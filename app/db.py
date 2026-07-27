@@ -185,6 +185,26 @@ class Database:
         self.conn.commit()
         return cursor.rowcount
 
+    def requeue_peer_id_errors(self) -> int:
+        cursor = self.conn.execute(
+            """
+            UPDATE messages
+            SET status = 'pending',
+                attempts = 0,
+                last_error = NULL,
+                next_retry_at = NULL,
+                updated_at = ?
+            WHERE status IN ('failed', 'skipped')
+              AND (
+                    LOWER(COALESCE(last_error, '')) LIKE '%peer id invalid%'
+                 OR LOWER(COALESCE(last_error, '')) LIKE '%peer_id_invalid%'
+              )
+            """,
+            (utc_now(),),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
     def due_jobs(self, limit: int) -> list[sqlite3.Row]:
         return self.query(
             """
