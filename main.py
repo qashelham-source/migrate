@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from contextlib import AsyncExitStack
 
+from app.admin_bot import run_admin_bot
 from app.config import AppConfig, load_config
 from app.db import Database
 from app.destination_manager import add_destination, list_destinations, remove_destination
@@ -24,6 +25,7 @@ from app.worker import Verifier, Worker
 
 COMMANDS = (
     "login",
+    "admin",
     "scan",
     "process",
     "verify",
@@ -69,7 +71,6 @@ def handle_destination_command(args: argparse.Namespace) -> bool:
         topic_id = int(args.values[1]) if len(args.values) == 2 else None
         added = add_destination(args.values[0], topic_id, args.config)
         print(f"Added destination: {added}")
-        print("Run python3 main.py scan, then python3 main.py process")
         return True
 
     if args.command == "remove-destination":
@@ -170,6 +171,10 @@ async def async_main() -> None:
 
     if args.command == "login":
         await interactive_login(config, args.session)
+        return
+
+    if args.command == "admin":
+        await run_admin_bot(config, args.config)
         return
 
     await run_with_clients(config, args.command)
