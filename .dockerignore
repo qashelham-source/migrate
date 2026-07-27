@@ -1,0 +1,13 @@
+.git
+.github
+.env
+config.yaml
+config.local.yaml
+sessions
+data
+downloads
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+tests
