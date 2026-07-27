@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import AsyncExitStack, suppress
+from typing import Any
+
+from pyrogram import Client
 
 from app.admin_bot import run_admin_bot
 from app.config import AppConfig, load_config
@@ -18,6 +21,7 @@ from app.telegram_client import (
     interactive_login,
     make_bot_client,
     make_user_client,
+    resolve_chat,
     update_account_cache,
 )
 from app.upload import Uploader
@@ -84,6 +88,54 @@ def handle_destination_command(args: argparse.Namespace) -> bool:
     return False
 
 
+def _configured_destinations(config: AppConfig) -> list[Any]:
+    return [
+        spec
+        for spec in config.destinations
+        if spec.chat
+        and "destination_channel_or_-100_id" not in str(spec.chat).lower()
+    ]
+
+
+async def choose_writer_for_destinations(
+    config: AppConfig,
+    reader: Client,
+    writer: Client,
+    limiter: TelegramLimiter,
+    logger: Any | None = None,
+) -> tuple[Client, bool]:
+    """Use the bot when it knows every destination; otherwise safely use the user session."""
+    destinations = _configured_destinations(config)
+    if writer is reader or not destinations:
+        return writer, True
+
+    for spec in destinations:
+        try:
+            await resolve_chat(writer, limiter, spec)
+            continue
+        except Exception as bot_error:
+            try:
+                await resolve_chat(reader, limiter, spec)
+            except Exception as reader_error:
+                if logger:
+                    logger.warning(
+                        "Destination %s cannot be resolved by writer or reader: writer=%s reader=%s",
+                        spec.chat,
+                        bot_error,
+                        reader_error,
+                    )
+                return writer, False
+
+            if logger:
+                logger.warning(
+                    "Writer bot cannot resolve private destination %s; using user session for this cycle",
+                    spec.chat,
+                )
+            return reader, True
+
+    return writer, True
+
+
 async def run_with_clients(config: AppConfig, command: str) -> None:
     logger = setup_logging(config.logging)
     limiter = TelegramLimiter(config, logger)
@@ -124,11 +176,32 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
                 bot_me = await limiter.call("read", writer.get_me)
                 logger.info("Writer bot: %s (%s)", bot_me.first_name, bot_me.id)
 
+            writer, destinations_ready = await choose_writer_for_destinations(
+                config,
+                reader,
+                writer,
+                limiter,
+                logger,
+            )
+            if writer is reader and bot is not None:
+                write_status(
+                    config,
+                    "starting",
+                    message="Destination private dikesan. Menggunakan user session untuk penghantaran.",
+                    reader_id=me.id,
+                )
+
+            if destinations_ready:
+                revived = queue.requeue_peer_id_errors()
+                if revived:
+                    logger.info("Returned %s PEER_ID_INVALID job(s) to pending", revived)
+
             write_status(
                 config,
                 "starting",
                 message="Telegram connected. Menyediakan migration cycle.",
                 reader_id=me.id,
+                writer="user" if writer is reader else "bot",
             )
 
             if config.telegram.load_dialogs_on_start:
