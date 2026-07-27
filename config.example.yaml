@@ -10,17 +10,10 @@ telegram:
     session_name: "uploader_bot"
     use_for_uploads: true
 
+# Source and destinations are configured from the Telegram control panel.
 migration:
-  sources:
-    - chat: "@source_channel_or_-100_id"
-      topic_id:
-      message_range:
-        start: 1
-        end: 2000
-
-  destinations:
-    - chat: "@destination_channel_or_-100_id"
-      topic_id:
+  sources: []
+  destinations: []
 
 transfer:
   include:
