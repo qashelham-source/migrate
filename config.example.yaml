@@ -3,6 +3,7 @@ telegram:
   api_hash: "${API_HASH}"
   user_session: "user"
   sessions_dir: "sessions"
+  load_dialogs_on_start: true
 
   bot:
     enabled: true
