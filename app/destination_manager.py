@@ -24,10 +24,10 @@ def _load_yaml(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
 
 
 def _save_yaml(path: Path, data: dict[str, Any]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
+    # config.yaml is bind-mounted into Docker, so write the mounted file in place.
+    with path.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(data, handle, allow_unicode=True, sort_keys=False)
-    temporary.replace(path)
+        handle.flush()
 
 
 def _is_placeholder(chat: str) -> bool:
