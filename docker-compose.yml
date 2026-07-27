@@ -20,11 +20,35 @@ services:
       - /bin/sh
       - -c
       - |
+        set -eu
         python main.py recover
-        while true; do
-          python main.py run
-          exit_code=$$?
-          echo "Migration cycle exited with code $$exit_code; retrying in $${RUN_INTERVAL_SECONDS:-300}s"
-          sleep "$${RUN_INTERVAL_SECONDS:-300}"
+        python main.py admin &
+        admin_pid=$$!
+
+        cleanup() {
+          kill "$$admin_pid" 2>/dev/null || true
+          wait "$$admin_pid" 2>/dev/null || true
+        }
+        trap cleanup EXIT INT TERM
+
+        while kill -0 "$$admin_pid" 2>/dev/null; do
+          exit_code=0
+          python main.py run || exit_code=$$?
+          echo "Migration cycle exited with code $$exit_code"
+
+          elapsed=0
+          interval=$${RUN_INTERVAL_SECONDS:-300}
+          while [ "$$elapsed" -lt "$$interval" ]; do
+            kill -0 "$$admin_pid" 2>/dev/null || exit 1
+            if [ -f /app/data/run_now ]; then
+              rm -f /app/data/run_now
+              echo "Run requested from Telegram control panel"
+              break
+            fi
+            sleep 5
+            elapsed=$$((elapsed + 5))
+          done
         done
+
+        wait "$$admin_pid"
     stop_grace_period: 30s
