@@ -77,29 +77,41 @@ class Scanner:
 
     async def _resolve_destinations(self) -> list[ResolvedChat]:
         resolved: list[ResolvedChat] = []
+        sending_client = self.writer or self.reader
+
         for spec in self.config.destinations:
             if not spec.chat or _is_placeholder(spec.chat):
                 continue
 
             try:
-                resolved.append(await resolve_chat(self.reader, self.limiter, spec))
+                destination = await resolve_chat(sending_client, self.limiter, spec)
+                resolved.append(destination)
                 continue
             except Exception as exc:
                 if self.logger:
-                    self.logger.warning("Reader could not resolve destination %s: %s", spec.chat, exc)
+                    client_name = "Writer" if sending_client is not self.reader else "Reader"
+                    self.logger.warning(
+                        "%s could not resolve destination %s: %s",
+                        client_name,
+                        spec.chat,
+                        exc,
+                    )
 
-            if self.writer and self.writer is not self.reader:
-                try:
-                    resolved.append(await resolve_chat(self.writer, self.limiter, spec))
-                    continue
-                except Exception as exc:
-                    if self.logger:
-                        self.logger.warning("Writer could not resolve destination %s: %s", spec.chat, exc)
+            # Never queue an unresolved literal peer. That produces PEER_ID_INVALID later.
+            write_status(
+                self.config,
+                "error",
+                message="Destination tidak dapat dikenal oleh bot uploader.",
+                destination_chat=spec.chat,
+                error=(
+                    "Pastikan bot MANAGER sudah menjadi admin destination dan cuba "
+                    "tambah destination semula melalui forward post atau -100 ID."
+                ),
+            )
 
-            resolved.append(ResolvedChat(chat_id=str(spec.chat), topic_id=spec.topic_id, title=str(spec.chat)))
         return resolved
 
-    async def _latest_message_id(self, chat_id: str) -> int | None:
+    async def _latest_message_id(self, chat_id: int | str) -> int | None:
         async for message in self.reader.get_chat_history(chat_id, limit=1):
             if not message_is_empty(message):
                 return int(message.id)
@@ -283,9 +295,9 @@ class Scanner:
             return next(iter(types))
         return "album"
 
-    def _group_unique_key(self, source_chat_id: str, messages: list[Message]) -> str:
+    def _group_unique_key(self, source_chat_id: int | str, messages: list[Message]) -> str:
         keys = [message_unique_key(message) for message in messages]
         keys = [key for key in keys if key]
         if keys:
             return "album:" + "|".join(keys) if len(keys) > 1 else keys[0]
-        return "messages:" + source_chat_id + ":" + ",".join(str(message.id) for message in messages)
+        return "messages:" + str(source_chat_id) + ":" + ",".join(str(message.id) for message in messages)

@@ -18,7 +18,7 @@ from app.config import AppConfig, ChatSpec
 
 @dataclass(frozen=True)
 class ResolvedChat:
-    chat_id: str
+    chat_id: int | str
     topic_id: int | None
     title: str
 
@@ -163,10 +163,20 @@ async def interactive_login(config: AppConfig, session_name: str | None = None) 
         await client.disconnect()
 
 
+def telegram_peer(value: int | str) -> int | str:
+    """Return numeric Telegram IDs as int; keep usernames and links as strings."""
+    if isinstance(value, int):
+        return value
+    text = str(value).strip()
+    if text.lstrip("-").isdigit():
+        return int(text)
+    return text
+
+
 async def resolve_chat(client: Client, limiter: TelegramLimiter, spec: ChatSpec) -> ResolvedChat:
-    chat = await limiter.call("resolve", client.get_chat, spec.chat)
+    chat = await limiter.call("resolve", client.get_chat, telegram_peer(spec.chat))
     title = chat.title or chat.username or str(chat.id)
-    return ResolvedChat(chat_id=str(chat.id), topic_id=spec.topic_id, title=title)
+    return ResolvedChat(chat_id=int(chat.id), topic_id=spec.topic_id, title=title)
 
 
 def message_media_type(message: Message) -> str:

@@ -7,14 +7,15 @@ from sqlite3 import Row
 
 from app.config import AppConfig
 from app.db import Database, utc_now
+from app.telegram_client import telegram_peer
 
 
 @dataclass(frozen=True)
 class MessageJob:
     id: int
-    source_chat_id: str
+    source_chat_id: int | str
     source_message_id: int
-    dest_chat_id: str
+    dest_chat_id: int | str
     status: str
     attempts: int
     last_error: str | None
@@ -33,9 +34,9 @@ class MessageJob:
     def from_row(cls, row: Row) -> "MessageJob":
         return cls(
             id=int(row["id"]),
-            source_chat_id=str(row["source_chat_id"]),
+            source_chat_id=telegram_peer(row["source_chat_id"]),
             source_message_id=int(row["source_message_id"]),
-            dest_chat_id=str(row["dest_chat_id"]),
+            dest_chat_id=telegram_peer(row["dest_chat_id"]),
             status=str(row["status"]),
             attempts=int(row["attempts"]),
             last_error=row["last_error"],
@@ -67,9 +68,9 @@ class MessageQueue:
     def enqueue(
         self,
         *,
-        source_chat_id: str,
+        source_chat_id: int | str,
         source_message_id: int,
-        dest_chat_id: str,
+        dest_chat_id: int | str,
         file_unique_key: str,
         source_message_ids: list[int],
         source_topic_id: int | None,
@@ -82,9 +83,9 @@ class MessageQueue:
         last_error: str | None = None,
     ) -> bool:
         return self.db.enqueue_message(
-            source_chat_id=source_chat_id,
+            source_chat_id=str(source_chat_id),
             source_message_id=source_message_id,
-            dest_chat_id=dest_chat_id,
+            dest_chat_id=str(dest_chat_id),
             file_unique_key=file_unique_key,
             source_message_ids=source_message_ids,
             source_topic_id=source_topic_id,
