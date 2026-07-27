@@ -1,6 +1,10 @@
 __pycache__/
 *.py[cod]
 
+config.yaml
+config.local.yaml
+.env
+
 data/*.sqlite3
 data/*.sqlite3-*
 data/*.log
@@ -11,6 +15,3 @@ downloads/completed/
 
 sessions/*.session
 sessions/*.session-journal
-
-.env
-config.local.yaml
