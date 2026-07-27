@@ -133,6 +133,9 @@ class MessageQueue:
     def recover_in_progress(self) -> int:
         return self.db.recover_in_progress()
 
+    def requeue_peer_id_errors(self) -> int:
+        return self.db.requeue_peer_id_errors()
+
     def counts_by_status(self) -> dict[str, int]:
         return self.db.counts_by_status()
 
