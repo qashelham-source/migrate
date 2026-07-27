@@ -34,6 +34,21 @@ if [ ! -f config.yaml ]; then
   exit 2
 fi
 
+# Apply the agreed balanced speed profile without changing source,
+# destinations, Telegram credentials, transfer rules, or queue data.
+sed -i -E 's|^([[:space:]]*global_min_delay_seconds:).*|\1 0.5|' config.yaml
+sed -i -E 's|^([[:space:]]*resolve_delay_seconds:).*|\1 1|' config.yaml
+sed -i -E 's|^([[:space:]]*read_delay_seconds:).*|\1 1|' config.yaml
+sed -i -E 's|^([[:space:]]*download_delay_seconds:).*|\1 1|' config.yaml
+sed -i -E 's|^([[:space:]]*copy_delay_seconds:).*|\1 2|' config.yaml
+sed -i -E 's|^([[:space:]]*upload_delay_seconds:).*|\1 5|' config.yaml
+sed -i -E 's|^([[:space:]]*verify_delay_seconds:).*|\1 1|' config.yaml
+sed -i -E 's|^([[:space:]]*floodwait_extra_min_seconds:).*|\1 5|' config.yaml
+sed -i -E 's|^([[:space:]]*floodwait_extra_max_seconds:).*|\1 15|' config.yaml
+sed -i -E 's|^([[:space:]]*size:).*|\1 100|' config.yaml
+sed -i -E 's|^([[:space:]]*pause_between_batches_seconds:).*|\1 120|' config.yaml
+sed -i -E 's|^([[:space:]]*idle_sleep_seconds:).*|\1 10|' config.yaml
+
 chmod 600 config.yaml
 [ -f .env ] && chmod 600 .env
 
@@ -41,5 +56,5 @@ docker compose -p "$PROJECT_NAME" config >/dev/null
 docker compose -p "$PROJECT_NAME" up -d --build --remove-orphans
 
 echo
-echo "Deployment complete."
+echo "Deployment complete with balanced migration speed settings."
 docker compose -p "$PROJECT_NAME" ps
