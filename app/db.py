@@ -59,6 +59,14 @@ class Database:
                 ON messages(status, next_retry_at, updated_at);
             CREATE INDEX IF NOT EXISTS idx_messages_source
                 ON messages(source_chat_id, source_message_id);
+
+            CREATE TABLE IF NOT EXISTS media_cache (
+                file_unique_key TEXT PRIMARY KEY,
+                bot_file_ids TEXT NOT NULL,
+                media_types TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
             """
         )
         self.conn.commit()
@@ -70,6 +78,9 @@ class Database:
 
     def query(self, sql: str, params: Iterable[Any] = ()) -> list[sqlite3.Row]:
         return list(self.conn.execute(sql, tuple(params)))
+
+    def query_one(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Row | None:
+        return self.conn.execute(sql, tuple(params)).fetchone()
 
     def enqueue_message(
         self,
@@ -90,7 +101,6 @@ class Database:
     ) -> bool:
         if status not in STATUSES:
             raise ValueError(f"Invalid message status: {status}")
-
         now = utc_now()
         cursor = self.conn.execute(
             """
@@ -99,8 +109,7 @@ class Database:
                 last_error, next_retry_at, file_unique_key, created_at, updated_at,
                 source_topic_id, dest_topic_id, media_group_id, source_message_ids,
                 media_type, file_size, caption
-            )
-            VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, 0, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 source_chat_id,
@@ -135,10 +144,8 @@ class Database:
     ) -> None:
         if status not in STATUSES:
             raise ValueError(f"Invalid message status: {status}")
-
         fields = ["status = ?", "updated_at = ?"]
         values: list[Any] = [status, utc_now()]
-
         if last_error is not None:
             fields.append("last_error = ?")
             values.append(last_error[:4000])
@@ -151,7 +158,6 @@ class Database:
         if verified_at is not None:
             fields.append("verified_at = ?")
             values.append(verified_at)
-
         values.append(job_id)
         self.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = ?", values)
 
@@ -180,24 +186,21 @@ class Database:
         return cursor.rowcount
 
     def due_jobs(self, limit: int) -> list[sqlite3.Row]:
-        now = utc_now()
         return self.query(
             """
-            SELECT *
-            FROM messages
+            SELECT * FROM messages
             WHERE status = 'pending'
               AND (next_retry_at IS NULL OR next_retry_at <= ?)
             ORDER BY updated_at ASC, id ASC
             LIMIT ?
             """,
-            (now, limit),
+            (utc_now(), limit),
         )
 
     def copied_jobs_for_verification(self, limit: int) -> list[sqlite3.Row]:
         return self.query(
             """
-            SELECT *
-            FROM messages
+            SELECT * FROM messages
             WHERE status = 'copied'
               AND dest_message_ids IS NOT NULL
               AND verified_at IS NULL
@@ -211,3 +214,43 @@ class Database:
         rows = self.query("SELECT status, COUNT(*) AS count FROM messages GROUP BY status")
         return {str(row["status"]): int(row["count"]) for row in rows}
 
+    def get_media_cache(self, file_unique_key: str) -> sqlite3.Row | None:
+        return self.query_one(
+            "SELECT * FROM media_cache WHERE file_unique_key = ?",
+            (file_unique_key,),
+        )
+
+    def save_media_cache(
+        self,
+        file_unique_key: str,
+        bot_file_ids: list[str],
+        media_types: list[str],
+    ) -> None:
+        if not file_unique_key or not bot_file_ids or len(bot_file_ids) != len(media_types):
+            return
+        now = utc_now()
+        self.execute(
+            """
+            INSERT INTO media_cache (
+                file_unique_key, bot_file_ids, media_types, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(file_unique_key) DO UPDATE SET
+                bot_file_ids = excluded.bot_file_ids,
+                media_types = excluded.media_types,
+                updated_at = excluded.updated_at
+            """,
+            (
+                file_unique_key,
+                json.dumps(bot_file_ids),
+                json.dumps(media_types),
+                now,
+                now,
+            ),
+        )
+
+    def delete_media_cache(self, file_unique_key: str) -> None:
+        self.execute("DELETE FROM media_cache WHERE file_unique_key = ?", (file_unique_key,))
+
+    def media_cache_count(self) -> int:
+        row = self.query_one("SELECT COUNT(*) AS count FROM media_cache")
+        return int(row["count"]) if row else 0
