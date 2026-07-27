@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from threading import Lock
 from typing import Any
@@ -8,6 +9,7 @@ import yaml
 
 
 _CONFIG_LOCK = Lock()
+_TME_RE = re.compile(r"^(?:https?://)?t\.me/(.+?)/?$", re.IGNORECASE)
 
 
 def _load_yaml(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
@@ -29,12 +31,51 @@ def _save_yaml(path: Path, data: dict[str, Any]) -> None:
 
 
 def normalize_chat(chat: str) -> str:
-    chat = str(chat).strip()
-    if not chat:
-        raise ValueError("Destination cannot be empty")
-    if chat.startswith("@") or chat.lstrip("-").isdigit():
-        return chat
-    return f"@{chat}"
+    value = str(chat).strip()
+    if not value:
+        raise ValueError("Channel cannot be empty")
+
+    match = _TME_RE.match(value)
+    if match:
+        path = match.group(1).split("?", 1)[0].strip("/")
+        parts = [part for part in path.split("/") if part]
+        if not parts:
+            raise ValueError("Invalid Telegram link")
+        if parts[0] == "c" and len(parts) >= 2 and parts[1].isdigit():
+            return f"-100{parts[1]}"
+        if parts[0].startswith("+") or parts[0] == "joinchat":
+            raise ValueError("Invite links are not supported. Forward a post or send the -100 channel ID.")
+        return f"@{parts[0].lstrip('@')}"
+
+    if value.startswith("@") or value.lstrip("-").isdigit():
+        return value
+    return f"@{value}"
+
+
+def get_sources(config_path: str | Path = "config.yaml") -> list[dict[str, Any]]:
+    with _CONFIG_LOCK:
+        _, data = _load_yaml(config_path)
+        sources = (data.get("migration") or {}).get("sources") or []
+        result: list[dict[str, Any]] = []
+        for source in sources:
+            if isinstance(source, dict):
+                item = dict(source)
+                item["chat"] = str(item.get("chat") or "")
+                result.append(item)
+            else:
+                result.append({"chat": str(source)})
+        return result
+
+
+def set_source(chat: str, config_path: str | Path = "config.yaml") -> dict[str, Any]:
+    normalized_chat = normalize_chat(chat)
+    with _CONFIG_LOCK:
+        path, data = _load_yaml(config_path)
+        migration = data.setdefault("migration", {})
+        item: dict[str, Any] = {"chat": normalized_chat}
+        migration["sources"] = [item]
+        _save_yaml(path, data)
+        return item
 
 
 def list_destinations(config_path: str | Path = "config.yaml") -> list[dict[str, Any]]:
