@@ -34,6 +34,7 @@ COMMANDS = (
     "admin",
     "health",
     "scan",
+    "sync",
     "process",
     "verify",
     "run",
@@ -224,6 +225,7 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
         if command == "stats":
             print_counts(queue.counts_by_status())
             print(f"cached_file_id: {queue.media_cache_count()}")
+            print(f"scan_checkpoints: {len(db.list_scan_checkpoints())}")
             return
         if command == "recover":
             recovered = queue.recover_in_progress()
@@ -231,7 +233,13 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
             return
 
         clear_stop(config)
-        write_status(config, "starting", message="Menyambung ke Telegram...")
+        cycle_mode = "incremental" if command == "sync" else "full" if command in {"scan", "run"} else command
+        write_status(
+            config,
+            "starting",
+            message="Menyambung ke Telegram...",
+            cycle_mode=cycle_mode,
+        )
         stop_watcher = asyncio.create_task(watch_stop_request(config, stop_event))
 
         async with AsyncExitStack() as stack:
@@ -279,6 +287,7 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
                     "starting",
                     message="Destination private dikesan. Menggunakan user session untuk penghantaran.",
                     reader_id=me.id,
+                    cycle_mode=cycle_mode,
                 )
 
             if destinations_ready:
@@ -292,9 +301,10 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
                 message="Telegram connected. Menyediakan migration cycle.",
                 reader_id=me.id,
                 writer="user" if writer is reader else "bot",
+                cycle_mode=cycle_mode,
             )
 
-            if command in {"scan", "run"}:
+            if command in {"scan", "sync", "run"}:
                 scanner = Scanner(
                     config,
                     queue,
@@ -302,10 +312,11 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
                     limiter,
                     writer=writer,
                     logger=logger,
+                    scan_mode="incremental" if command == "sync" else "full",
                 )
                 await scanner.scan(stop_event)
 
-            if command in {"process", "run"} and not stop_event.is_set():
+            if command in {"process", "sync", "run"} and not stop_event.is_set():
                 uploader = Uploader(
                     config,
                     reader,
@@ -326,6 +337,7 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
                     config,
                     "stopped",
                     message="Migration dihentikan dengan selamat.",
+                    cycle_mode=cycle_mode,
                     **queue.counts_by_status(),
                 )
     except Exception as exc:
