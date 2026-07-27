@@ -196,20 +196,22 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         raise ValueError("config.yaml must contain a YAML object")
     raw = _expand_env(raw)
 
-    telegram = raw.get("telegram", {})
-    transfer = raw.get("transfer", {})
-    queue = raw.get("queue", {})
-    limits = raw.get("limits", {})
-    batch = raw.get("batch", {})
-    downloads = raw.get("downloads", {})
-    logging_cfg = raw.get("logging", {})
-    migration = raw.get("migration", {})
+    telegram = raw.get("telegram") or {}
+    transfer = raw.get("transfer") or {}
+    queue = raw.get("queue") or {}
+    limits = raw.get("limits") or {}
+    batch = raw.get("batch") or {}
+    downloads = raw.get("downloads") or {}
+    logging_cfg = raw.get("logging") or {}
+    migration = raw.get("migration") or {}
     bot = telegram.get("bot") or {}
     include = transfer.get("include") or {}
     native_copy = transfer.get("native_copy") or {}
 
-    api_id = _as_int(telegram.get("api_id"), 0) or 0
-    api_hash = str(telegram.get("api_hash") or "")
+    api_id = _as_int(telegram.get("api_id") or os.getenv("API_ID"), 0) or 0
+    api_hash = str(telegram.get("api_hash") or os.getenv("API_HASH") or "")
+    bot_token = str(bot.get("token") or os.getenv("BOT_TOKEN") or "")
+    bot_enabled = _as_bool(bot.get("enabled"), bool(bot_token))
 
     if api_id <= 0:
         raise ValueError("telegram.api_id is required in config.yaml or API_ID environment variable")
@@ -230,8 +232,8 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             user_session=str(telegram.get("user_session") or "user"),
             sessions_dir=_path(base_dir, str(telegram.get("sessions_dir", "sessions"))),
             load_dialogs_on_start=_as_bool(telegram.get("load_dialogs_on_start"), False),
-            bot_enabled=_as_bool(bot.get("enabled"), False),
-            bot_token=str(bot.get("token") or ""),
+            bot_enabled=bot_enabled,
+            bot_token=bot_token,
             bot_session_name=str(bot.get("session_name") or "uploader_bot"),
             use_bot_for_uploads=_as_bool(bot.get("use_for_uploads"), True),
         ),
