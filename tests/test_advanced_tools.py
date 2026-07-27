@@ -4,12 +4,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.advanced import (
+    checkpoint_rows,
     classify_repair_error,
     load_health_report,
     repair_summary,
     request_run_mode,
     requeue_repair_category,
     requeue_retryable_repairs,
+    reset_all_checkpoints,
     save_health_report,
 )
 from app.db import Database
@@ -49,10 +51,10 @@ def enqueue_error(
 
 def test_request_run_mode_writes_atomic_mode_and_wakeup_marker(tmp_path: Path) -> None:
     config = config_for(tmp_path)
-    request_run_mode(config, "process")  # type: ignore[arg-type]
+    request_run_mode(config, "sync")  # type: ignore[arg-type]
 
     runtime_dir = tmp_path / "data"
-    assert (runtime_dir / "run_mode").read_text(encoding="utf-8") == "process"
+    assert (runtime_dir / "run_mode").read_text(encoding="utf-8") == "sync"
     assert (runtime_dir / "run_now").exists()
 
 
@@ -63,6 +65,25 @@ def test_health_report_round_trip(tmp_path: Path) -> None:
     save_health_report(config, report)  # type: ignore[arg-type]
 
     assert load_health_report(config) == report  # type: ignore[arg-type]
+
+
+def test_checkpoint_helpers_list_and_reset(tmp_path: Path) -> None:
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        db.set_scan_checkpoint(-1001111111111, None, 846, "incremental")
+        db.set_scan_checkpoint(-1002222222222, 7, 91, "full")
+
+        rows = checkpoint_rows(db)
+        by_source = {row["source_chat_id"]: row for row in rows}
+
+        assert by_source["-1001111111111"]["last_scanned_message_id"] == 846
+        assert by_source["-1001111111111"]["source_topic_id"] is None
+        assert by_source["-1002222222222"]["source_topic_id"] == 7
+        assert reset_all_checkpoints(db) == 2
+        assert checkpoint_rows(db) == []
+    finally:
+        db.close()
 
 
 def test_repair_summary_classifies_errors_and_preserves_unsupported(tmp_path: Path) -> None:
