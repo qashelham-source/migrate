@@ -30,6 +30,11 @@ def _save_yaml(path: Path, data: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def _is_placeholder(chat: str) -> bool:
+    value = str(chat).lower()
+    return "source_channel_or_-100_id" in value or "destination_channel_or_-100_id" in value
+
+
 def normalize_chat(chat: str) -> str:
     value = str(chat).strip()
     if not value:
@@ -61,9 +66,10 @@ def get_sources(config_path: str | Path = "config.yaml") -> list[dict[str, Any]]
             if isinstance(source, dict):
                 item = dict(source)
                 item["chat"] = str(item.get("chat") or "")
-                result.append(item)
             else:
-                result.append({"chat": str(source)})
+                item = {"chat": str(source)}
+            if item["chat"] and not _is_placeholder(item["chat"]):
+                result.append(item)
         return result
 
 
@@ -87,9 +93,10 @@ def list_destinations(config_path: str | Path = "config.yaml") -> list[dict[str,
             if isinstance(destination, dict):
                 item = dict(destination)
                 item["chat"] = str(item.get("chat") or "")
-                result.append(item)
             else:
-                result.append({"chat": str(destination)})
+                item = {"chat": str(destination)}
+            if item["chat"] and not _is_placeholder(item["chat"]):
+                result.append(item)
         return result
 
 
@@ -104,7 +111,14 @@ def add_destination(
 
     with _CONFIG_LOCK:
         path, data = _load_yaml(config_path)
-        destinations = data.setdefault("migration", {}).setdefault("destinations", [])
+        migration = data.setdefault("migration", {})
+        raw_destinations = migration.setdefault("destinations", [])
+        destinations = []
+        for destination in raw_destinations:
+            existing_value = destination.get("chat") if isinstance(destination, dict) else destination
+            if not _is_placeholder(str(existing_value or "")):
+                destinations.append(destination)
+        migration["destinations"] = destinations
 
         for destination in destinations:
             if isinstance(destination, dict):
@@ -130,7 +144,15 @@ def remove_destination(
 ) -> dict[str, Any]:
     with _CONFIG_LOCK:
         path, data = _load_yaml(config_path)
-        destinations = data.setdefault("migration", {}).setdefault("destinations", [])
+        migration = data.setdefault("migration", {})
+        raw_destinations = migration.setdefault("destinations", [])
+        destinations = []
+        for destination in raw_destinations:
+            existing_value = destination.get("chat") if isinstance(destination, dict) else destination
+            if not _is_placeholder(str(existing_value or "")):
+                destinations.append(destination)
+        migration["destinations"] = destinations
+
         if not destinations:
             raise ValueError("No destinations configured")
         if index < 1 or index > len(destinations):
