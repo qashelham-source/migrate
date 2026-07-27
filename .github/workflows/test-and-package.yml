@@ -40,6 +40,14 @@ jobs:
           path: pytest.log
           if-no-files-found: warn
 
+      - name: Validate Docker Compose
+        run: |
+          cp config.example.yaml config.yaml
+          docker compose config >/dev/null
+
+      - name: Build Docker image
+        run: docker build -t migration-manager:test .
+
       - name: Build clean ZIP
         run: |
           zip -r telegram-migration-fileid-final.zip . \
