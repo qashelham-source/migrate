@@ -8,7 +8,7 @@ from typing import Any
 from pyrogram.types import Message
 
 from app.control import write_status
-from app.errors import RetryableJobError
+from app.errors import PermanentJobError, RetryableJobError
 from app.queue import MessageJob
 from app.telegram_client import message_media_type
 from app.telemetry import ProgressMeter, StoragePolicy, storage_snapshot
@@ -69,7 +69,36 @@ class Release3Uploader(Uploader):
         self._active_job = job
         self._meters.clear()
         try:
-            return await super().process(job, stop_event, on_phase)
+            try:
+                return await super().process(job, stop_event, on_phase)
+            except PermanentJobError as exc:
+                error = f"{exc.__class__.__name__}: {exc}"
+                lowered = error.lower()
+                if any(
+                    marker in lowered
+                    for marker in (
+                        "chatwriteforbidden",
+                        "chat_write_forbidden",
+                        "channelprivate",
+                        "channel_private",
+                        "channelinvalid",
+                        "channel_invalid",
+                        "not enough rights",
+                        "forbidden",
+                    )
+                ):
+                    self.queue.pause_destination(
+                        job,
+                        "Destination access/permission failed",
+                        error,
+                    )
+                    self.queue.log_repair(
+                        action="pause_destination",
+                        job=job,
+                        reason=error,
+                        outcome="paused",
+                    )
+                raise
         finally:
             self._active_job = None
             self._meters.clear()
