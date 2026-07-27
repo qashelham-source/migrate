@@ -12,12 +12,14 @@ from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMa
 
 from app.advanced import (
     REPAIR_CATEGORIES,
+    checkpoint_rows,
     load_health_report,
     repair_samples,
     repair_summary,
     request_run_mode,
     requeue_repair_category,
     requeue_retryable_repairs,
+    reset_all_checkpoints,
 )
 from app.config import AppConfig
 from app.control import (
@@ -67,7 +69,7 @@ def _menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("📊 Live Status", callback_data="status:view"),
                 InlineKeyboardButton("⏹ Stop Current Job", callback_data="stop:current"),
             ],
-            [InlineKeyboardButton("▶️ Run Sekarang", callback_data="run:now")],
+            [InlineKeyboardButton("▶️ Sync Sekarang", callback_data="run:now")],
             [InlineKeyboardButton("🧰 Advanced Tools", callback_data="advanced:menu")],
         ]
     )
@@ -86,9 +88,12 @@ def _advanced_menu() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton("▶️ Resume Pending", callback_data="advanced:resume"),
-                InlineKeyboardButton("🔍 Full Scan", callback_data="advanced:full"),
+                InlineKeyboardButton("🆕 Sync New Posts", callback_data="advanced:sync"),
             ],
-            [InlineKeyboardButton("🆕 Sync New Posts", callback_data="advanced:sync")],
+            [
+                InlineKeyboardButton("🔍 Full Scan", callback_data="advanced:full"),
+                InlineKeyboardButton("📍 Checkpoints", callback_data="checkpoint:view"),
+            ],
             [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
         ]
     )
@@ -120,6 +125,27 @@ def _repair_menu() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton("🔄 Refresh", callback_data="advanced:repair")],
             [InlineKeyboardButton("⬅️ Advanced Tools", callback_data="advanced:menu")],
+        ]
+    )
+
+
+def _checkpoint_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🔄 Refresh", callback_data="checkpoint:refresh"),
+                InlineKeyboardButton("♻️ Reset + Full Scan", callback_data="checkpoint:reset:confirm"),
+            ],
+            [InlineKeyboardButton("⬅️ Advanced Tools", callback_data="advanced:menu")],
+        ]
+    )
+
+
+def _checkpoint_confirm_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Ya, reset dan full scan", callback_data="checkpoint:reset:all")],
+            [InlineKeyboardButton("❌ Batal", callback_data="checkpoint:view")],
         ]
     )
 
@@ -231,6 +257,16 @@ def _status_text(config: AppConfig) -> str:
     if message:
         lines.append(str(message))
 
+    mode = str(status.get("scan_mode") or status.get("cycle_mode") or "").lower()
+    if mode:
+        mode_label = {
+            "incremental": "Incremental Sync",
+            "full": "Full Scan",
+            "process": "Resume Pending",
+            "health": "Health Check",
+        }.get(mode, mode.title())
+        lines.append(f"Mode: {mode_label}")
+
     if status.get("job_id") is not None:
         lines.extend(
             [
@@ -251,6 +287,15 @@ def _status_text(config: AppConfig) -> str:
     total = status.get("total")
     if current is not None and total is not None:
         lines.append(f"Progress: {current}/{total}")
+
+    scan_start = status.get("scan_start")
+    scan_end = status.get("scan_end")
+    if scan_start is not None and scan_end is not None:
+        lines.append(f"Message range: {scan_start}-{scan_end}")
+    if status.get("checkpoint") is not None:
+        lines.append(f"Checkpoint: {status['checkpoint']}")
+    if status.get("checkpoint_bootstrap"):
+        lines.append("Checkpoint source: existing queue")
 
     batch_index = status.get("batch_index")
     batch_total = status.get("batch_total")
@@ -286,6 +331,11 @@ def _advanced_text(config: AppConfig) -> str:
     status = read_status(config)
     counts = _queue_counts(config)
     active = is_active_phase(status.get("phase"))
+    db = _with_database(config)
+    try:
+        checkpoint_count = len(checkpoint_rows(db))
+    finally:
+        db.close()
     return "\n".join(
         [
             "🧰 Advanced Tools",
@@ -294,9 +344,10 @@ def _advanced_text(config: AppConfig) -> str:
             f"Pending: {counts.get('pending', 0)}",
             f"Failed: {counts.get('failed', 0)}",
             f"Skipped: {counts.get('skipped', 0)}",
+            f"Active checkpoints: {checkpoint_count}",
             "",
-            "Health Check menguji session, akses channel, permission dan storage.",
-            "Repair Queue mengumpulkan job bermasalah mengikut punca.",
+            "Sync New Posts membaca hanya ID selepas checkpoint terakhir.",
+            "Full Scan membaca semula seluruh range tetapi queue kekal anti-duplicate.",
         ]
     )
 
@@ -375,6 +426,37 @@ def _repair_details_text(config: AppConfig) -> str:
                 "",
             ]
         )
+    return "\n".join(lines)[:3900]
+
+
+def _checkpoint_text(config: AppConfig) -> str:
+    db = _with_database(config)
+    try:
+        rows = checkpoint_rows(db)
+    finally:
+        db.close()
+
+    lines = ["📍 Incremental Sync Checkpoints", ""]
+    if not rows:
+        lines.extend(
+            [
+                "Belum ada checkpoint rasmi.",
+                "Sync pertama akan bootstrap daripada message ID tertinggi yang sudah ada dalam queue.",
+            ]
+        )
+        return "\n".join(lines)
+
+    for index, row in enumerate(rows, start=1):
+        topic = f" · topic {row['source_topic_id']}" if row.get("source_topic_id") else ""
+        lines.extend(
+            [
+                f"{index}. Source {row['source_chat_id']}{topic}",
+                f"   Last message ID: {row['last_scanned_message_id']}",
+                f"   Mode: {row['last_scan_mode']} · Updated: {row['updated_at']} UTC",
+                "",
+            ]
+        )
+    lines.append("Sync seterusnya bermula selepas Last message ID.")
     return "\n".join(lines)[:3900]
 
 
@@ -529,6 +611,43 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await query.message.edit_text(_repair_text(config), reply_markup=_repair_menu())
             return
 
+        if data in {"checkpoint:view", "checkpoint:refresh"}:
+            try:
+                await query.message.edit_text(_checkpoint_text(config), reply_markup=_checkpoint_menu())
+            except MessageNotModified:
+                pass
+            await query.answer("Checkpoint dikemas kini" if data == "checkpoint:refresh" else None)
+            return
+
+        if data == "checkpoint:reset:confirm":
+            await query.message.edit_text(
+                "♻️ Reset semua checkpoint?\n\nSelepas reset, bot akan buat Full Scan dan bina checkpoint baru. Queue lama tidak dipadam.",
+                reply_markup=_checkpoint_confirm_menu(),
+            )
+            await query.answer()
+            return
+
+        if data == "checkpoint:reset:all":
+            status = read_status(config)
+            if is_active_phase(status.get("phase")):
+                await query.answer(
+                    "Migration masih aktif. Stop atau tunggu selesai sebelum reset checkpoint.",
+                    show_alert=True,
+                )
+                return
+            db = _with_database(config)
+            try:
+                removed = reset_all_checkpoints(db)
+            finally:
+                db.close()
+            _request_mode(config, "run")
+            await query.answer(
+                f"{removed} checkpoint dibuang. Full Scan telah dijadualkan.",
+                show_alert=True,
+            )
+            await query.message.edit_text(_checkpoint_text(config), reply_markup=_checkpoint_menu())
+            return
+
         if data == "advanced:resume":
             _request_mode(config, "process")
             await query.answer("Pending queue akan disambung tanpa scan semula.", show_alert=True)
@@ -540,10 +659,8 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             return
 
         if data == "advanced:sync":
-            await query.answer(
-                "Checkpoint Sync New Posts akan diaktifkan dalam Release 2. Buat masa ini guna Full Scan.",
-                show_alert=True,
-            )
+            _request_mode(config, "sync")
+            await query.answer("Hanya post selepas checkpoint terakhir akan disync.", show_alert=True)
             return
 
         if data == "source:set":
@@ -630,8 +747,8 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             return
 
         if data == "run:now":
-            _request_mode(config, "run")
-            await query.answer("Migration akan mula secepat mungkin.", show_alert=True)
+            _request_mode(config, "sync")
+            await query.answer("Sync post baru akan mula secepat mungkin.", show_alert=True)
             return
 
         await query.answer()

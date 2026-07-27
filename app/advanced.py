@@ -10,7 +10,7 @@ from app.config import AppConfig
 from app.db import Database, utc_now
 
 
-RUN_MODES = {"run", "process", "health"}
+RUN_MODES = {"run", "sync", "process", "health"}
 REPAIR_CATEGORIES = (
     "media_empty",
     "peer_id",
@@ -56,6 +56,24 @@ def load_health_report(config: AppConfig) -> dict[str, Any] | None:
     except (OSError, ValueError, json.JSONDecodeError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def checkpoint_rows(db: Database) -> list[dict[str, Any]]:
+    return [
+        {
+            "source_chat_id": str(row["source_chat_id"]),
+            "source_topic_id": int(row["source_topic_key"]) or None,
+            "last_scanned_message_id": int(row["last_scanned_message_id"]),
+            "last_scan_mode": str(row["last_scan_mode"]),
+            "created_at": str(row["created_at"]),
+            "updated_at": str(row["updated_at"]),
+        }
+        for row in db.list_scan_checkpoints()
+    ]
+
+
+def reset_all_checkpoints(db: Database) -> int:
+    return db.reset_scan_checkpoints()
 
 
 def classify_repair_error(row: Row | dict[str, Any]) -> str:

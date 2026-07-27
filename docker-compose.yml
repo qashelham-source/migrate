@@ -32,9 +32,9 @@ services:
         trap cleanup EXIT INT TERM
 
         while kill -0 "$$admin_pid" 2>/dev/null; do
-          mode=run
+          mode=sync
           if [ -f /app/data/run_mode ]; then
-            mode=$$(cat /app/data/run_mode 2>/dev/null || echo run)
+            mode=$$(cat /app/data/run_mode 2>/dev/null || echo sync)
             rm -f /app/data/run_mode
           fi
 
@@ -48,13 +48,17 @@ services:
               echo "Resuming pending queue without scanning"
               python main.py process || exit_code=$$?
               ;;
+            sync)
+              echo "Syncing only new source posts, then processing queue"
+              python main.py sync || exit_code=$$?
+              ;;
             run)
               echo "Running full scan and queue processing"
               python main.py run || exit_code=$$?
               ;;
             *)
-              echo "Unknown run mode '$$mode'; using full run"
-              python main.py run || exit_code=$$?
+              echo "Unknown run mode '$$mode'; using incremental sync"
+              python main.py sync || exit_code=$$?
               ;;
           esac
           echo "Migration mode $$mode exited with code $$exit_code"
