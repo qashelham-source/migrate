@@ -11,6 +11,11 @@ services:
       API_HASH: "${API_HASH:-}"
       BOT_TOKEN: "${BOT_TOKEN:-}"
       RUN_INTERVAL_SECONDS: "${RUN_INTERVAL_SECONDS:-300}"
+      LIVE_RECONCILE_SECONDS: "${LIVE_RECONCILE_SECONDS:-300}"
+      LIVE_EVENT_DEBOUNCE_SECONDS: "${LIVE_EVENT_DEBOUNCE_SECONDS:-2}"
+      STORAGE_RESERVE_BYTES: "${STORAGE_RESERVE_BYTES:-5368709120}"
+      STORAGE_WARNING_FREE_BYTES: "${STORAGE_WARNING_FREE_BYTES:-10737418240}"
+      STORAGE_CRITICAL_FREE_BYTES: "${STORAGE_CRITICAL_FREE_BYTES:-3221225472}"
     volumes:
       - ./config.yaml:/app/config.yaml
       - ./sessions:/app/sessions
@@ -24,58 +29,19 @@ services:
         python main.py recover
         python main.py admin &
         admin_pid=$$!
+        python main.py serve &
+        service_pid=$$!
 
         cleanup() {
-          kill "$$admin_pid" 2>/dev/null || true
-          wait "$$admin_pid" 2>/dev/null || true
+          kill "$$admin_pid" "$$service_pid" 2>/dev/null || true
+          wait "$$admin_pid" "$$service_pid" 2>/dev/null || true
         }
         trap cleanup EXIT INT TERM
 
-        while kill -0 "$$admin_pid" 2>/dev/null; do
-          mode=sync
-          if [ -f /app/data/run_mode ]; then
-            mode=$$(cat /app/data/run_mode 2>/dev/null || echo sync)
-            rm -f /app/data/run_mode
-          fi
-
-          exit_code=0
-          case "$$mode" in
-            health)
-              echo "Running pre-flight health check"
-              python main.py health || exit_code=$$?
-              ;;
-            process)
-              echo "Resuming pending queue without scanning"
-              python main.py process || exit_code=$$?
-              ;;
-            sync)
-              echo "Syncing only new source posts, then processing queue"
-              python main.py sync || exit_code=$$?
-              ;;
-            run)
-              echo "Running full scan and queue processing"
-              python main.py run || exit_code=$$?
-              ;;
-            *)
-              echo "Unknown run mode '$$mode'; using incremental sync"
-              python main.py sync || exit_code=$$?
-              ;;
-          esac
-          echo "Migration mode $$mode exited with code $$exit_code"
-
-          elapsed=0
-          interval=$${RUN_INTERVAL_SECONDS:-300}
-          while [ "$$elapsed" -lt "$$interval" ]; do
-            kill -0 "$$admin_pid" 2>/dev/null || exit 1
-            if [ -f /app/data/run_now ]; then
-              rm -f /app/data/run_now
-              echo "Run requested from Telegram control panel"
-              break
-            fi
-            sleep 5
-            elapsed=$$((elapsed + 5))
-          done
+        while kill -0 "$$admin_pid" 2>/dev/null && kill -0 "$$service_pid" 2>/dev/null; do
+          sleep 5
         done
 
-        wait "$$admin_pid"
-    stop_grace_period: 30s
+        echo "Admin bot or live migration service stopped unexpectedly"
+        exit 1
+    stop_grace_period: 45s
