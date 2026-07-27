@@ -97,6 +97,77 @@ def _configured_destinations(config: AppConfig) -> list[Any]:
     ]
 
 
+def _configured_numeric_peer_ids(config: AppConfig) -> set[int]:
+    result: set[int] = set()
+    for spec in [*config.sources, *config.destinations]:
+        value = str(spec.chat or "").strip()
+        if value.lstrip("-").isdigit():
+            result.add(int(value))
+    return result
+
+
+async def warm_dialog_cache(
+    config: AppConfig,
+    reader: Client,
+    stop_event: asyncio.Event,
+    logger: Any | None = None,
+) -> tuple[int, set[int]]:
+    """Load the user session's dialogs so private peer IDs and access hashes are cached."""
+    if not config.telegram.load_dialogs_on_start:
+        return 0, set()
+
+    targets = _configured_numeric_peer_ids(config)
+    found: set[int] = set()
+    loaded = 0
+
+    write_status(
+        config,
+        "starting",
+        message="Memuatkan cache dialog dan channel Telegram...",
+        target_peers=len(targets),
+    )
+    if logger:
+        logger.info(
+            "Warming Telegram dialog cache before peer resolution; target_peer_ids=%s",
+            sorted(targets),
+        )
+
+    try:
+        async for dialog in reader.get_dialogs():
+            if stop_event.is_set():
+                break
+            loaded += 1
+            chat = getattr(dialog, "chat", None)
+            chat_id = getattr(chat, "id", None)
+            if chat_id is not None:
+                numeric_id = int(chat_id)
+                if numeric_id in targets:
+                    found.add(numeric_id)
+            if targets and found == targets:
+                break
+    except Exception as exc:
+        if logger:
+            logger.warning("Telegram dialog cache warmup stopped early: %s", exc)
+
+    missing = targets - found
+    if logger:
+        logger.info(
+            "Dialog cache warmup complete: loaded=%s matched=%s missing=%s",
+            loaded,
+            sorted(found),
+            sorted(missing),
+        )
+    write_status(
+        config,
+        "starting",
+        message="Cache dialog Telegram selesai dimuatkan.",
+        dialogs_loaded=loaded,
+        matched_peers=len(found),
+        missing_peers=len(missing),
+    )
+    return loaded, found
+
+
 async def choose_writer_for_destinations(
     config: AppConfig,
     reader: Client,
@@ -168,6 +239,8 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
             update_account_cache(config, config.telegram.user_session, me)
             logger.info("Reader session: %s (%s)", me.first_name, me.id)
 
+            await warm_dialog_cache(config, reader, stop_event, logger)
+
             bot = make_bot_client(config)
             writer = reader
             if bot and config.telegram.use_bot_for_uploads:
@@ -203,11 +276,6 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
                 reader_id=me.id,
                 writer="user" if writer is reader else "bot",
             )
-
-            if config.telegram.load_dialogs_on_start:
-                logger.info(
-                    "Dialog cache warmup skipped; chats are resolved directly through the limiter"
-                )
 
             if command in {"scan", "run"}:
                 scanner = Scanner(
