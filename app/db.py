@@ -70,6 +70,7 @@ class Database:
             """
         )
         self.conn.commit()
+        self.requeue_send_multi_media_errors()
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         cursor = self.conn.execute(sql, tuple(params))
@@ -198,6 +199,28 @@ class Database:
               AND (
                     LOWER(COALESCE(last_error, '')) LIKE '%peer id invalid%'
                  OR LOWER(COALESCE(last_error, '')) LIKE '%peer_id_invalid%'
+              )
+            """,
+            (utc_now(),),
+        )
+        self.conn.commit()
+        return cursor.rowcount
+
+    def requeue_send_multi_media_errors(self) -> int:
+        """Retry legacy album jobs that were skipped before individual upload fallback existed."""
+        cursor = self.conn.execute(
+            """
+            UPDATE messages
+            SET status = 'pending',
+                attempts = 0,
+                last_error = NULL,
+                next_retry_at = NULL,
+                updated_at = ?
+            WHERE status IN ('failed', 'skipped')
+              AND LOWER(COALESCE(last_error, '')) LIKE '%sendmultimedia%'
+              AND (
+                    LOWER(COALESCE(last_error, '')) LIKE '%media_empty%'
+                 OR LOWER(COALESCE(last_error, '')) LIKE '%mediaempty%'
               )
             """,
             (utc_now(),),
