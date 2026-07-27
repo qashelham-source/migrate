@@ -139,6 +139,31 @@ class MessageQueue:
     def counts_by_status(self) -> dict[str, int]:
         return self.db.counts_by_status()
 
+    def get_scan_checkpoint(
+        self,
+        source_chat_id: int | str,
+        source_topic_id: int | None = None,
+    ) -> int | None:
+        row = self.db.get_scan_checkpoint(source_chat_id, source_topic_id)
+        return int(row["last_scanned_message_id"]) if row else None
+
+    def set_scan_checkpoint(
+        self,
+        source_chat_id: int | str,
+        source_topic_id: int | None,
+        last_scanned_message_id: int,
+        scan_mode: str,
+    ) -> None:
+        self.db.set_scan_checkpoint(
+            source_chat_id,
+            source_topic_id,
+            last_scanned_message_id,
+            scan_mode,
+        )
+
+    def source_queue_highwater(self, source_chat_id: int | str) -> int | None:
+        return self.db.source_queue_highwater(source_chat_id)
+
     def get_media_cache(self, file_unique_key: str) -> MediaCacheEntry | None:
         row = self.db.get_media_cache(file_unique_key)
         if not row:
