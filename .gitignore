@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+
+data/*.sqlite3
+data/*.sqlite3-*
+data/*.log
+
+downloads/active/
+downloads/failed/
+downloads/completed/
+
+sessions/*.session
+sessions/*.session-journal
+
+.env
+config.local.yaml
