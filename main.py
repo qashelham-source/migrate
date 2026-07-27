@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import AsyncExitStack, suppress
+from pathlib import Path
 from typing import Any
 
 from pyrogram import Client
@@ -13,9 +14,12 @@ from app.control import clear_stop, watch_stop_request, write_status
 from app.db import Database
 from app.destination_manager import add_destination, list_destinations, remove_destination
 from app.health import run_health_check
+from app.live import LiveTrigger
 from app.logging import setup_logging
 from app.queue import MessageQueue
+from app.release3_uploader import Release3Uploader
 from app.scanner import Scanner
+from app.source_registry import refresh_source_registry
 from app.telegram_client import (
     TelegramLimiter,
     install_stop_handlers,
@@ -25,7 +29,6 @@ from app.telegram_client import (
     resolve_chat,
     update_account_cache,
 )
-from app.upload import Uploader
 from app.worker import Verifier, Worker
 
 
@@ -38,6 +41,7 @@ COMMANDS = (
     "process",
     "verify",
     "run",
+    "serve",
     "stats",
     "recover",
     "list-destinations",
@@ -48,7 +52,7 @@ COMMANDS = (
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Telegram migration with reusable bot file_id cache"
+        description="Verified live Telegram migration with reusable bot file_id cache"
     )
     parser.add_argument("command", choices=COMMANDS, help="Command to run")
     parser.add_argument("values", nargs="*", help="Arguments for destination commands")
@@ -100,6 +104,14 @@ def _configured_destinations(config: AppConfig) -> list[Any]:
     ]
 
 
+def _configured_sources(config: AppConfig) -> list[Any]:
+    return [
+        spec
+        for spec in config.sources
+        if spec.chat and "source_channel_or_-100_id" not in str(spec.chat).lower()
+    ]
+
+
 def _configured_numeric_peer_ids(config: AppConfig) -> set[int]:
     result: set[int] = set()
     for spec in [*config.sources, *config.destinations]:
@@ -122,7 +134,6 @@ async def warm_dialog_cache(
     targets = _configured_numeric_peer_ids(config)
     found: set[int] = set()
     loaded = 0
-
     write_status(
         config,
         "starting",
@@ -210,7 +221,208 @@ async def choose_writer_for_destinations(
     return writer, True
 
 
-async def run_with_clients(config: AppConfig, command: str) -> None:
+async def _resume_healthy_destinations(
+    config: AppConfig,
+    queue: MessageQueue,
+    client: Client,
+    limiter: TelegramLimiter,
+    logger: Any | None = None,
+) -> None:
+    for spec in _configured_destinations(config):
+        try:
+            resolved = await resolve_chat(client, limiter, spec)
+            queue.resume_destination(resolved.chat_id)
+        except Exception as exc:
+            if logger:
+                logger.debug("Destination %s remains unavailable: %s", spec.chat, exc)
+
+
+async def _resolved_source_ids(
+    config: AppConfig,
+    queue: MessageQueue,
+    reader: Client,
+    limiter: TelegramLimiter,
+    logger: Any | None = None,
+) -> set[int]:
+    source_ids: set[int] = set()
+    for spec in _configured_sources(config):
+        try:
+            resolved = await resolve_chat(reader, limiter, spec)
+            source_ids.add(int(resolved.chat_id))
+            queue.set_live_watch(resolved.chat_id, True)
+        except Exception as exc:
+            if logger:
+                logger.warning("Live watcher could not resolve source %s: %s", spec.chat, exc)
+    return source_ids
+
+
+async def _execute_cycle(
+    config: AppConfig,
+    command: str,
+    *,
+    reader: Client,
+    bot: Client | None,
+    limiter: TelegramLimiter,
+    queue: MessageQueue,
+    stop_event: asyncio.Event,
+    reader_me: Any,
+    writer_me: Any,
+    logger: Any | None,
+    trigger_reason: str | None = None,
+) -> None:
+    queue.config = config
+    writer = bot if bot is not None and config.telegram.use_bot_for_uploads else reader
+    writer, destinations_ready = await choose_writer_for_destinations(
+        config,
+        reader,
+        writer,
+        limiter,
+        logger,
+    )
+    if destinations_ready:
+        await _resume_healthy_destinations(config, queue, writer, limiter, logger)
+        revived = queue.requeue_peer_id_errors()
+        if revived and logger:
+            logger.info("Returned %s PEER_ID_INVALID job(s) to pending", revived)
+
+    cycle_mode = "incremental" if command == "sync" else "full" if command in {"scan", "run"} else command
+    write_status(
+        config,
+        "starting",
+        message="Telegram connected. Menyediakan migration cycle.",
+        reader_id=reader_me.id,
+        writer="user" if writer is reader else "bot",
+        cycle_mode=cycle_mode,
+        live_trigger=trigger_reason,
+    )
+
+    if command == "health":
+        report = await run_health_check(
+            config,
+            reader,
+            writer,
+            limiter,
+            queue,
+            reader_me=reader_me,
+            writer_me=writer_me,
+            logger=logger,
+        )
+        print(f"Health check: {report['overall']}")
+        return
+
+    if command in {"scan", "sync", "run"}:
+        scanner = Scanner(
+            config,
+            queue,
+            reader,
+            limiter,
+            writer=writer,
+            logger=logger,
+            scan_mode="incremental" if command == "sync" else "full",
+        )
+        await scanner.scan(stop_event)
+
+    if command in {"process", "sync", "run"} and not stop_event.is_set():
+        uploader = Release3Uploader(
+            config,
+            reader,
+            writer,
+            limiter,
+            queue=queue,
+            logger=logger,
+        )
+        worker = Worker(config, queue, uploader, logger=logger)
+        await worker.run(stop_event)
+
+    if command in {"verify", "process", "sync", "run"} and not stop_event.is_set():
+        verifier = Verifier(
+            config,
+            queue,
+            reader,
+            writer,
+            limiter,
+            logger=logger,
+        )
+        await verifier.run(stop_event)
+
+    for spec in _configured_sources(config):
+        value = str(spec.chat).strip()
+        if value.lstrip("-").isdigit():
+            queue.recompute_source_state(int(value))
+
+
+async def _run_live_service(
+    initial_config: AppConfig,
+    config_path: str | Path,
+    *,
+    reader: Client,
+    bot: Client | None,
+    limiter: TelegramLimiter,
+    queue: MessageQueue,
+    stop_event: asyncio.Event,
+    reader_me: Any,
+    writer_me: Any,
+    logger: Any | None,
+) -> None:
+    await refresh_source_registry(initial_config, queue, reader, stop_event, logger)
+    source_ids = await _resolved_source_ids(initial_config, queue, reader, limiter, logger)
+    trigger = LiveTrigger(source_ids)
+    reader.add_handler(trigger.handler)
+    command = "sync"
+    reason = "startup"
+    cycle_number = 0
+    try:
+        while not stop_event.is_set():
+            config = load_config(config_path)
+            config.ensure_directories()
+            queue.config = config
+            trigger.source_ids = await _resolved_source_ids(config, queue, reader, limiter, logger)
+            cycle_number += 1
+            write_status(
+                config,
+                "starting",
+                message="Live Watcher aktif. Menjalankan cycle migration.",
+                live_watcher=True,
+                watched_sources=len(trigger.source_ids),
+                reconciliation_seconds=trigger.settings.reconcile_interval_seconds,
+                live_trigger=reason,
+                cycle_number=cycle_number,
+            )
+            await _execute_cycle(
+                config,
+                command,
+                reader=reader,
+                bot=bot,
+                limiter=limiter,
+                queue=queue,
+                stop_event=stop_event,
+                reader_me=reader_me,
+                writer_me=writer_me,
+                logger=logger,
+                trigger_reason=reason,
+            )
+            if stop_event.is_set():
+                break
+            if cycle_number % 12 == 0:
+                await refresh_source_registry(config, queue, reader, stop_event, logger)
+            write_status(
+                config,
+                "watching",
+                message="Live Watcher menunggu post baharu; checkpoint reconciliation kekal aktif.",
+                live_watcher=True,
+                watched_sources=len(trigger.source_ids),
+                reconciliation_seconds=trigger.settings.reconcile_interval_seconds,
+                **queue.counts_by_status(),
+            )
+            next_trigger = await trigger.wait(config, stop_event)
+            if next_trigger is None:
+                break
+            command, reason = next_trigger
+    finally:
+        reader.remove_handler(trigger.handler)
+
+
+async def run_with_clients(config: AppConfig, command: str, config_path: str | Path) -> None:
     logger = setup_logging(config.logging)
     limiter = TelegramLimiter(config, logger)
     stop_event = asyncio.Event()
@@ -226,6 +438,7 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
             print_counts(queue.counts_by_status())
             print(f"cached_file_id: {queue.media_cache_count()}")
             print(f"scan_checkpoints: {len(db.list_scan_checkpoints())}")
+            print(f"source_registry: {len(queue.list_registered_sources())}")
             return
         if command == "recover":
             recovered = queue.recover_in_progress()
@@ -233,12 +446,11 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
             return
 
         clear_stop(config)
-        cycle_mode = "incremental" if command == "sync" else "full" if command in {"scan", "run"} else command
         write_status(
             config,
             "starting",
             message="Menyambung ke Telegram...",
-            cycle_mode=cycle_mode,
+            cycle_mode="service" if command == "serve" else command,
         )
         stop_watcher = asyncio.create_task(watch_stop_request(config, stop_event))
 
@@ -252,92 +464,46 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
             await warm_dialog_cache(config, reader, stop_event, logger)
 
             bot = make_bot_client(config)
-            writer = reader
             writer_me = me
             if bot and config.telegram.use_bot_for_uploads:
-                writer = bot
-                await stack.enter_async_context(writer)
-                writer_me = await limiter.call("read", writer.get_me)
+                await stack.enter_async_context(bot)
+                writer_me = await limiter.call("read", bot.get_me)
                 logger.info("Writer bot: %s (%s)", writer_me.first_name, writer_me.id)
+            else:
+                bot = None
 
-            if command == "health":
-                report = await run_health_check(
+            if command == "serve":
+                await _run_live_service(
                     config,
-                    reader,
-                    writer,
-                    limiter,
-                    queue,
+                    config_path,
+                    reader=reader,
+                    bot=bot,
+                    limiter=limiter,
+                    queue=queue,
+                    stop_event=stop_event,
                     reader_me=me,
                     writer_me=writer_me,
                     logger=logger,
                 )
-                print(f"Health check: {report['overall']}")
-                return
-
-            writer, destinations_ready = await choose_writer_for_destinations(
-                config,
-                reader,
-                writer,
-                limiter,
-                logger,
-            )
-            if writer is reader and bot is not None:
-                write_status(
+            else:
+                await _execute_cycle(
                     config,
-                    "starting",
-                    message="Destination private dikesan. Menggunakan user session untuk penghantaran.",
-                    reader_id=me.id,
-                    cycle_mode=cycle_mode,
-                )
-
-            if destinations_ready:
-                revived = queue.requeue_peer_id_errors()
-                if revived:
-                    logger.info("Returned %s PEER_ID_INVALID job(s) to pending", revived)
-
-            write_status(
-                config,
-                "starting",
-                message="Telegram connected. Menyediakan migration cycle.",
-                reader_id=me.id,
-                writer="user" if writer is reader else "bot",
-                cycle_mode=cycle_mode,
-            )
-
-            if command in {"scan", "sync", "run"}:
-                scanner = Scanner(
-                    config,
-                    queue,
-                    reader,
-                    limiter,
-                    writer=writer,
-                    logger=logger,
-                    scan_mode="incremental" if command == "sync" else "full",
-                )
-                await scanner.scan(stop_event)
-
-            if command in {"process", "sync", "run"} and not stop_event.is_set():
-                uploader = Uploader(
-                    config,
-                    reader,
-                    writer,
-                    limiter,
+                    command,
+                    reader=reader,
+                    bot=bot,
+                    limiter=limiter,
                     queue=queue,
+                    stop_event=stop_event,
+                    reader_me=me,
+                    writer_me=writer_me,
                     logger=logger,
                 )
-                worker = Worker(config, queue, uploader, logger=logger)
-                await worker.run(stop_event)
-
-            if command == "verify" and not stop_event.is_set():
-                verifier = Verifier(config, queue, writer, limiter, logger=logger)
-                await verifier.run(stop_event)
 
             if stop_event.is_set():
                 write_status(
                     config,
                     "stopped",
                     message="Migration dihentikan dengan selamat.",
-                    cycle_mode=cycle_mode,
                     **queue.counts_by_status(),
                 )
     except Exception as exc:
@@ -370,7 +536,6 @@ async def async_main() -> None:
     args = parse_args()
     if handle_destination_command(args):
         return
-
     config = load_config(args.config)
     config.ensure_directories()
 
@@ -382,7 +547,7 @@ async def async_main() -> None:
         await run_admin_bot(config, args.config)
         return
 
-    await run_with_clients(config, args.command)
+    await run_with_clients(config, args.command, args.config)
 
 
 def main() -> None:
