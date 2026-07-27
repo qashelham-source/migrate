@@ -21,6 +21,11 @@ from app.telegram_client import (
 )
 
 
+def _is_placeholder(chat: str) -> bool:
+    value = str(chat).lower()
+    return "source_channel_or_-100_id" in value or "destination_channel_or_-100_id" in value
+
+
 class Scanner:
     def __init__(
         self,
@@ -40,12 +45,18 @@ class Scanner:
 
     async def scan(self, stop_event: asyncio.Event) -> None:
         destinations = await self._resolve_destinations()
-        if not destinations:
-            raise ValueError("No valid destinations configured")
-        if not self.config.sources:
-            raise ValueError("No source configured")
+        sources = [source for source in self.config.sources if source.chat and not _is_placeholder(source.chat)]
 
-        for source in self.config.sources:
+        if not sources or not destinations:
+            if self.logger:
+                self.logger.info(
+                    "Migration waiting for Telegram bot settings: source=%s destination=%s",
+                    "set" if sources else "missing",
+                    "set" if destinations else "missing",
+                )
+            return
+
+        for source in sources:
             if stop_event.is_set():
                 break
             await self._scan_source(source, destinations, stop_event)
@@ -53,6 +64,9 @@ class Scanner:
     async def _resolve_destinations(self) -> list[ResolvedChat]:
         resolved: list[ResolvedChat] = []
         for spec in self.config.destinations:
+            if not spec.chat or _is_placeholder(spec.chat):
+                continue
+
             try:
                 resolved.append(await resolve_chat(self.reader, self.limiter, spec))
                 continue
