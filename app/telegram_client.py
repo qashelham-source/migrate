@@ -150,7 +150,7 @@ async def interactive_login(config: AppConfig, session_name: str | None = None) 
             await limiter.call("read", client.sign_in, phone, sent_code.phone_code_hash, code)
         except SessionPasswordNeeded:
             password = input("Two-factor password: ").strip()
-            await limiter.call("read", client.sign_in, password=password)
+            await limiter.call("read", client.check_password, password)
 
         me = await limiter.call("read", client.get_me)
         update_account_cache(config, session, me)
