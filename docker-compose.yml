@@ -32,9 +32,32 @@ services:
         trap cleanup EXIT INT TERM
 
         while kill -0 "$$admin_pid" 2>/dev/null; do
+          mode=run
+          if [ -f /app/data/run_mode ]; then
+            mode=$$(cat /app/data/run_mode 2>/dev/null || echo run)
+            rm -f /app/data/run_mode
+          fi
+
           exit_code=0
-          python main.py run || exit_code=$$?
-          echo "Migration cycle exited with code $$exit_code"
+          case "$$mode" in
+            health)
+              echo "Running pre-flight health check"
+              python main.py health || exit_code=$$?
+              ;;
+            process)
+              echo "Resuming pending queue without scanning"
+              python main.py process || exit_code=$$?
+              ;;
+            run)
+              echo "Running full scan and queue processing"
+              python main.py run || exit_code=$$?
+              ;;
+            *)
+              echo "Unknown run mode '$$mode'; using full run"
+              python main.py run || exit_code=$$?
+              ;;
+          esac
+          echo "Migration mode $$mode exited with code $$exit_code"
 
           elapsed=0
           interval=$${RUN_INTERVAL_SECONDS:-300}

@@ -12,6 +12,7 @@ from app.config import AppConfig, load_config
 from app.control import clear_stop, watch_stop_request, write_status
 from app.db import Database
 from app.destination_manager import add_destination, list_destinations, remove_destination
+from app.health import run_health_check
 from app.logging import setup_logging
 from app.queue import MessageQueue
 from app.scanner import Scanner
@@ -31,6 +32,7 @@ from app.worker import Verifier, Worker
 COMMANDS = (
     "login",
     "admin",
+    "health",
     "scan",
     "process",
     "verify",
@@ -243,11 +245,26 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
 
             bot = make_bot_client(config)
             writer = reader
+            writer_me = me
             if bot and config.telegram.use_bot_for_uploads:
                 writer = bot
                 await stack.enter_async_context(writer)
-                bot_me = await limiter.call("read", writer.get_me)
-                logger.info("Writer bot: %s (%s)", bot_me.first_name, bot_me.id)
+                writer_me = await limiter.call("read", writer.get_me)
+                logger.info("Writer bot: %s (%s)", writer_me.first_name, writer_me.id)
+
+            if command == "health":
+                report = await run_health_check(
+                    config,
+                    reader,
+                    writer,
+                    limiter,
+                    queue,
+                    reader_me=me,
+                    writer_me=writer_me,
+                    logger=logger,
+                )
+                print(f"Health check: {report['overall']}")
+                return
 
             writer, destinations_ready = await choose_writer_for_destinations(
                 config,

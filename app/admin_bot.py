@@ -10,6 +10,15 @@ from pyrogram import Client, filters, idle
 from pyrogram.errors import MessageNotModified
 from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
+from app.advanced import (
+    REPAIR_CATEGORIES,
+    load_health_report,
+    repair_samples,
+    repair_summary,
+    request_run_mode,
+    requeue_repair_category,
+    requeue_retryable_repairs,
+)
 from app.config import AppConfig
 from app.control import (
     clear_stop,
@@ -34,6 +43,17 @@ _PENDING: dict[int, str] = {}
 _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
 
 
+CATEGORY_LABELS = {
+    "media_empty": "MEDIA_EMPTY",
+    "peer_id": "Peer ID",
+    "permission": "Permission",
+    "temporary": "Temporary/Network",
+    "source_missing": "Source Missing",
+    "unsupported": "Unsupported",
+    "other": "Other",
+}
+
+
 def _menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
@@ -48,12 +68,60 @@ def _menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("⏹ Stop Current Job", callback_data="stop:current"),
             ],
             [InlineKeyboardButton("▶️ Run Sekarang", callback_data="run:now")],
+            [InlineKeyboardButton("🧰 Advanced Tools", callback_data="advanced:menu")],
         ]
     )
 
 
 def _back_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Menu", callback_data="menu")]])
+
+
+def _advanced_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("🩺 Health Check", callback_data="advanced:health"),
+                InlineKeyboardButton("🛠 Repair Queue", callback_data="advanced:repair"),
+            ],
+            [
+                InlineKeyboardButton("▶️ Resume Pending", callback_data="advanced:resume"),
+                InlineKeyboardButton("🔍 Full Scan", callback_data="advanced:full"),
+            ],
+            [InlineKeyboardButton("🆕 Sync New Posts", callback_data="advanced:sync")],
+            [InlineKeyboardButton("⬅️ Menu", callback_data="menu")],
+        ]
+    )
+
+
+def _health_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("▶️ Run Check", callback_data="health:run"),
+                InlineKeyboardButton("🔄 Refresh", callback_data="health:refresh"),
+            ],
+            [InlineKeyboardButton("⬅️ Advanced Tools", callback_data="advanced:menu")],
+        ]
+    )
+
+
+def _repair_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("🔄 Retry masalah sementara", callback_data="repair:retry:all")],
+            [
+                InlineKeyboardButton("🎞 Retry MEDIA_EMPTY", callback_data="repair:retry:media_empty"),
+                InlineKeyboardButton("🔑 Retry Permission", callback_data="repair:retry:permission"),
+            ],
+            [
+                InlineKeyboardButton("🧩 Retry Peer ID", callback_data="repair:retry:peer_id"),
+                InlineKeyboardButton("📋 Lihat Butiran", callback_data="repair:details"),
+            ],
+            [InlineKeyboardButton("🔄 Refresh", callback_data="advanced:repair")],
+            [InlineKeyboardButton("⬅️ Advanced Tools", callback_data="advanced:menu")],
+        ]
+    )
 
 
 def _status_menu() -> InlineKeyboardMarkup:
@@ -100,10 +168,9 @@ def _extract_chat(message: Message) -> str:
     return value
 
 
-def _touch_run_now(config: AppConfig) -> None:
-    path = config.queue.db_path.parent / "run_now"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.touch()
+def _request_mode(config: AppConfig, mode: str) -> None:
+    clear_stop(config)
+    request_run_mode(config, mode)
 
 
 def _settings_text(config_path: Path) -> str:
@@ -132,6 +199,12 @@ def _queue_counts(config: AppConfig) -> dict[str, int]:
         db.close()
 
 
+def _with_database(config: AppConfig) -> Database:
+    db = Database(config.queue.db_path)
+    db.initialize()
+    return db
+
+
 def _status_text(config: AppConfig) -> str:
     status = read_status(config)
     counts = _queue_counts(config)
@@ -147,6 +220,8 @@ def _status_text(config: AppConfig) -> str:
         "batch_pause": "⏸ Batch Pause",
         "stopping": "🛑 Stopping Safely",
         "stopped": "⏹ Stopped",
+        "health_check": "🩺 Health Check",
+        "health_complete": "✅ Health Check Complete",
         "idle": "✅ Idle",
         "error": "❌ Error",
     }
@@ -205,6 +280,102 @@ def _status_text(config: AppConfig) -> str:
         lines.extend(["", f"Updated: {updated_at} UTC"])
     lines.append("Auto-refresh setiap 3 saat.")
     return "\n".join(lines)
+
+
+def _advanced_text(config: AppConfig) -> str:
+    status = read_status(config)
+    counts = _queue_counts(config)
+    active = is_active_phase(status.get("phase"))
+    return "\n".join(
+        [
+            "🧰 Advanced Tools",
+            "",
+            f"Migration: {'sedang berjalan' if active else 'tidak aktif'}",
+            f"Pending: {counts.get('pending', 0)}",
+            f"Failed: {counts.get('failed', 0)}",
+            f"Skipped: {counts.get('skipped', 0)}",
+            "",
+            "Health Check menguji session, akses channel, permission dan storage.",
+            "Repair Queue mengumpulkan job bermasalah mengikut punca.",
+        ]
+    )
+
+
+def _health_text(config: AppConfig) -> str:
+    report = load_health_report(config)
+    status = read_status(config)
+    if not report:
+        lines = [
+            "🩺 Pre-flight Health Check",
+            "",
+            "Belum ada laporan health check.",
+            "Tekan Run Check untuk menguji session, source, destination, permission dan storage.",
+        ]
+        if str(status.get("phase")) == "health_check":
+            lines.extend(["", "🟡 Health check sedang berjalan..."])
+        return "\n".join(lines)
+
+    overall_icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}.get(str(report.get("overall")), "ℹ️")
+    lines = [
+        "🩺 Pre-flight Health Check",
+        "",
+        f"Overall: {overall_icon} {str(report.get('overall') or 'unknown').upper()}",
+        f"Checked: {report.get('generated_at') or '-'} UTC",
+        "",
+    ]
+    for item in report.get("checks") or []:
+        icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}.get(str(item.get("status")), "•")
+        lines.append(f"{icon} {item.get('name')}: {item.get('detail')}")
+    if str(status.get("phase")) == "health_check":
+        lines.extend(["", "🟡 Health check baru sedang berjalan..."])
+    return "\n".join(lines)[:3900]
+
+
+def _repair_text(config: AppConfig) -> str:
+    db = _with_database(config)
+    try:
+        summary = repair_summary(db)
+    finally:
+        db.close()
+    total = sum(summary.values())
+    lines = ["🛠 Repair Queue", "", f"Jumlah job bermasalah: {total}", ""]
+    for category in REPAIR_CATEGORIES:
+        lines.append(f"• {CATEGORY_LABELS[category]}: {summary.get(category, 0)}")
+    lines.extend(
+        [
+            "",
+            "Retry masalah sementara tidak menyentuh job Unsupported atau Source Missing.",
+            "Permission hanya patut diretry selepas akses channel sudah dibetulkan.",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _repair_details_text(config: AppConfig) -> str:
+    db = _with_database(config)
+    try:
+        rows: list[tuple[str, dict[str, Any]]] = []
+        for category in REPAIR_CATEGORIES:
+            for item in repair_samples(db, category, limit=5):
+                rows.append((category, item))
+        rows.sort(key=lambda pair: int(pair[1]["id"]), reverse=True)
+    finally:
+        db.close()
+
+    lines = ["📋 Repair Queue Details", ""]
+    if not rows:
+        lines.append("Tiada failed/skipped job dengan error untuk dibaiki.")
+    for category, item in rows[:15]:
+        error = str(item["last_error"]).replace("\n", " ")[:160]
+        lines.extend(
+            [
+                f"#{item['id']} · {CATEGORY_LABELS[category]} · {item['media_type']}",
+                f"Source message: {item['source_message_id']} · Attempts: {item['attempts']}",
+                f"{error}",
+                "",
+            ]
+        )
+    return "\n".join(lines)[:3900]
 
 
 def _cancel_live(user_id: int) -> None:
@@ -293,6 +464,88 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await query.answer()
             return
 
+        if data == "advanced:menu":
+            await query.message.edit_text(_advanced_text(config), reply_markup=_advanced_menu())
+            await query.answer()
+            return
+
+        if data == "advanced:health" or data == "health:refresh":
+            try:
+                await query.message.edit_text(_health_text(config), reply_markup=_health_menu())
+            except MessageNotModified:
+                pass
+            await query.answer("Health report dikemas kini" if data == "health:refresh" else None)
+            return
+
+        if data == "health:run":
+            status = read_status(config)
+            _request_mode(config, "health")
+            text = "Health check akan berjalan selepas cycle semasa selesai." if is_active_phase(
+                status.get("phase")
+            ) else "Health check akan mula secepat mungkin."
+            await query.answer(text, show_alert=True)
+            try:
+                await query.message.edit_text(_health_text(config), reply_markup=_health_menu())
+            except MessageNotModified:
+                pass
+            return
+
+        if data == "advanced:repair":
+            try:
+                await query.message.edit_text(_repair_text(config), reply_markup=_repair_menu())
+            except MessageNotModified:
+                pass
+            await query.answer()
+            return
+
+        if data == "repair:details":
+            await query.message.edit_text(_repair_details_text(config), reply_markup=_repair_menu())
+            await query.answer()
+            return
+
+        if data.startswith("repair:retry:"):
+            status = read_status(config)
+            if is_active_phase(status.get("phase")):
+                await query.answer(
+                    "Migration masih aktif. Stop atau tunggu selesai sebelum repair queue.",
+                    show_alert=True,
+                )
+                return
+            category = data.rsplit(":", 1)[1]
+            db = _with_database(config)
+            try:
+                if category == "all":
+                    revived = requeue_retryable_repairs(db)
+                else:
+                    revived = requeue_repair_category(db, category)
+            finally:
+                db.close()
+            if revived:
+                _request_mode(config, "process")
+            await query.answer(
+                f"{revived} job dikembalikan ke pending." if revived else "Tiada job sepadan untuk diretry.",
+                show_alert=True,
+            )
+            await query.message.edit_text(_repair_text(config), reply_markup=_repair_menu())
+            return
+
+        if data == "advanced:resume":
+            _request_mode(config, "process")
+            await query.answer("Pending queue akan disambung tanpa scan semula.", show_alert=True)
+            return
+
+        if data == "advanced:full":
+            _request_mode(config, "run")
+            await query.answer("Full scan dan pemprosesan queue telah dijadualkan.", show_alert=True)
+            return
+
+        if data == "advanced:sync":
+            await query.answer(
+                "Checkpoint Sync New Posts akan diaktifkan dalam Release 2. Buat masa ini guna Full Scan.",
+                show_alert=True,
+            )
+            return
+
         if data == "source:set":
             _PENDING[user_id] = "source"
             await query.message.edit_text(
@@ -358,7 +611,10 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 label = f"🗑 {index}. {destination.get('chat', '')}"[:60]
                 rows.append([InlineKeyboardButton(label, callback_data=f"dest:delete:{index}")])
             rows.append([InlineKeyboardButton("⬅️ Menu", callback_data="menu")])
-            await query.message.edit_text("Pilih destination yang nak dibuang:", reply_markup=InlineKeyboardMarkup(rows))
+            await query.message.edit_text(
+                "Pilih destination yang nak dibuang:",
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
             await query.answer()
             return
 
@@ -366,7 +622,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             try:
                 index = int(data.rsplit(":", 1)[1])
                 removed = remove_destination(index, path)
-                _touch_run_now(config)
+                _request_mode(config, "run")
                 await query.answer(f"Dibuang: {removed.get('chat', '')}", show_alert=True)
                 await query.message.edit_text(_settings_text(path), reply_markup=_back_menu())
             except Exception as exc:
@@ -374,8 +630,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             return
 
         if data == "run:now":
-            clear_stop(config)
-            _touch_run_now(config)
+            _request_mode(config, "run")
             await query.answer("Migration akan mula secepat mungkin.", show_alert=True)
             return
 
@@ -405,11 +660,13 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 saved = add_destination(chat, None, path)
                 result = f"✅ Destination ditambah: {saved['chat']}"
             _PENDING.pop(user_id, None)
-            clear_stop(config)
-            _touch_run_now(config)
+            _request_mode(config, "run")
             await message.reply_text(result, reply_markup=_menu())
         except Exception as exc:
-            await message.reply_text(f"Tak berjaya: {exc}\n\nCuba hantar semula atau tekan Menu.", reply_markup=_back_menu())
+            await message.reply_text(
+                f"Tak berjaya: {exc}\n\nCuba hantar semula atau tekan Menu.",
+                reply_markup=_back_menu(),
+            )
 
     await app.start()
     try:
