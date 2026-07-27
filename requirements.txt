@@ -5,5 +5,3 @@ colorama==0.4.6
 tqdm==4.66.5
 PyYAML==6.0.2
 telethon==1.41.2
-pip install -r requirements.txt
-telethon==1.41.2
