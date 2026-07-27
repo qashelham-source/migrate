@@ -1,0 +1,30 @@
+services:
+  migration-manager:
+    build:
+      context: .
+    container_name: migration-manager
+    restart: unless-stopped
+    init: true
+    working_dir: /app
+    environment:
+      API_ID: "${API_ID:-}"
+      API_HASH: "${API_HASH:-}"
+      BOT_TOKEN: "${BOT_TOKEN:-}"
+      RUN_INTERVAL_SECONDS: "${RUN_INTERVAL_SECONDS:-300}"
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - ./sessions:/app/sessions
+      - ./data:/app/data
+      - ./downloads:/app/downloads
+    command:
+      - /bin/sh
+      - -c
+      - |
+        python main.py recover
+        while true; do
+          python main.py run
+          exit_code=$$?
+          echo "Migration cycle exited with code $$exit_code; retrying in $${RUN_INTERVAL_SECONDS:-300}s"
+          sleep "$${RUN_INTERVAL_SECONDS:-300}"
+        done
+    stop_grace_period: 30s
