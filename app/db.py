@@ -14,6 +14,10 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _topic_key(topic_id: int | None) -> int:
+    return int(topic_id or 0)
+
+
 class Database:
     def __init__(self, path: Path) -> None:
         self.path = path
@@ -66,6 +70,16 @@ class Database:
                 media_types TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS scan_checkpoints (
+                source_chat_id TEXT NOT NULL,
+                source_topic_key INTEGER NOT NULL DEFAULT 0,
+                last_scanned_message_id INTEGER NOT NULL,
+                last_scan_mode TEXT NOT NULL DEFAULT 'incremental',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (source_chat_id, source_topic_key)
             );
             """
         )
@@ -256,6 +270,95 @@ class Database:
     def counts_by_status(self) -> dict[str, int]:
         rows = self.query("SELECT status, COUNT(*) AS count FROM messages GROUP BY status")
         return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def get_scan_checkpoint(
+        self,
+        source_chat_id: int | str,
+        source_topic_id: int | None = None,
+    ) -> sqlite3.Row | None:
+        return self.query_one(
+            """
+            SELECT * FROM scan_checkpoints
+            WHERE source_chat_id = ? AND source_topic_key = ?
+            """,
+            (str(source_chat_id), _topic_key(source_topic_id)),
+        )
+
+    def set_scan_checkpoint(
+        self,
+        source_chat_id: int | str,
+        source_topic_id: int | None,
+        last_scanned_message_id: int,
+        scan_mode: str,
+    ) -> None:
+        now = utc_now()
+        self.execute(
+            """
+            INSERT INTO scan_checkpoints (
+                source_chat_id, source_topic_key, last_scanned_message_id,
+                last_scan_mode, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source_chat_id, source_topic_key) DO UPDATE SET
+                last_scanned_message_id = excluded.last_scanned_message_id,
+                last_scan_mode = excluded.last_scan_mode,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(source_chat_id),
+                _topic_key(source_topic_id),
+                int(last_scanned_message_id),
+                str(scan_mode),
+                now,
+                now,
+            ),
+        )
+
+    def list_scan_checkpoints(self) -> list[sqlite3.Row]:
+        return self.query(
+            """
+            SELECT source_chat_id, source_topic_key, last_scanned_message_id,
+                   last_scan_mode, created_at, updated_at
+            FROM scan_checkpoints
+            ORDER BY updated_at DESC, source_chat_id ASC
+            """
+        )
+
+    def reset_scan_checkpoints(
+        self,
+        source_chat_id: int | str | None = None,
+        source_topic_id: int | None = None,
+    ) -> int:
+        if source_chat_id is None:
+            cursor = self.execute("DELETE FROM scan_checkpoints")
+            return int(cursor.rowcount)
+        cursor = self.execute(
+            "DELETE FROM scan_checkpoints WHERE source_chat_id = ? AND source_topic_key = ?",
+            (str(source_chat_id), _topic_key(source_topic_id)),
+        )
+        return int(cursor.rowcount)
+
+    def source_queue_highwater(self, source_chat_id: int | str) -> int | None:
+        """Return the highest source message ID already represented by any queued group."""
+        rows = self.query(
+            """
+            SELECT source_message_id, source_message_ids
+            FROM messages
+            WHERE source_chat_id = ?
+            """,
+            (str(source_chat_id),),
+        )
+        highest: int | None = None
+        for row in rows:
+            candidates = [int(row["source_message_id"])]
+            try:
+                decoded = json.loads(row["source_message_ids"] or "[]")
+                if isinstance(decoded, list):
+                    candidates.extend(int(value) for value in decoded)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            row_highest = max(candidates)
+            highest = row_highest if highest is None else max(highest, row_highest)
+        return highest
 
     def get_media_cache(self, file_unique_key: str) -> sqlite3.Row | None:
         return self.query_one(
