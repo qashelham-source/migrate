@@ -24,6 +24,37 @@ class Release3Uploader(Uploader):
         self._meters: dict[str, ProgressMeter] = {}
         self._last_progress_write = 0.0
         self._storage_policy = StoragePolicy.from_environment()
+        self._install_pause_guard()
+
+    def _install_pause_guard(self) -> None:
+        """Prevent automatic resolve checks from clearing a real permission pause."""
+        self.queue.db.conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS trg_keep_permission_destination_paused
+            BEFORE UPDATE OF paused ON destination_health
+            WHEN OLD.paused = 1
+             AND NEW.paused = 0
+             AND EXISTS (
+                SELECT 1 FROM messages m
+                WHERE m.dest_chat_id = OLD.dest_chat_id
+                  AND m.status IN ('failed', 'skipped')
+                  AND (
+                       LOWER(COALESCE(m.last_error, '')) LIKE '%chatwriteforbidden%'
+                    OR LOWER(COALESCE(m.last_error, '')) LIKE '%chat_write_forbidden%'
+                    OR LOWER(COALESCE(m.last_error, '')) LIKE '%channelprivate%'
+                    OR LOWER(COALESCE(m.last_error, '')) LIKE '%channel_private%'
+                    OR LOWER(COALESCE(m.last_error, '')) LIKE '%channelinvalid%'
+                    OR LOWER(COALESCE(m.last_error, '')) LIKE '%channel_invalid%'
+                    OR LOWER(COALESCE(m.last_error, '')) LIKE '%not enough rights%'
+                    OR LOWER(COALESCE(m.last_error, '')) LIKE '%forbidden%'
+                  )
+             )
+            BEGIN
+                SELECT RAISE(IGNORE);
+            END;
+            """
+        )
+        self.queue.db.conn.commit()
 
     async def process(
         self,
