@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 
 from app.admin_bot import run_admin_bot
 from app.config import AppConfig, load_config
+from app.control import clear_stop, watch_stop_request, write_status
 from app.db import Database
 from app.destination_manager import add_destination, list_destinations, remove_destination
 from app.logging import setup_logging
@@ -92,6 +93,7 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
     db = Database(config.queue.db_path)
     db.initialize()
     queue = MessageQueue(db, config)
+    stop_watcher: asyncio.Task[None] | None = None
 
     try:
         if command == "stats":
@@ -102,6 +104,10 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
             recovered = queue.recover_in_progress()
             print(f"Recovered {recovered} in-progress jobs to pending")
             return
+
+        clear_stop(config)
+        write_status(config, "starting", message="Menyambung ke Telegram...")
+        stop_watcher = asyncio.create_task(watch_stop_request(config, stop_event))
 
         async with AsyncExitStack() as stack:
             reader = make_user_client(config)
@@ -117,6 +123,13 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
                 await stack.enter_async_context(writer)
                 bot_me = await limiter.call("read", writer.get_me)
                 logger.info("Writer bot: %s (%s)", bot_me.first_name, bot_me.id)
+
+            write_status(
+                config,
+                "starting",
+                message="Telegram connected. Menyediakan migration cycle.",
+                reader_id=me.id,
+            )
 
             if config.telegram.load_dialogs_on_start:
                 logger.info(
@@ -149,7 +162,29 @@ async def run_with_clients(config: AppConfig, command: str) -> None:
             if command == "verify" and not stop_event.is_set():
                 verifier = Verifier(config, queue, writer, limiter, logger=logger)
                 await verifier.run(stop_event)
+
+            if stop_event.is_set():
+                write_status(
+                    config,
+                    "stopped",
+                    message="Migration dihentikan dengan selamat.",
+                    **queue.counts_by_status(),
+                )
+    except Exception as exc:
+        write_status(
+            config,
+            "error",
+            message="Migration cycle berhenti kerana ralat.",
+            error=f"{exc.__class__.__name__}: {exc}"[:1000],
+            **queue.counts_by_status(),
+        )
+        raise
     finally:
+        if stop_watcher is not None:
+            stop_watcher.cancel()
+            with suppress(asyncio.CancelledError):
+                await stop_watcher
+        clear_stop(config)
         db.close()
 
 
