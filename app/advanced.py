@@ -8,6 +8,7 @@ from typing import Any
 
 from app.config import AppConfig
 from app.db import Database, utc_now
+from app.release3_store import Release3Store
 
 
 RUN_MODES = {"run", "sync", "process", "health"}
@@ -176,7 +177,8 @@ def requeue_repair_category(db: Database, category: str) -> int:
     if normalized not in allowed:
         raise ValueError(f"Category cannot be requeued: {category}")
 
-    ids = [int(row["id"]) for row in repair_rows(db) if classify_repair_error(row) == normalized]
+    matching = [row for row in repair_rows(db) if classify_repair_error(row) == normalized]
+    ids = [int(row["id"]) for row in matching]
     if not ids:
         return 0
     placeholders = ",".join("?" for _ in ids)
@@ -192,6 +194,11 @@ def requeue_repair_category(db: Database, category: str) -> int:
         """,
         (utc_now(), *ids),
     )
+    if normalized in {"permission", "peer_id"}:
+        store = Release3Store(db)
+        store.initialize()
+        for destination in {str(row["dest_chat_id"]) for row in matching}:
+            store.resume_destination(destination)
     return int(cursor.rowcount)
 
 
