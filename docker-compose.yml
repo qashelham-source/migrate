@@ -12,7 +12,7 @@ services:
       BOT_TOKEN: "${BOT_TOKEN:-}"
       RUN_INTERVAL_SECONDS: "${RUN_INTERVAL_SECONDS:-300}"
     volumes:
-      - ./config.yaml:/app/config.yaml:ro
+      - ./config.yaml:/app/config.yaml
       - ./sessions:/app/sessions
       - ./data:/app/data
       - ./downloads:/app/downloads
