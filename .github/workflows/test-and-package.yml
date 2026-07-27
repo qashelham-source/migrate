@@ -1,0 +1,52 @@
+name: Test and package
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Compile Python files
+        run: python -m compileall -q app main.py bot.py
+
+      - name: Run tests
+        run: pytest -q
+
+      - name: Build clean ZIP
+        run: |
+          zip -r telegram-migration-fileid-final.zip . \
+            -x '.git/*' \
+               '.github/*' \
+               '__pycache__/*' \
+               '*/__pycache__/*' \
+               '*.pyc' \
+               '.env' \
+               'config.yaml' \
+               'sessions/*' \
+               'data/*' \
+               'downloads/*'
+
+      - name: Upload ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: telegram-migration-fileid-final
+          path: telegram-migration-fileid-final.zip
+          if-no-files-found: error
