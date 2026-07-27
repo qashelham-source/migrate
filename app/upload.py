@@ -90,7 +90,15 @@ class Uploader:
                     raise PermanentJobError(str(exc)) from exc
                 if self.logger:
                     self.logger.warning("User cannot post job %s; uploader bot fallback", job.id)
-            except (ChannelPrivate, ChannelInvalid, MediaEmpty) as exc:
+            except MediaEmpty as exc:
+                if self.config.transfer.forwarding_only:
+                    raise PermanentJobError(str(exc)) from exc
+                if self.logger:
+                    self.logger.warning(
+                        "Native copy returned MEDIA_EMPTY for job %s; downloading for upload fallback",
+                        job.id,
+                    )
+            except (ChannelPrivate, ChannelInvalid) as exc:
                 raise PermanentJobError(str(exc)) from exc
             except BadRequest as exc:
                 if self.config.transfer.forwarding_only:
@@ -121,27 +129,42 @@ class Uploader:
                 else:
                     media.append(InputMediaDocument(file_id, caption=item_caption))
             result = await self.limiter.call(
-                "upload", self.writer.send_media_group,
-                chat_id=job.dest_chat_id, media=media, **kwargs,
+                "upload",
+                self.writer.send_media_group,
+                chat_id=job.dest_chat_id,
+                media=media,
+                **kwargs,
             )
         else:
             file_id = cached.bot_file_ids[0]
             media_type = cached.media_types[0]
             if media_type == "photo":
                 result = await self.limiter.call(
-                    "upload", self.writer.send_photo,
-                    chat_id=job.dest_chat_id, photo=file_id, caption=caption, **kwargs,
+                    "upload",
+                    self.writer.send_photo,
+                    chat_id=job.dest_chat_id,
+                    photo=file_id,
+                    caption=caption,
+                    **kwargs,
                 )
             elif media_type == "video":
                 result = await self.limiter.call(
-                    "upload", self.writer.send_video,
-                    chat_id=job.dest_chat_id, video=file_id, caption=caption,
-                    supports_streaming=True, **kwargs,
+                    "upload",
+                    self.writer.send_video,
+                    chat_id=job.dest_chat_id,
+                    video=file_id,
+                    caption=caption,
+                    supports_streaming=True,
+                    **kwargs,
                 )
             else:
                 result = await self.limiter.call(
-                    "upload", self.writer.send_document,
-                    chat_id=job.dest_chat_id, document=file_id, caption=caption, **kwargs,
+                    "upload",
+                    self.writer.send_document,
+                    chat_id=job.dest_chat_id,
+                    document=file_id,
+                    caption=caption,
+                    **kwargs,
                 )
         return UploadResult(status="copied", dest_message_ids=self._result_message_ids(result))
 
@@ -150,7 +173,8 @@ class Uploader:
         if not text:
             return UploadResult(status="skipped", reason="Text message was empty")
         result = await self.limiter.call(
-            "upload", self.writer.send_message,
+            "upload",
+            self.writer.send_message,
             chat_id=job.dest_chat_id,
             text=text,
             entities=message.entities or message.caption_entities,
@@ -160,8 +184,10 @@ class Uploader:
 
     async def _load_source_messages(self, job: MessageJob) -> list[Message]:
         result = await self.limiter.call(
-            "read", self.reader.get_messages,
-            job.source_chat_id, job.source_message_ids,
+            "read",
+            self.reader.get_messages,
+            job.source_chat_id,
+            job.source_message_ids,
         )
         if not isinstance(result, list):
             result = [result]
@@ -173,7 +199,8 @@ class Uploader:
         if self.config.transfer.hide_sender:
             if len(messages) > 1 and first.media_group_id:
                 result = await self.limiter.call(
-                    "copy", self.reader.copy_media_group,
+                    "copy",
+                    self.reader.copy_media_group,
                     chat_id=job.dest_chat_id,
                     from_chat_id=job.source_chat_id,
                     message_id=first.id,
@@ -182,7 +209,8 @@ class Uploader:
                 )
             else:
                 result = await self.limiter.call(
-                    "copy", self.reader.copy_message,
+                    "copy",
+                    self.reader.copy_message,
                     chat_id=job.dest_chat_id,
                     from_chat_id=job.source_chat_id,
                     message_id=first.id,
@@ -191,7 +219,8 @@ class Uploader:
                 )
         else:
             result = await self.limiter.call(
-                "copy", self.reader.forward_messages,
+                "copy",
+                self.reader.forward_messages,
                 chat_id=job.dest_chat_id,
                 from_chat_id=job.source_chat_id,
                 message_ids=[message.id for message in messages],
@@ -252,27 +281,83 @@ class Uploader:
                     media.append(InputMediaVideo(str(path), caption=caption, supports_streaming=True))
                 else:
                     media.append(InputMediaDocument(str(path), caption=caption))
-            result = await self.limiter.call(
-                "upload", self.writer.send_media_group,
-                chat_id=job.dest_chat_id, media=media, **kwargs,
-            )
-            sent = result if isinstance(result, list) else [result]
+            try:
+                result = await self.limiter.call(
+                    "upload",
+                    self.writer.send_media_group,
+                    chat_id=job.dest_chat_id,
+                    media=media,
+                    **kwargs,
+                )
+                sent = result if isinstance(result, list) else [result]
+            except MediaEmpty:
+                if self.logger:
+                    self.logger.warning(
+                        "Media group upload returned MEDIA_EMPTY for job %s; sending %s item(s) individually",
+                        job.id,
+                        len(downloaded),
+                    )
+                sent = await self._upload_downloaded_individually(job, downloaded)
+                result = sent
         else:
             message, path = downloaded[0]
-            caption = self._caption_for(message)
-            media_type = message_media_type(message)
-            common = dict(chat_id=job.dest_chat_id, caption=caption, **kwargs)
-            if media_type == "photo":
-                result = await self.limiter.call("upload", self.writer.send_photo, photo=str(path), **common)
-            elif media_type == "video":
-                result = await self.limiter.call(
-                    "upload", self.writer.send_video,
-                    video=str(path), supports_streaming=True, **common,
-                )
-            else:
-                result = await self.limiter.call("upload", self.writer.send_document, document=str(path), **common)
+            result = await self._send_downloaded_item(
+                job,
+                message,
+                path,
+                caption=self._caption_for(message),
+            )
             sent = [result]
         return UploadResult(status="copied", dest_message_ids=self._result_message_ids(result)), sent
+
+    async def _upload_downloaded_individually(
+        self,
+        job: MessageJob,
+        downloaded: list[tuple[Message, Path]],
+    ) -> list[Message]:
+        sent: list[Message] = []
+        caption_used = False
+        for message, path in downloaded:
+            caption = self._caption_for(message) if not caption_used else None
+            caption_used = caption_used or bool(caption)
+            sent.append(await self._send_downloaded_item(job, message, path, caption=caption))
+        return sent
+
+    async def _send_downloaded_item(
+        self,
+        job: MessageJob,
+        message: Message,
+        path: Path,
+        *,
+        caption: str | None,
+    ) -> Message:
+        media_type = message_media_type(message)
+        common = dict(
+            chat_id=job.dest_chat_id,
+            caption=caption,
+            **self._destination_kwargs(job),
+        )
+        if media_type == "photo":
+            return await self.limiter.call(
+                "upload",
+                self.writer.send_photo,
+                photo=str(path),
+                **common,
+            )
+        if media_type == "video":
+            return await self.limiter.call(
+                "upload",
+                self.writer.send_video,
+                video=str(path),
+                supports_streaming=True,
+                **common,
+            )
+        return await self.limiter.call(
+            "upload",
+            self.writer.send_document,
+            document=str(path),
+            **common,
+        )
 
     def _destination_kwargs(self, job: MessageJob) -> dict[str, Any]:
         return {"reply_to_message_id": job.dest_topic_id} if job.dest_topic_id else {}
