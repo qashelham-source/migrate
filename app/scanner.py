@@ -8,6 +8,7 @@ from pyrogram import Client
 from pyrogram.types import Message
 
 from app.config import AppConfig, ChatSpec
+from app.control import write_status
 from app.queue import MessageQueue
 from app.telegram_client import (
     ResolvedChat,
@@ -54,12 +55,25 @@ class Scanner:
                     "set" if sources else "missing",
                     "set" if destinations else "missing",
                 )
+            write_status(
+                self.config,
+                "waiting",
+                message="Tetapkan source dan destination dalam bot.",
+                source="set" if sources else "missing",
+                destination="set" if destinations else "missing",
+            )
             return
 
-        for source in sources:
+        for source_index, source in enumerate(sources, start=1):
             if stop_event.is_set():
                 break
-            await self._scan_source(source, destinations, stop_event)
+            await self._scan_source(
+                source,
+                destinations,
+                stop_event,
+                source_index=source_index,
+                source_total=len(sources),
+            )
 
     async def _resolve_destinations(self) -> list[ResolvedChat]:
         resolved: list[ResolvedChat] = []
@@ -96,7 +110,18 @@ class Scanner:
         source: ChatSpec,
         destinations: list[ResolvedChat],
         stop_event: asyncio.Event,
+        *,
+        source_index: int,
+        source_total: int,
     ) -> None:
+        write_status(
+            self.config,
+            "scanning",
+            message="Resolving source channel...",
+            source=source.chat,
+            source_index=source_index,
+            source_total=source_total,
+        )
         resolved_source = await resolve_chat(self.reader, self.limiter, source)
 
         configured_start = source.start_id if source.start_id is not None else 1
@@ -108,11 +133,20 @@ class Scanner:
         if configured_end is None:
             if self.logger:
                 self.logger.info("Source %s has no messages", resolved_source.title)
+            write_status(
+                self.config,
+                "scanning",
+                message="Source tiada mesej.",
+                source=resolved_source.title,
+                source_index=source_index,
+                source_total=source_total,
+            )
             return
 
         start_id = min(configured_start, configured_end)
         end_id = max(configured_start, configured_end)
         chunk_size = max(1, self.config.limits.get_messages_chunk_size)
+        total_ids = end_id - start_id + 1
 
         if self.logger:
             self.logger.info(
@@ -128,16 +162,50 @@ class Scanner:
             if stop_event.is_set():
                 break
             chunk_end = min(chunk_start + chunk_size - 1, end_id)
+            scanned = chunk_end - start_id + 1
+            write_status(
+                self.config,
+                "scanning",
+                message="Sedang scan mesej source.",
+                source=resolved_source.title,
+                current=scanned,
+                total=total_ids,
+                source_index=source_index,
+                source_total=source_total,
+            )
             ids = list(range(chunk_start, chunk_end + 1))
             result = await self.limiter.call("read", self.reader.get_messages, resolved_source.chat_id, ids)
             if not isinstance(result, list):
                 result = [result]
             messages.extend([msg for msg in result if not message_is_empty(msg)])
 
+        if stop_event.is_set():
+            write_status(
+                self.config,
+                "stopping",
+                message="Scan dihentikan dengan selamat.",
+                source=resolved_source.title,
+            )
+            return
+
         grouped = self._group_messages(messages)
         added = skipped = existing = 0
 
-        for group in grouped:
+        for group_index, group in enumerate(grouped, start=1):
+            if stop_event.is_set():
+                break
+            if group_index == 1 or group_index % 100 == 0 or group_index == len(grouped):
+                write_status(
+                    self.config,
+                    "scanning",
+                    message="Menyusun queue migration.",
+                    source=resolved_source.title,
+                    current=group_index,
+                    total=len(grouped),
+                    source_index=source_index,
+                    source_total=source_total,
+                )
+
             first = group[0]
             processable = self._group_should_process(group)
             status = "pending" if processable else "skipped"
@@ -177,6 +245,15 @@ class Scanner:
 
         if self.logger:
             self.logger.info("Scan complete: added=%s skipped=%s already_queued=%s", added, skipped, existing)
+        write_status(
+            self.config,
+            "scan_complete",
+            message="Scan selesai. Memulakan pemindahan queue.",
+            source=resolved_source.title,
+            added=added,
+            skipped=skipped,
+            existing=existing,
+        )
 
     def _group_messages(self, messages: list[Message]) -> list[list[Message]]:
         groups: dict[str, list[Message]] = defaultdict(list)
