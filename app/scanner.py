@@ -42,6 +42,8 @@ class Scanner:
         destinations = await self._resolve_destinations()
         if not destinations:
             raise ValueError("No valid destinations configured")
+        if not self.config.sources:
+            raise ValueError("No source configured")
 
         for source in self.config.sources:
             if stop_event.is_set():
@@ -67,8 +69,13 @@ class Scanner:
                         self.logger.warning("Writer could not resolve destination %s: %s", spec.chat, exc)
 
             resolved.append(ResolvedChat(chat_id=str(spec.chat), topic_id=spec.topic_id, title=str(spec.chat)))
-
         return resolved
+
+    async def _latest_message_id(self, chat_id: str) -> int | None:
+        async for message in self.reader.get_chat_history(chat_id, limit=1):
+            if not message_is_empty(message):
+                return int(message.id)
+        return None
 
     async def _scan_source(
         self,
@@ -76,12 +83,21 @@ class Scanner:
         destinations: list[ResolvedChat],
         stop_event: asyncio.Event,
     ) -> None:
-        if source.start_id is None or source.end_id is None:
-            raise ValueError(f"Source {source.chat} needs message_range.start and message_range.end")
-
         resolved_source = await resolve_chat(self.reader, self.limiter, source)
-        start_id = min(source.start_id, source.end_id)
-        end_id = max(source.start_id, source.end_id)
+
+        configured_start = source.start_id if source.start_id is not None else 1
+        configured_end = source.end_id
+        if configured_end is None:
+            configured_end = await self.limiter.call(
+                "read", self._latest_message_id, resolved_source.chat_id
+            )
+        if configured_end is None:
+            if self.logger:
+                self.logger.info("Source %s has no messages", resolved_source.title)
+            return
+
+        start_id = min(configured_start, configured_end)
+        end_id = max(configured_start, configured_end)
         chunk_size = max(1, self.config.limits.get_messages_chunk_size)
 
         if self.logger:
@@ -182,4 +198,3 @@ class Scanner:
         if keys:
             return "album:" + "|".join(keys) if len(keys) > 1 else keys[0]
         return "messages:" + source_chat_id + ":" + ",".join(str(message.id) for message in messages)
-
