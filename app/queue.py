@@ -52,6 +52,13 @@ class MessageJob:
         )
 
 
+@dataclass(frozen=True)
+class MediaCacheEntry:
+    file_unique_key: str
+    bot_file_ids: list[str]
+    media_types: list[str]
+
+
 class MessageQueue:
     def __init__(self, db: Database, config: AppConfig) -> None:
         self.db = db
@@ -117,7 +124,6 @@ class MessageQueue:
         if attempts >= self.config.queue.max_attempts:
             self.db.set_status(job.id, "failed", last_error=error)
             return "failed"
-
         backoff = self._backoff_for_attempt(attempts)
         next_retry = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat(timespec="seconds")
         self.db.set_status(job.id, "pending", last_error=error, next_retry_at=next_retry)
@@ -129,9 +135,39 @@ class MessageQueue:
     def counts_by_status(self) -> dict[str, int]:
         return self.db.counts_by_status()
 
+    def get_media_cache(self, file_unique_key: str) -> MediaCacheEntry | None:
+        row = self.db.get_media_cache(file_unique_key)
+        if not row:
+            return None
+        try:
+            bot_file_ids = [str(value) for value in json.loads(row["bot_file_ids"])]
+            media_types = [str(value) for value in json.loads(row["media_types"])]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not bot_file_ids or len(bot_file_ids) != len(media_types):
+            return None
+        return MediaCacheEntry(
+            file_unique_key=str(row["file_unique_key"]),
+            bot_file_ids=bot_file_ids,
+            media_types=media_types,
+        )
+
+    def save_media_cache(
+        self,
+        file_unique_key: str,
+        bot_file_ids: list[str],
+        media_types: list[str],
+    ) -> None:
+        self.db.save_media_cache(file_unique_key, bot_file_ids, media_types)
+
+    def delete_media_cache(self, file_unique_key: str) -> None:
+        self.db.delete_media_cache(file_unique_key)
+
+    def media_cache_count(self) -> int:
+        return self.db.media_cache_count()
+
     def _backoff_for_attempt(self, attempts: int) -> int:
         if not self.config.queue.retry_backoff_seconds:
             return 300
         index = min(max(attempts - 1, 0), len(self.config.queue.retry_backoff_seconds) - 1)
         return self.config.queue.retry_backoff_seconds[index]
-
