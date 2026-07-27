@@ -10,6 +10,7 @@ from pyrogram.types import Message
 from app.control import write_status
 from app.errors import RetryableJobError
 from app.queue import MessageJob
+from app.telegram_client import message_media_type
 from app.telemetry import ProgressMeter, StoragePolicy, storage_snapshot
 from app.upload import UploadResult, Uploader
 
@@ -30,6 +31,10 @@ class Release3Uploader(Uploader):
         stop_event: asyncio.Event,
         on_phase: Any,
     ) -> UploadResult:
+        if self.queue.release3.is_destination_paused(job.dest_chat_id):
+            raise RetryableJobError(
+                f"Destination {job.dest_chat_id} is paused after an access or permission failure"
+            )
         self._active_job = job
         self._meters.clear()
         try:
@@ -100,6 +105,44 @@ class Release3Uploader(Uploader):
             details={"items": len(downloaded)},
         )
         return await super()._upload_downloaded_individually(job, downloaded)
+
+    async def _send_downloaded_item(
+        self,
+        job: MessageJob,
+        message: Message,
+        path: Path,
+        *,
+        caption: str | None,
+    ) -> Message:
+        media_type = message_media_type(message)
+        common = dict(
+            chat_id=job.dest_chat_id,
+            caption=caption,
+            progress=self._progress,
+            progress_args=("uploading",),
+            **self._destination_kwargs(job),
+        )
+        if media_type == "photo":
+            return await self.limiter.call(
+                "upload",
+                self.writer.send_photo,
+                photo=str(path),
+                **common,
+            )
+        if media_type == "video":
+            return await self.limiter.call(
+                "upload",
+                self.writer.send_video,
+                video=str(path),
+                supports_streaming=True,
+                **common,
+            )
+        return await self.limiter.call(
+            "upload",
+            self.writer.send_document,
+            document=str(path),
+            **common,
+        )
 
     async def _progress(self, current: int, total: int, stage: str) -> None:
         job = self._active_job
