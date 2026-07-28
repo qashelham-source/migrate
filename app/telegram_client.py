@@ -24,6 +24,14 @@ class ResolvedChat:
 
 
 class TelegramLimiter:
+    """Rate-limit Telegram operations without blocking unrelated pipeline stages.
+
+    Release 8.2 keeps global pacing for normal calls, but FloodWait cooldowns are
+    tracked per operation. A throttled upload therefore no longer freezes reads,
+    verification, dialog resolution, or downloads unless Telegram throttles those
+    operations independently.
+    """
+
     def __init__(self, config: AppConfig, logger: Any | None = None) -> None:
         self.config = config
         self.logger = logger
@@ -31,12 +39,14 @@ class TelegramLimiter:
         self._upload_lock = asyncio.Lock()
         self._last_global = 0.0
         self._last_by_operation: dict[str, float] = {}
-        self._floodwait_until = 0.0
+        self._floodwait_until_by_operation: dict[str, float] = {}
+        self._floodwait_events_by_operation: dict[str, int] = {}
+        self._floodwait_seconds_by_operation: dict[str, int] = {}
 
     async def wait(self, operation: str) -> None:
         async with self._lock:
             now = time.monotonic()
-            flood_wait = self._floodwait_until - now
+            flood_wait = self._floodwait_until_by_operation.get(operation, 0.0) - now
             global_wait = self.config.limits.global_min_delay_seconds - (now - self._last_global)
             op_wait = self.config.limits.delay_for(operation) - (
                 now - self._last_by_operation.get(operation, 0.0)
@@ -48,6 +58,31 @@ class TelegramLimiter:
             finished = time.monotonic()
             self._last_global = finished
             self._last_by_operation[operation] = finished
+
+    def floodwait_snapshot(self) -> dict[str, Any]:
+        """Return lightweight limiter telemetry for status pages and diagnostics."""
+        now = time.monotonic()
+        operations = sorted(
+            set(self._floodwait_until_by_operation)
+            | set(self._floodwait_events_by_operation)
+            | set(self._floodwait_seconds_by_operation)
+        )
+        details = {
+            operation: {
+                "events": self._floodwait_events_by_operation.get(operation, 0),
+                "total_wait_seconds": self._floodwait_seconds_by_operation.get(operation, 0),
+                "cooldown_remaining_seconds": max(
+                    0,
+                    int(self._floodwait_until_by_operation.get(operation, 0.0) - now),
+                ),
+            }
+            for operation in operations
+        }
+        return {
+            "floodwait_events": sum(item["events"] for item in details.values()),
+            "floodwait_total_seconds": sum(item["total_wait_seconds"] for item in details.values()),
+            "floodwait_operations": details,
+        }
 
     async def _call_with_retry(
         self,
@@ -64,10 +99,20 @@ class TelegramLimiter:
                 extra_min = self.config.limits.floodwait_extra_min_seconds
                 extra_max = self.config.limits.floodwait_extra_max_seconds
                 wait = max(1, int(exc.value)) + random.randint(extra_min, extra_max)
-                self._floodwait_until = max(self._floodwait_until, time.monotonic() + wait)
+                self._floodwait_until_by_operation[operation] = max(
+                    self._floodwait_until_by_operation.get(operation, 0.0),
+                    time.monotonic() + wait,
+                )
+                self._floodwait_events_by_operation[operation] = (
+                    self._floodwait_events_by_operation.get(operation, 0) + 1
+                )
+                self._floodwait_seconds_by_operation[operation] = (
+                    self._floodwait_seconds_by_operation.get(operation, 0) + wait
+                )
                 if self.logger:
                     self.logger.warning(
-                        "FloodWait from Telegram during %s: pausing all operations for %ss",
+                        "FloodWait from Telegram during %s: pausing only %s operations for %ss",
+                        operation,
                         operation,
                         wait,
                     )
@@ -82,8 +127,8 @@ class TelegramLimiter:
     ) -> Any:
         # Pyrogram can upload several SaveBigFilePart chunks concurrently. Telegram may
         # throttle every chunk at once, creating a traceback storm and preventing useful
-        # progress. Serialize top-level upload calls; Client instances below also limit
-        # internal concurrent transmissions to one.
+        # progress. Serialize top-level upload calls while allowing unrelated reads,
+        # downloads and verification calls to continue under their own cooldowns.
         if operation == "upload":
             async with self._upload_lock:
                 return await self._call_with_retry(operation, fn, *args, **kwargs)
