@@ -7,7 +7,7 @@ from sqlite3 import Row
 from typing import Any
 
 from app.config import AppConfig
-from app.db import Database, utc_now
+from app.db import Database, RecoverySummary, utc_now
 from app.release3_store import Release3Store
 from app.telegram_client import telegram_peer
 
@@ -135,11 +135,12 @@ class MessageQueue:
         )
         return [MessageJob.from_row(row) for row in rows]
 
-    def start_attempt(self, job: MessageJob) -> int:
-        attempts = self.db.increment_attempt(job.id)
-        self.db.set_status(job.id, "downloading")
-        self.release3.start_telemetry(job.id, job.file_size)
-        return attempts
+    def claim_due(self, limit: int) -> list[MessageJob]:
+        """Claim work before processing so a second worker cannot send the same job."""
+        jobs = [MessageJob.from_row(row) for row in self.db.claim_due_messages(limit)]
+        for job in jobs:
+            self.release3.start_telemetry(job.id, job.file_size)
+        return jobs
 
     def set_phase(self, job_id: int, status: str) -> None:
         self.db.set_status(job_id, status)
@@ -303,7 +304,7 @@ class MessageQueue:
     def recompute_source_state(self, source_chat_id: int | str) -> dict[str, Any]:
         return self.release3.recompute_source_state(source_chat_id)
 
-    def recover_in_progress(self) -> int:
+    def recover_in_progress(self) -> RecoverySummary:
         return self.db.recover_in_progress()
 
     def requeue_peer_id_errors(self) -> int:
