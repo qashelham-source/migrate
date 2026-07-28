@@ -2,12 +2,23 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 
 STATUSES = {"pending", "downloading", "uploading", "copied", "failed", "skipped"}
+
+
+@dataclass(frozen=True)
+class RecoverySummary:
+    requeued_downloads: int
+    held_uploads: int
+
+    @property
+    def total(self) -> int:
+        return self.requeued_downloads + self.held_uploads
 
 
 def utc_now() -> str:
@@ -26,6 +37,7 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.execute("PRAGMA busy_timeout=5000")
 
     def close(self) -> None:
         self.conn.close()
@@ -57,8 +69,10 @@ class Database:
                 verified_at TEXT
             );
 
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique_job
-                ON messages(source_chat_id, dest_chat_id, file_unique_key);
+            DROP INDEX IF EXISTS idx_messages_unique_job;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique_delivery
+                ON messages(source_chat_id, source_message_id, dest_chat_id)
+                WHERE file_unique_key NOT LIKE 'repair:%';
             CREATE INDEX IF NOT EXISTS idx_messages_due
                 ON messages(status, next_retry_at, updated_at);
             CREATE INDEX IF NOT EXISTS idx_messages_source
@@ -186,19 +200,40 @@ class Database:
         self.conn.commit()
         return int(row["attempts"])
 
-    def recover_in_progress(self) -> int:
-        cursor = self.conn.execute(
+    def recover_in_progress(self) -> RecoverySummary:
+        """Safely recover interrupted downloads without replaying uncertain uploads."""
+        now = utc_now()
+        downloads = self.conn.execute(
             """
             UPDATE messages
             SET status = 'pending',
-                last_error = COALESCE(last_error, 'Recovered after interrupted run'),
+                last_error = CASE
+                    WHEN last_error IS NULL OR last_error = ''
+                    THEN 'Recovered after interrupted download'
+                    ELSE last_error
+                END,
+                next_retry_at = NULL,
                 updated_at = ?
-            WHERE status IN ('downloading', 'uploading')
+            WHERE status = 'downloading'
             """,
-            (utc_now(),),
+            (now,),
+        )
+        uploads = self.conn.execute(
+            """
+            UPDATE messages
+            SET status = 'failed',
+                last_error = 'Interrupted during upload; destination result is unknown. Verify destination before retrying manually.',
+                next_retry_at = NULL,
+                updated_at = ?
+            WHERE status = 'uploading'
+            """,
+            (now,),
         )
         self.conn.commit()
-        return cursor.rowcount
+        return RecoverySummary(
+            requeued_downloads=int(downloads.rowcount),
+            held_uploads=int(uploads.rowcount),
+        )
 
     def requeue_peer_id_errors(self) -> int:
         cursor = self.conn.execute(
@@ -241,6 +276,57 @@ class Database:
         )
         self.conn.commit()
         return cursor.rowcount
+
+    def claim_due_messages(self, limit: int) -> list[sqlite3.Row]:
+        """Atomically reserve pending jobs so two workers cannot send the same post."""
+        now = utc_now()
+        limit = max(1, int(limit))
+        try:
+            self.conn.execute("BEGIN IMMEDIATE")
+            rows = list(
+                self.conn.execute(
+                    """
+                    SELECT m.id
+                    FROM messages m
+                    LEFT JOIN destination_health dh ON dh.dest_chat_id = m.dest_chat_id
+                    WHERE m.status = 'pending'
+                      AND (m.next_retry_at IS NULL OR m.next_retry_at <= ?)
+                      AND COALESCE(dh.paused, 0) = 0
+                    ORDER BY m.updated_at ASC, m.id ASC
+                    LIMIT ?
+                    """,
+                    (now, limit),
+                )
+            )
+            ids = [int(row["id"]) for row in rows]
+            if not ids:
+                self.conn.commit()
+                return []
+
+            placeholders = ", ".join("?" for _ in ids)
+            self.conn.execute(
+                f"""
+                UPDATE messages
+                SET status = 'downloading', attempts = attempts + 1, updated_at = ?
+                WHERE id IN ({placeholders}) AND status = 'pending'
+                """,
+                (now, *ids),
+            )
+            claimed = list(
+                self.conn.execute(
+                    f"""
+                    SELECT * FROM messages
+                    WHERE id IN ({placeholders})
+                    ORDER BY updated_at ASC, id ASC
+                    """,
+                    ids,
+                )
+            )
+            self.conn.commit()
+            return claimed
+        except BaseException:
+            self.conn.rollback()
+            raise
 
     def due_jobs(self, limit: int) -> list[sqlite3.Row]:
         return self.query(

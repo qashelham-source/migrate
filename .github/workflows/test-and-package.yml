@@ -30,7 +30,10 @@ jobs:
         run: python -m compileall -q app main.py bot.py
 
       - name: Run tests
-        run: pytest -q 2>&1 | tee pytest.log
+        shell: bash
+        run: |
+          set -euo pipefail
+          PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:${PYTHONPATH}}" python -m pytest -q 2>&1 | tee pytest.log
 
       - name: Upload pytest log
         if: always()
@@ -57,7 +60,7 @@ jobs:
                '*/__pycache__/*' \
                '*.pyc' \
                '.env' \
-               'config.yaml' \
+               'config.yaml*' \
                'sessions/*' \
                'data/*' \
                'downloads/*'

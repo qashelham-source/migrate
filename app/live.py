@@ -69,7 +69,13 @@ class LiveTrigger:
         self.last_message_id = int(getattr(message, "id", 0) or 0) or None
         self.event.set()
 
-    async def wait(self, config: AppConfig, stop_event: asyncio.Event) -> tuple[str, str] | None:
+    async def wait(
+        self,
+        config: AppConfig,
+        stop_event: asyncio.Event,
+        *,
+        allow_reconciliation: bool = True,
+    ) -> tuple[str, str] | None:
         started = time.monotonic()
         while not stop_event.is_set():
             requested = consume_run_request(config)
@@ -79,7 +85,7 @@ class LiveTrigger:
                 await self._debounce(stop_event)
                 self.event.clear()
                 return "sync", "live_event"
-            if time.monotonic() - started >= self.settings.reconcile_interval_seconds:
+            if allow_reconciliation and time.monotonic() - started >= self.settings.reconcile_interval_seconds:
                 return "sync", "reconciliation"
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=self.settings.poll_seconds)
