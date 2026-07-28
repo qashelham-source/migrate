@@ -2,6 +2,7 @@
 .github
 .env
 config.yaml
+config.yaml.*
 config.local.yaml
 sessions
 data
