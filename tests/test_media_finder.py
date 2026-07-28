@@ -175,3 +175,38 @@ def test_backfill_existing_queue_is_idempotent(tmp_path: Path) -> None:
         assert stats["indexed"] == 1
     finally:
         db.close()
+
+
+def test_limited_backfill_advances_to_unindexed_queue_items(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    try:
+        for message_id in (10, 11):
+            assert db.enqueue_message(
+                source_chat_id="-1001",
+                source_message_id=message_id,
+                dest_chat_id="-2001",
+                file_unique_key=f"queue-key-{message_id}",
+                source_message_ids=[message_id],
+                source_topic_id=None,
+                dest_topic_id=None,
+                media_group_id=None,
+                media_type="video",
+                file_size=2048,
+                caption=None,
+            )
+        assert index_existing_queue(db, limit=1) == 1
+        assert index_existing_queue(db, limit=1) == 1
+        assert media_finder_stats(db)["indexed"] == 2
+    finally:
+        db.close()
+
+
+def test_private_telegram_link_uses_numeric_chat_id_prefix(tmp_path: Path) -> None:
+    db = make_db(tmp_path)
+    try:
+        index_media(db, source_chat_id="-100123456", source_message_id=88, descriptor=video())
+        found = find_by_reference(db, "https://t.me/c/123456/88")
+        assert found is not None
+        assert found["source_chat_id"] == "-100123456"
+    finally:
+        db.close()
