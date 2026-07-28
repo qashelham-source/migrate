@@ -167,6 +167,9 @@ def make_bot_client(config: AppConfig) -> Client | None:
         api_hash=config.telegram.api_hash,
         bot_token=config.telegram.bot_token,
         workdir=str(config.telegram.sessions_dir),
+        # The control-panel process is the only client that should receive
+        # button callbacks. This uploader client only sends media.
+        no_updates=True,
         max_concurrent_transmissions=1,
     )
 
