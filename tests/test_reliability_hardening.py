@@ -123,6 +123,7 @@ def test_live_service_waits_for_trigger_before_first_migration_cycle(
     monkeypatch,
 ) -> None:
     config = make_config(tmp_path)
+    config.ensure_directories = lambda: None
     db = Database(config.queue.db_path)
     db.initialize()
     queue = MessageQueue(db, config)  # type: ignore[arg-type]
