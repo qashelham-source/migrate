@@ -21,6 +21,12 @@ services:
       - ./sessions:/app/sessions
       - ./data:/app/data
       - ./downloads:/app/downloads
+    healthcheck:
+      test: ["CMD", "python", "reliability_check.py", "--config", "/app/config.yaml", "--json"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 45s
     command:
       - /bin/sh
       - -c
