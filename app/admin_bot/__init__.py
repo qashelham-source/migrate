@@ -26,12 +26,14 @@ from app.control import clear_stop, is_active_phase, read_status, request_stop, 
 from app.dashboard_v2 import dashboard_snapshot, format_bytes, format_eta, issue_center
 from app.db import Database
 from app.destination_manager import get_sources, list_destinations, set_destinations, set_sources
+from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
 from app.queue import MessageQueue
 from app.telegram_client import load_accounts, make_user_client
 
 _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
 _CHANNEL_CACHE: dict[int, list[dict[str, Any]]] = {}
 _SELECTIONS: dict[int, dict[str, set[str]]] = {}
+_FINDER_INPUTS: set[int] = set()
 _PAGE_SIZE = 8
 
 CATEGORY_LABELS = {
@@ -226,6 +228,118 @@ def _capacity_text(config: AppConfig) -> str:
             "", "Temporary files are removed after verified upload.",
         ]
     )
+
+
+def _finder_text_from_stats(stats: dict[str, Any], indexed_now: int | None = None) -> str:
+    lines = [
+        "🔍 Original Media Finder",
+        "",
+        f"Indexed media: {stats['indexed']}",
+        f"Unique fingerprints: {stats['unique_fingerprints']}",
+        f"Duplicate records: {stats['duplicate_records']} ({stats['duplicate_rate']}%)",
+        f"Search history: {stats['match_history']}",
+    ]
+    if indexed_now is not None:
+        lines += ["", f"✅ {indexed_now} media queue item baru diindex."]
+    lines += [
+        "",
+        "Index Queue membaca metadata sedia ada sahaja—tiada media dimuat turun atau diubah.",
+        "Find Link menerima t.me link atau nombor message yang sudah diindex.",
+    ]
+    return "\n".join(lines)[:3900]
+
+
+def _finder_text(config: AppConfig, *, indexed_now: int | None = None) -> str:
+    db = _database(config)
+    try:
+        stats = media_finder_stats(db)
+    finally:
+        db.close()
+    return _finder_text_from_stats(stats, indexed_now)
+
+
+def _finder_menu() -> InlineKeyboardMarkup:
+    return _buttons(
+        [
+            [("📥 Index Queue", "finder:index"), ("🔎 Find Link", "finder:search")],
+            [("🔄 Refresh", "finder:view")],
+            [("👥 Duplicate Detector", "duplicates:view")],
+            [("⬅️ Smart Center", "smart:menu")],
+        ]
+    )
+
+
+def _duplicates_text_from_data(
+    stats: dict[str, Any],
+    groups: list[dict[str, Any]],
+    indexed_now: int | None = None,
+) -> str:
+    lines = [
+        "👥 Duplicate Detector",
+        "",
+        f"Indexed media: {stats['indexed']}",
+        f"Duplicate records: {stats['duplicate_records']} ({stats['duplicate_rate']}%)",
+    ]
+    if indexed_now is not None:
+        lines += ["", f"✅ {indexed_now} media queue item baru diindex."]
+    if not groups:
+        lines += ["", "✅ Tiada duplicate dijumpai dalam media yang telah diindex."]
+        return "\n".join(lines)
+    lines += ["", f"Top duplicate groups: {len(groups)}"]
+    for index, group in enumerate(groups, start=1):
+        lines += [
+            "",
+            f"{index}. {int(group.get('copies') or 0)} salinan",
+            f"Original: {group.get('original_chat_id')}/{group.get('original_message_id')}",
+        ]
+        locations = str(group.get("locations") or "")
+        if locations:
+            lines.append(f"Locations: {locations[:240]}")
+    return "\n".join(lines)[:3900]
+
+
+def _duplicates_text(config: AppConfig, *, indexed_now: int | None = None) -> str:
+    db = _database(config)
+    try:
+        stats = media_finder_stats(db)
+        groups = duplicate_groups(db, limit=10)
+    finally:
+        db.close()
+    return _duplicates_text_from_data(stats, groups, indexed_now)
+
+
+def _duplicates_menu() -> InlineKeyboardMarkup:
+    return _buttons(
+        [
+            [("📥 Index Queue", "duplicates:index"), ("🔄 Refresh", "duplicates:view")],
+            [("⬅️ Smart Center", "smart:menu")],
+        ]
+    )
+
+
+def _finder_result_text(reference: str, match: dict[str, Any] | None) -> str:
+    if match is None:
+        return "\n".join(
+            [
+                "🔍 Original Media Finder",
+                "",
+                "❌ Media asal tidak dijumpai dalam index.",
+                "Tekan Index Queue dahulu, kemudian cuba t.me link atau message ID semula.",
+            ]
+        )
+    size = int(match.get("file_size") or 0)
+    lines = [
+        "🔍 Original Media Finder",
+        "",
+        "✅ Media asal dijumpai.",
+        f"Source: {match.get('source_chat_id')}",
+        f"Message ID: {match.get('source_message_id')}",
+        f"Type: {match.get('media_type') or '-'}",
+        f"Size: {format_bytes(size) if size else '-'}",
+    ]
+    if match.get("file_name"):
+        lines.append(f"File: {str(match['file_name'])[:180]}")
+    return "\n".join(lines)[:3900]
 
 
 def _health_text(config: AppConfig) -> str:
@@ -434,6 +548,8 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
         data = query.data or ""
         if data not in {"menu", "dashboard:view", "stop:current"}:
             _cancel_live(user_id)
+        if data != "finder:search":
+            _FINDER_INPUTS.discard(user_id)
 
         if data in {"menu", "dashboard:view"}:
             await edit(query, _dashboard_text(config), _menu())
@@ -511,9 +627,36 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             "advanced:health": (_health_text, _buttons([[("▶️ Run Check", "health:run"), ("🔄 Refresh", "advanced:health")], [("⬅️ Smart Center", "smart:menu")]])),
             "advanced:repair": (_repair_text, _buttons([[("🔄 Retry temporary", "repair:retry:all")], [("📋 Details", "repair:details")], [("⬅️ Smart Center", "smart:menu")]])),
             "checkpoint:view": (_checkpoint_text, _buttons([[("♻️ Reset + Full Scan", "checkpoint:reset:confirm")], [("⬅️ Recovery Tools", "advanced:menu")]])),
-            "finder:view": (lambda _: "🔍 Original Media Finder\n\nFingerprint engine aktif. Gunakan command-line finder untuk carian terperinci sementara UI carian media dibina.", _back("smart:menu", "⬅️ Smart Center")),
-            "duplicates:view": (lambda _: "👥 Duplicate Detector\n\nDuplicate fingerprint direkodkan oleh media engine. Paparan kumpulan duplicate akan ditambah pada release seterusnya.", _back("smart:menu", "⬅️ Smart Center")),
         }
+        if data == "finder:view":
+            await edit(query, _finder_text(config), _finder_menu())
+            await query.answer()
+            return
+        if data == "finder:search":
+            _FINDER_INPUTS.add(user_id)
+            await edit(
+                query,
+                "🔍 Original Media Finder\n\nHantar t.me link atau nombor message untuk cari media asal dalam index.",
+                _back("finder:view", "⬅️ Finder"),
+            )
+            await query.answer()
+            return
+        if data in {"finder:index", "duplicates:index"}:
+            await query.answer("Mengindex hingga 500 media queue item…")
+            db = _database(config)
+            try:
+                indexed = index_existing_queue(db, limit=500)
+            finally:
+                db.close()
+            if data == "finder:index":
+                await edit(query, _finder_text(config, indexed_now=indexed), _finder_menu())
+            else:
+                await edit(query, _duplicates_text(config, indexed_now=indexed), _duplicates_menu())
+            return
+        if data == "duplicates:view":
+            await edit(query, _duplicates_text(config), _duplicates_menu())
+            await query.answer()
+            return
         if data in pages:
             fn, markup = pages[data]
             await edit(query, fn(config), markup)
@@ -585,7 +728,17 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
         if not _is_authorized(config, user_id):
             await reject(message=message)
             return
-        if not (message.text or "").startswith("/start"):
+        text = (message.text or "").strip()
+        if user_id is not None and user_id in _FINDER_INPUTS:
+            _FINDER_INPUTS.discard(user_id)
+            db = _database(config)
+            try:
+                match = find_by_reference(db, text)
+            finally:
+                db.close()
+            await message.reply_text(_finder_result_text(text, match), reply_markup=_finder_menu())
+            return
+        if not text.startswith("/start"):
             sent = await message.reply_text(_dashboard_text(config), reply_markup=_menu())
             if user_id is not None:
                 start_live(user_id, sent)
