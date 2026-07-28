@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from threading import Lock
-from typing import Any
+from typing import Any, Iterable
 
 import yaml
 
@@ -24,10 +24,14 @@ def _load_yaml(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
 
 
 def _save_yaml(path: Path, data: dict[str, Any]) -> None:
-    # config.yaml is bind-mounted into Docker, so write the mounted file in place.
-    with path.open("w", encoding="utf-8") as handle:
+    backup = path.with_suffix(path.suffix + ".bak")
+    if path.exists():
+        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
         yaml.safe_dump(data, handle, allow_unicode=True, sort_keys=False)
         handle.flush()
+    temporary.replace(path)
 
 
 def _is_placeholder(chat: str) -> bool:
@@ -35,7 +39,7 @@ def _is_placeholder(chat: str) -> bool:
     return "source_channel_or_-100_id" in value or "destination_channel_or_-100_id" in value
 
 
-def normalize_chat(chat: str) -> str:
+def normalize_chat(chat: str | int) -> str:
     value = str(chat).strip()
     if not value:
         raise ValueError("Channel cannot be empty")
@@ -57,31 +61,53 @@ def normalize_chat(chat: str) -> str:
     return f"@{value}"
 
 
+def _normalised_items(values: Iterable[str | int | dict[str, Any]]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[str, int | None]] = set()
+    for raw in values:
+        if isinstance(raw, dict):
+            chat = normalize_chat(raw.get("chat", ""))
+            topic_id = raw.get("topic_id")
+        else:
+            chat = normalize_chat(raw)
+            topic_id = None
+        key = (chat.lower(), int(topic_id) if topic_id is not None else None)
+        if key in seen:
+            continue
+        seen.add(key)
+        item: dict[str, Any] = {"chat": chat}
+        if topic_id is not None:
+            item["topic_id"] = int(topic_id)
+        result.append(item)
+    return result
+
+
 def get_sources(config_path: str | Path = "config.yaml") -> list[dict[str, Any]]:
     with _CONFIG_LOCK:
         _, data = _load_yaml(config_path)
         sources = (data.get("migration") or {}).get("sources") or []
         result: list[dict[str, Any]] = []
         for source in sources:
-            if isinstance(source, dict):
-                item = dict(source)
-                item["chat"] = str(item.get("chat") or "")
-            else:
-                item = {"chat": str(source)}
+            item = dict(source) if isinstance(source, dict) else {"chat": str(source)}
+            item["chat"] = str(item.get("chat") or "")
             if item["chat"] and not _is_placeholder(item["chat"]):
                 result.append(item)
         return result
 
 
-def set_source(chat: str, config_path: str | Path = "config.yaml") -> dict[str, Any]:
-    normalized_chat = normalize_chat(chat)
+def set_sources(chats: Iterable[str | int | dict[str, Any]], config_path: str | Path = "config.yaml") -> list[dict[str, Any]]:
+    items = _normalised_items(chats)
+    if not items:
+        raise ValueError("Choose at least one source")
     with _CONFIG_LOCK:
         path, data = _load_yaml(config_path)
-        migration = data.setdefault("migration", {})
-        item: dict[str, Any] = {"chat": normalized_chat}
-        migration["sources"] = [item]
+        data.setdefault("migration", {})["sources"] = items
         _save_yaml(path, data)
-        return item
+    return items
+
+
+def set_source(chat: str, config_path: str | Path = "config.yaml") -> dict[str, Any]:
+    return set_sources([chat], config_path)[0]
 
 
 def list_destinations(config_path: str | Path = "config.yaml") -> list[dict[str, Any]]:
@@ -90,14 +116,25 @@ def list_destinations(config_path: str | Path = "config.yaml") -> list[dict[str,
         destinations = (data.get("migration") or {}).get("destinations") or []
         result: list[dict[str, Any]] = []
         for destination in destinations:
-            if isinstance(destination, dict):
-                item = dict(destination)
-                item["chat"] = str(item.get("chat") or "")
-            else:
-                item = {"chat": str(destination)}
+            item = dict(destination) if isinstance(destination, dict) else {"chat": str(destination)}
+            item["chat"] = str(item.get("chat") or "")
             if item["chat"] and not _is_placeholder(item["chat"]):
                 result.append(item)
         return result
+
+
+def set_destinations(
+    destinations: Iterable[str | int | dict[str, Any]],
+    config_path: str | Path = "config.yaml",
+) -> list[dict[str, Any]]:
+    items = _normalised_items(destinations)
+    if not items:
+        raise ValueError("Choose at least one destination")
+    with _CONFIG_LOCK:
+        path, data = _load_yaml(config_path)
+        data.setdefault("migration", {})["destinations"] = items
+        _save_yaml(path, data)
+    return items
 
 
 def add_destination(
@@ -105,58 +142,31 @@ def add_destination(
     topic_id: int | None = None,
     config_path: str | Path = "config.yaml",
 ) -> dict[str, Any]:
-    normalized_chat = normalize_chat(chat)
-    if topic_id is not None and topic_id <= 0:
-        raise ValueError("Topic ID must be greater than zero")
-
-    with _CONFIG_LOCK:
-        path, data = _load_yaml(config_path)
-        migration = data.setdefault("migration", {})
-        raw_destinations = migration.setdefault("destinations", [])
-        destinations = []
-        for destination in raw_destinations:
-            existing_value = destination.get("chat") if isinstance(destination, dict) else destination
-            if not _is_placeholder(str(existing_value or "")):
-                destinations.append(destination)
-        migration["destinations"] = destinations
-
-        for destination in destinations:
-            if isinstance(destination, dict):
-                existing_chat = normalize_chat(str(destination.get("chat") or ""))
-                existing_topic = destination.get("topic_id")
-            else:
-                existing_chat = normalize_chat(str(destination))
-                existing_topic = None
-            if existing_chat.lower() == normalized_chat.lower() and existing_topic == topic_id:
-                raise ValueError("Destination already exists")
-
-        item: dict[str, Any] = {"chat": normalized_chat}
-        if topic_id is not None:
-            item["topic_id"] = topic_id
-        destinations.append(item)
-        _save_yaml(path, data)
-        return item
+    existing = list_destinations(config_path)
+    item: dict[str, Any] = {"chat": chat}
+    if topic_id is not None:
+        if topic_id <= 0:
+            raise ValueError("Topic ID must be greater than zero")
+        item["topic_id"] = topic_id
+    normalised = _normalised_items([*existing, item])
+    if len(normalised) == len(existing):
+        raise ValueError("Destination already exists")
+    set_destinations(normalised, config_path)
+    return normalised[-1]
 
 
-def remove_destination(
-    index: int,
-    config_path: str | Path = "config.yaml",
-) -> dict[str, Any]:
-    with _CONFIG_LOCK:
-        path, data = _load_yaml(config_path)
-        migration = data.setdefault("migration", {})
-        raw_destinations = migration.setdefault("destinations", [])
-        destinations = []
-        for destination in raw_destinations:
-            existing_value = destination.get("chat") if isinstance(destination, dict) else destination
-            if not _is_placeholder(str(existing_value or "")):
-                destinations.append(destination)
-        migration["destinations"] = destinations
-
-        if not destinations:
-            raise ValueError("No destinations configured")
-        if index < 1 or index > len(destinations):
-            raise ValueError(f"Destination number must be between 1 and {len(destinations)}")
-        removed = destinations.pop(index - 1)
-        _save_yaml(path, data)
-        return dict(removed) if isinstance(removed, dict) else {"chat": str(removed)}
+def remove_destination(index: int, config_path: str | Path = "config.yaml") -> dict[str, Any]:
+    destinations = list_destinations(config_path)
+    if not destinations:
+        raise ValueError("No destinations configured")
+    if index < 1 or index > len(destinations):
+        raise ValueError(f"Destination number must be between 1 and {len(destinations)}")
+    removed = destinations.pop(index - 1)
+    if destinations:
+        set_destinations(destinations, config_path)
+    else:
+        with _CONFIG_LOCK:
+            path, data = _load_yaml(config_path)
+            data.setdefault("migration", {})["destinations"] = []
+            _save_yaml(path, data)
+    return removed
