@@ -140,7 +140,8 @@ def test_live_service_waits_for_trigger_before_first_migration_cycle(
     async def source_ids(*args, **kwargs) -> set[int]:
         return set()
 
-    async def wait_without_trigger(self, current_config, stop_event):
+    async def wait_without_trigger(self, current_config, stop_event, **kwargs):
+        assert kwargs["allow_reconciliation"] is False
         return None
 
     async def should_not_run_cycle(*args, **kwargs) -> None:
