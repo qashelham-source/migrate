@@ -28,6 +28,9 @@ git reset --hard origin/main
 
 mkdir -p sessions data downloads/active downloads/failed downloads/completed
 
+# Older releases wrote this plaintext credential backup. It is no longer used.
+rm -f config.yaml.bak config.yaml.tmp
+
 if [ ! -f config.yaml ]; then
   cp config.example.yaml config.yaml
   echo "config.yaml was created from the example. Edit it, then run ./deploy.sh again."
