@@ -388,7 +388,11 @@ async def _run_live_service(
                     reconciliation_seconds=trigger.settings.reconcile_interval_seconds,
                     **queue.counts_by_status(),
                 )
-                next_trigger = await trigger.wait(config, stop_event)
+                next_trigger = await trigger.wait(
+                    config,
+                    stop_event,
+                    allow_reconciliation=False,
+                )
                 if next_trigger is None:
                     break
                 command, reason = next_trigger
