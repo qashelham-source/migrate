@@ -28,17 +28,20 @@ class TelegramLimiter:
         self.config = config
         self.logger = logger
         self._lock = asyncio.Lock()
+        self._upload_lock = asyncio.Lock()
         self._last_global = 0.0
         self._last_by_operation: dict[str, float] = {}
+        self._floodwait_until = 0.0
 
     async def wait(self, operation: str) -> None:
         async with self._lock:
             now = time.monotonic()
+            flood_wait = self._floodwait_until - now
             global_wait = self.config.limits.global_min_delay_seconds - (now - self._last_global)
             op_wait = self.config.limits.delay_for(operation) - (
                 now - self._last_by_operation.get(operation, 0.0)
             )
-            delay = max(0.0, global_wait, op_wait)
+            delay = max(0.0, flood_wait, global_wait, op_wait)
             if delay > 0:
                 await asyncio.sleep(delay)
 
@@ -46,7 +49,7 @@ class TelegramLimiter:
             self._last_global = finished
             self._last_by_operation[operation] = finished
 
-    async def call(
+    async def _call_with_retry(
         self,
         operation: str,
         fn: Callable[..., Awaitable[Any]],
@@ -60,10 +63,31 @@ class TelegramLimiter:
             except FloodWait as exc:
                 extra_min = self.config.limits.floodwait_extra_min_seconds
                 extra_max = self.config.limits.floodwait_extra_max_seconds
-                wait = int(exc.value) + random.randint(extra_min, extra_max)
+                wait = max(1, int(exc.value)) + random.randint(extra_min, extra_max)
+                self._floodwait_until = max(self._floodwait_until, time.monotonic() + wait)
                 if self.logger:
-                    self.logger.warning("FloodWait from Telegram: sleeping %ss", wait)
+                    self.logger.warning(
+                        "FloodWait from Telegram during %s: pausing all operations for %ss",
+                        operation,
+                        wait,
+                    )
                 await asyncio.sleep(wait)
+
+    async def call(
+        self,
+        operation: str,
+        fn: Callable[..., Awaitable[Any]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
+        # Pyrogram can upload several SaveBigFilePart chunks concurrently. Telegram may
+        # throttle every chunk at once, creating a traceback storm and preventing useful
+        # progress. Serialize top-level upload calls; Client instances below also limit
+        # internal concurrent transmissions to one.
+        if operation == "upload":
+            async with self._upload_lock:
+                return await self._call_with_retry(operation, fn, *args, **kwargs)
+        return await self._call_with_retry(operation, fn, *args, **kwargs)
 
 
 def install_stop_handlers(stop_event: asyncio.Event) -> None:
@@ -83,6 +107,7 @@ def make_user_client(config: AppConfig) -> Client:
         api_id=config.telegram.api_id,
         api_hash=config.telegram.api_hash,
         workdir=str(config.telegram.sessions_dir),
+        max_concurrent_transmissions=1,
     )
 
 
@@ -97,6 +122,7 @@ def make_bot_client(config: AppConfig) -> Client | None:
         api_hash=config.telegram.api_hash,
         bot_token=config.telegram.bot_token,
         workdir=str(config.telegram.sessions_dir),
+        max_concurrent_transmissions=1,
     )
 
 
@@ -140,6 +166,7 @@ async def interactive_login(config: AppConfig, session_name: str | None = None) 
         api_id=config.telegram.api_id,
         api_hash=config.telegram.api_hash,
         workdir=str(config.telegram.sessions_dir),
+        max_concurrent_transmissions=1,
     )
     await client.connect()
     try:
