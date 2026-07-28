@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+import sqlite3
+import tempfile
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import Any, Callable
@@ -28,7 +31,7 @@ from app.db import Database
 from app.destination_manager import get_sources, list_destinations, set_destinations, set_sources
 from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
 from app.queue import MessageQueue
-from app.telegram_client import load_accounts, make_user_client
+from app.telegram_client import load_accounts
 
 _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
 _CHANNEL_CACHE: dict[int, list[dict[str, Any]]] = {}
@@ -404,36 +407,84 @@ def _selection_for(user_id: int, path: Path) -> dict[str, set[str]]:
     return _SELECTIONS[user_id]
 
 
-async def _scan_channels(config: AppConfig) -> list[dict[str, Any]]:
-    client = make_user_client(config)
-    channels: list[dict[str, Any]] = []
-    await client.start()
-    try:
-        async for dialog in client.get_dialogs():
-            chat = dialog.chat
-            kind = str(getattr(chat, "type", "")).lower()
-            if not any(value in kind for value in ("channel", "group", "supergroup")):
-                continue
-            chat_id = str(chat.id)
-            title = str(chat.title or chat.username or chat.id)
-            can_destination = False
-            access = "🟢 Ready"
-            try:
-                member = await client.get_chat_member(chat.id, "me")
-                status = str(getattr(member, "status", "")).lower()
-                can_destination = "owner" in status or "administrator" in status
-            except Exception:
-                access = "🟡 Limited"
-            channels.append({
-                "chat": chat_id,
-                "title": title,
-                "kind": "Channel" if "channel" in kind else "Group",
-                "can_source": True,
-                "can_destination": can_destination,
-                "access": access,
-            })
-    finally:
-        await client.stop()
+def _snapshot_session_database(source: Path, destination: Path) -> None:
+    """Create an isolated SQLite snapshot without locking the live Telegram session."""
+    if not source.is_file():
+        raise RuntimeError("Session Telegram tidak ditemui. Jalankan login dahulu.")
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_uri = f"{source.resolve().as_uri()}?mode=ro"
+    last_error: sqlite3.OperationalError | None = None
+    for attempt in range(5):
+        try:
+            if destination.exists():
+                destination.unlink()
+            with sqlite3.connect(source_uri, uri=True, timeout=3.0) as reader:
+                with sqlite3.connect(destination, timeout=3.0) as writer:
+                    reader.backup(writer, pages=100, sleep=0.05)
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            last_error = exc
+            time.sleep(0.15 * (attempt + 1))
+
+    raise RuntimeError("Session Telegram masih sibuk. Cuba Scan / Refresh lagi.") from last_error
+
+
+async def _scan_channels(config: AppConfig, user_id: int) -> list[dict[str, Any]]:
+    sessions_dir = config.telegram.sessions_dir
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    source_session = sessions_dir / f"{config.telegram.user_session}.session"
+
+    with tempfile.TemporaryDirectory(prefix="channel-scan-", dir=str(sessions_dir)) as temp_dir:
+        workdir = Path(temp_dir)
+        session_name = f"channel-scan-{user_id}"
+        await asyncio.to_thread(
+            _snapshot_session_database,
+            source_session,
+            workdir / f"{session_name}.session",
+        )
+        client = Client(
+            name=session_name,
+            api_id=config.telegram.api_id,
+            api_hash=config.telegram.api_hash,
+            workdir=str(workdir),
+            no_updates=True,
+            max_concurrent_transmissions=1,
+        )
+        channels: list[dict[str, Any]] = []
+        started = False
+        try:
+            await client.start()
+            started = True
+            async for dialog in client.get_dialogs():
+                chat = dialog.chat
+                kind = str(getattr(chat, "type", "")).lower()
+                if not any(value in kind for value in ("channel", "group", "supergroup")):
+                    continue
+                chat_id = str(chat.id)
+                title = str(chat.title or chat.username or chat.id)
+                can_destination = False
+                access = "🟢 Ready"
+                try:
+                    member = await client.get_chat_member(chat.id, "me")
+                    status = str(getattr(member, "status", "")).lower()
+                    can_destination = "owner" in status or "administrator" in status
+                except Exception:
+                    access = "🟡 Limited"
+                channels.append({
+                    "chat": chat_id,
+                    "title": title,
+                    "kind": "Channel" if "channel" in kind else "Group",
+                    "can_source": True,
+                    "can_destination": can_destination,
+                    "access": access,
+                })
+        finally:
+            if started:
+                await client.stop()
+
     channels.sort(key=lambda item: (item["title"].lower(), item["chat"]))
     return channels
 
@@ -564,7 +615,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await query.answer("Scanning Telegram…", show_alert=False)
             await edit(query, "📚 Channel Manager\n\nScanning channel dan group…", _back("channels:view", "⬅️ Cancel"))
             try:
-                _CHANNEL_CACHE[user_id] = await _scan_channels(config)
+                _CHANNEL_CACHE[user_id] = await _scan_channels(config, user_id)
                 _SELECTIONS.pop(user_id, None)
                 await edit(query, _channel_text(user_id, path), _channel_menu(user_id, path))
             except Exception as exc:
