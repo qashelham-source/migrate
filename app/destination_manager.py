@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from threading import Lock
@@ -24,14 +25,23 @@ def _load_yaml(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
 
 
 def _save_yaml(path: Path, data: dict[str, Any]) -> None:
-    backup = path.with_suffix(path.suffix + ".bak")
-    if path.exists():
-        backup.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+    """Atomically replace config without leaving a credential-bearing backup behind."""
     temporary = path.with_suffix(path.suffix + ".tmp")
-    with temporary.open("w", encoding="utf-8") as handle:
-        yaml.safe_dump(data, handle, allow_unicode=True, sort_keys=False)
-        handle.flush()
-    temporary.replace(path)
+    temporary.unlink(missing_ok=True)
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            yaml.safe_dump(data, handle, allow_unicode=True, sort_keys=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def _is_placeholder(chat: str) -> bool:
