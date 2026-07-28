@@ -9,6 +9,7 @@ from typing import Any
 _original_rmtree = shutil.rmtree
 _original_mkdir = Path.mkdir
 _logger = logging.getLogger("migration.temp_cleanup")
+_callsite_logger = logging.getLogger("migration.call_site")
 _MAX_REMAINING_FILES = 20
 
 
@@ -114,5 +115,98 @@ def audited_rmtree(path: str | bytes | Path, *args: Any, **kwargs: Any) -> None:
         _logger.info("TEMP_CLEANUP_NOT_FOUND path=%s", target)
 
 
+def _install_call_site_audit() -> None:
+    try:
+        from app.upload import Uploader
+    except Exception:
+        _callsite_logger.exception("CALLSITE_AUDIT_INSTALL_FAILED")
+        return
+
+    if getattr(Uploader, "_callsite_audit_installed", False):
+        return
+
+    original_download_and_upload = Uploader._download_and_upload
+    original_download_one = Uploader._download_one
+    original_upload_downloaded = Uploader._upload_downloaded
+
+    async def audited_download_and_upload(
+        self: Any,
+        job: Any,
+        messages: list[Any],
+        stop_event: Any,
+        on_phase: Any,
+    ) -> Any:
+        job_dir = self.config.downloads.active_dir / f"job-{job.id}"
+        _callsite_logger.info(
+            "CALLSITE_ENTER job=%s path=%s messages=%s",
+            job.id,
+            job_dir,
+            len(messages),
+        )
+        try:
+            return await original_download_and_upload(self, job, messages, stop_event, on_phase)
+        except BaseException:
+            _callsite_logger.exception("CALLSITE_ERROR job=%s path=%s", job.id, job_dir)
+            raise
+        finally:
+            files, total_bytes = _directory_usage(job_dir) if job_dir.exists() else (0, 0)
+            _callsite_logger.info(
+                "CALLSITE_EXIT job=%s path=%s exists=%s files=%s bytes=%s",
+                job.id,
+                job_dir,
+                job_dir.exists(),
+                files,
+                total_bytes,
+            )
+
+    async def audited_download_one(self: Any, message: Any, job_dir: Path) -> Path:
+        _callsite_logger.info(
+            "DOWNLOAD_START job_path=%s message=%s",
+            job_dir,
+            getattr(message, "id", None),
+        )
+        try:
+            result = await original_download_one(self, message, job_dir)
+        except BaseException:
+            _callsite_logger.exception(
+                "DOWNLOAD_FAILED job_path=%s message=%s",
+                job_dir,
+                getattr(message, "id", None),
+            )
+            raise
+        size = result.stat().st_size if result.exists() else -1
+        _callsite_logger.info(
+            "DOWNLOAD_FINISHED job_path=%s message=%s file=%s bytes=%s",
+            job_dir,
+            getattr(message, "id", None),
+            result,
+            size,
+        )
+        return result
+
+    async def audited_upload_downloaded(self: Any, job: Any, downloaded: list[Any]) -> Any:
+        files = [str(path) for _, path in downloaded]
+        _callsite_logger.info(
+            "UPLOAD_START job=%s files=%s paths=%s",
+            job.id,
+            len(downloaded),
+            files,
+        )
+        try:
+            result = await original_upload_downloaded(self, job, downloaded)
+        except BaseException:
+            _callsite_logger.exception("UPLOAD_FAILED job=%s files=%s", job.id, len(downloaded))
+            raise
+        _callsite_logger.info("UPLOAD_FINISHED job=%s files=%s", job.id, len(downloaded))
+        return result
+
+    Uploader._download_and_upload = audited_download_and_upload
+    Uploader._download_one = audited_download_one
+    Uploader._upload_downloaded = audited_upload_downloaded
+    Uploader._callsite_audit_installed = True
+    _callsite_logger.info("CALLSITE_AUDIT_INSTALLED")
+
+
 Path.mkdir = audited_mkdir
 shutil.rmtree = audited_rmtree
+_install_call_site_audit()
