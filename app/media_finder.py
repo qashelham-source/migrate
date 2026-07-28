@@ -353,14 +353,18 @@ def find_by_reference(db: Database, reference: str) -> dict[str, Any] | None:
         return None
     chat, message_id = parsed
     if chat:
+        candidates = [chat, f"@{chat}"]
+        if chat.isdigit():
+            candidates.append(f"-100{chat}")
+        placeholders = ", ".join("?" for _ in candidates)
         row = db.query_one(
-            """
+            f"""
             SELECT * FROM media_fingerprints
             WHERE source_message_id = ?
-              AND (source_chat_id = ? OR source_chat_id = ?)
+              AND source_chat_id IN ({placeholders})
             ORDER BY updated_at DESC LIMIT 1
             """,
-            (message_id, chat, f"@{chat}"),
+            (message_id, *candidates),
         )
     else:
         row = db.query_one(
@@ -410,10 +414,20 @@ def index_existing_queue(db: Database, *, limit: int | None = None) -> int:
     """Backfill safe metadata already present in the queue; no Telegram calls are made."""
     initialize_media_finder(db)
     sql = """
-        SELECT source_chat_id, source_message_id, media_type, file_size, file_unique_key
-        FROM messages
-        WHERE media_type IS NOT NULL
-        ORDER BY id ASC
+        SELECT
+            m.source_chat_id,
+            m.source_message_id,
+            MAX(m.media_type) AS media_type,
+            MAX(m.file_size) AS file_size,
+            MIN(m.file_unique_key) AS file_unique_key
+        FROM messages AS m
+        LEFT JOIN media_fingerprints AS fingerprints
+          ON fingerprints.source_chat_id = CAST(m.source_chat_id AS TEXT)
+         AND fingerprints.source_message_id = m.source_message_id
+        WHERE m.media_type IS NOT NULL
+          AND fingerprints.id IS NULL
+        GROUP BY m.source_chat_id, m.source_message_id
+        ORDER BY MIN(m.id) ASC
     """
     params: Iterable[Any] = ()
     if limit is not None:
