@@ -368,8 +368,8 @@ async def _run_live_service(
     source_ids = await _resolved_source_ids(initial_config, queue, reader, limiter, logger)
     trigger = LiveTrigger(source_ids)
     reader.add_handler(trigger.handler)
-    command = "sync"
-    reason = "startup"
+    command: str | None = None
+    reason: str | None = None
     cycle_number = 0
     try:
         while not stop_event.is_set():
@@ -377,6 +377,23 @@ async def _run_live_service(
             config.ensure_directories()
             queue.config = config
             trigger.source_ids = await _resolved_source_ids(config, queue, reader, limiter, logger)
+
+            if command is None:
+                write_status(
+                    config,
+                    "watching",
+                    message="Live Watcher aktif. Menunggu post baharu atau arahan admin sebelum migration dijalankan.",
+                    live_watcher=True,
+                    watched_sources=len(trigger.source_ids),
+                    reconciliation_seconds=trigger.settings.reconcile_interval_seconds,
+                    **queue.counts_by_status(),
+                )
+                next_trigger = await trigger.wait(config, stop_event)
+                if next_trigger is None:
+                    break
+                command, reason = next_trigger
+                continue
+
             cycle_number += 1
             write_status(
                 config,
@@ -421,7 +438,6 @@ async def _run_live_service(
     finally:
         reader.remove_handler(trigger.handler)
 
-
 async def run_with_clients(config: AppConfig, command: str, config_path: str | Path) -> None:
     logger = setup_logging(config.logging)
     limiter = TelegramLimiter(config, logger)
@@ -441,8 +457,11 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
             print(f"source_registry: {len(queue.list_registered_sources())}")
             return
         if command == "recover":
-            recovered = queue.recover_in_progress()
-            print(f"Recovered {recovered} in-progress jobs to pending")
+            recovery = queue.recover_in_progress()
+            print(f"Recovered {recovery.requeued_downloads} interrupted download job(s) to pending")
+            print(
+                f"Held {recovery.held_uploads} interrupted upload job(s) for manual destination verification"
+            )
             return
 
         clear_stop(config)
