@@ -26,6 +26,32 @@ class Release3Uploader(Uploader):
         self._storage_policy = StoragePolicy.from_environment()
         self._install_pause_guard()
 
+    @staticmethod
+    def _directory_usage(path: Path) -> tuple[int, int]:
+        files = 0
+        total_bytes = 0
+        if not path.exists():
+            return files, total_bytes
+        try:
+            for item in path.rglob("*"):
+                if not item.is_file():
+                    continue
+                files += 1
+                try:
+                    total_bytes += item.stat().st_size
+                except OSError:
+                    pass
+        except OSError:
+            pass
+        return files, total_bytes
+
+    def _audit(self, level: str, event: str, **details: Any) -> None:
+        if not self.logger:
+            return
+        payload = " ".join(f"{key}={value}" for key, value in details.items())
+        log_method = getattr(self.logger, level, self.logger.info)
+        log_method("%s%s", event, f" {payload}" if payload else "")
+
     def _install_pause_guard(self) -> None:
         """Prevent automatic resolve checks from clearing a real permission pause."""
         self.queue.db.conn.executescript(
@@ -68,9 +94,25 @@ class Release3Uploader(Uploader):
             )
         self._active_job = job
         self._meters.clear()
+        self._audit(
+            "info",
+            "RELEASE3_PROCESS_ENTER",
+            job=job.id,
+            source=job.source_message_id,
+            destination=job.dest_chat_id,
+            media=job.media_type,
+        )
         try:
             try:
-                return await super().process(job, stop_event, on_phase)
+                result = await super().process(job, stop_event, on_phase)
+                self._audit(
+                    "info",
+                    "RELEASE3_PROCESS_EXIT",
+                    job=job.id,
+                    status=result.status,
+                    destination_messages=result.dest_message_ids,
+                )
+                return result
             except PermanentJobError as exc:
                 error = f"{exc.__class__.__name__}: {exc}"
                 lowered = error.lower()
@@ -99,6 +141,14 @@ class Release3Uploader(Uploader):
                         outcome="paused",
                     )
                 raise
+        except BaseException as exc:
+            self._audit(
+                "exception",
+                "RELEASE3_PROCESS_ERROR",
+                job=job.id,
+                error=f"{exc.__class__.__name__}:{exc}",
+            )
+            raise
         finally:
             self._active_job = None
             self._meters.clear()
@@ -139,18 +189,109 @@ class Release3Uploader(Uploader):
             outcome="started",
             details=snapshot.as_status(),
         )
-        return await super()._download_and_upload(job, messages, stop_event, on_phase)
+        job_dir = self.config.downloads.active_dir / f"job-{job.id}"
+        self._audit(
+            "info",
+            "RELEASE3_CALLSITE_ENTER",
+            job=job.id,
+            path=job_dir,
+            messages=len(messages),
+        )
+        try:
+            result = await super()._download_and_upload(job, messages, stop_event, on_phase)
+            self._audit(
+                "info",
+                "RELEASE3_UPLOAD_ROUTE_FINISHED",
+                job=job.id,
+                status=result.status,
+                destination_messages=result.dest_message_ids,
+            )
+            return result
+        except BaseException as exc:
+            self._audit(
+                "exception",
+                "RELEASE3_CALLSITE_ERROR",
+                job=job.id,
+                path=job_dir,
+                error=f"{exc.__class__.__name__}:{exc}",
+            )
+            raise
+        finally:
+            files, total_bytes = self._directory_usage(job_dir)
+            self._audit(
+                "info" if not job_dir.exists() else "warning",
+                "RELEASE3_CALLSITE_EXIT",
+                job=job.id,
+                path=job_dir,
+                exists=job_dir.exists(),
+                files=files,
+                bytes=total_bytes,
+            )
 
     async def _download_one(self, message: Message, job_dir: Path) -> Path:
         path = job_dir / self._file_name_for(message)
-        result = await self.limiter.call(
-            "download",
-            message.download,
-            file_name=str(path),
-            progress=self._progress,
-            progress_args=("downloading",),
+        self._audit(
+            "info",
+            "RELEASE3_DOWNLOAD_START",
+            job=self._active_job.id if self._active_job else None,
+            message=message.id,
+            path=path,
         )
-        return Path(result or path)
+        try:
+            result = await self.limiter.call(
+                "download",
+                message.download,
+                file_name=str(path),
+                progress=self._progress,
+                progress_args=("downloading",),
+            )
+        except BaseException as exc:
+            self._audit(
+                "exception",
+                "RELEASE3_DOWNLOAD_FAILED",
+                job=self._active_job.id if self._active_job else None,
+                message=message.id,
+                path=path,
+                error=f"{exc.__class__.__name__}:{exc}",
+            )
+            raise
+        final_path = Path(result or path)
+        size = final_path.stat().st_size if final_path.exists() else -1
+        self._audit(
+            "info",
+            "RELEASE3_DOWNLOAD_FINISHED",
+            job=self._active_job.id if self._active_job else None,
+            message=message.id,
+            path=final_path,
+            bytes=size,
+        )
+        return final_path
+
+    async def _upload_downloaded(
+        self,
+        job: MessageJob,
+        downloaded: list[tuple[Message, Path]],
+    ) -> tuple[UploadResult, list[Message]]:
+        self._audit(
+            "info",
+            "RELEASE3_UPLOAD_START",
+            job=job.id,
+            files=len(downloaded),
+            bytes=sum(path.stat().st_size for _, path in downloaded if path.exists()),
+        )
+        try:
+            result = await super()._upload_downloaded(job, downloaded)
+        except BaseException as exc:
+            self._audit(
+                "exception",
+                "RELEASE3_UPLOAD_FAILED",
+                job=job.id,
+                files=len(downloaded),
+                error=f"{exc.__class__.__name__}:{exc}",
+            )
+            raise
+        self._audit("info", "RELEASE3_UPLOAD_FINISHED", job=job.id, files=len(downloaded))
+        return result
 
     async def _upload_downloaded_individually(
         self,
