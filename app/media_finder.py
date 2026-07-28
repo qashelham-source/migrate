@@ -269,7 +269,8 @@ def compare_descriptors(
 
 
 def _row_descriptor(row: Mapping[str, Any]) -> MediaDescriptor:
-    return MediaDescriptor.from_mapping(row)
+    # sqlite3.Row supports key lookup but not Mapping.get().
+    return MediaDescriptor.from_mapping(dict(row))
 
 
 def find_matches(
