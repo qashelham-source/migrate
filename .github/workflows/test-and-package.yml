@@ -33,8 +33,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:${PYTHONPATH}}" \\
-            python -m pytest -q 2>&1 | tee pytest.log
+          PYTHONPATH="${GITHUB_WORKSPACE}${PYTHONPATH:+:${PYTHONPATH}}" python -m pytest -q 2>&1 | tee pytest.log
 
       - name: Upload pytest log
         if: always()
