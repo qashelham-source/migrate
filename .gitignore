@@ -2,6 +2,7 @@ __pycache__/
 *.py[cod]
 
 config.yaml
+config.yaml.*
 config.local.yaml
 .env
 
@@ -15,3 +16,6 @@ downloads/completed/
 
 sessions/*.session
 sessions/*.session-journal
+sessions/*.session-wal
+sessions/*.session-shm
+sessions/accounts.json
