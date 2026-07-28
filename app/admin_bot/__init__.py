@@ -23,27 +23,16 @@ from app.advanced import (
 )
 from app.config import AppConfig
 from app.control import clear_stop, is_active_phase, read_status, request_stop, write_status
-from app.dashboard_v2 import (
-    dashboard_snapshot,
-    delivery_matrix,
-    format_bytes,
-    format_eta,
-    issue_center,
-    source_library,
-)
+from app.dashboard_v2 import dashboard_snapshot, format_bytes, format_eta, issue_center
 from app.db import Database
-from app.destination_manager import (
-    add_destination,
-    get_sources,
-    list_destinations,
-    remove_destination,
-    set_source,
-)
+from app.destination_manager import get_sources, list_destinations, set_destinations, set_sources
 from app.queue import MessageQueue
-from app.telegram_client import load_accounts
+from app.telegram_client import load_accounts, make_user_client
 
-_PENDING: dict[int, str] = {}
 _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
+_CHANNEL_CACHE: dict[int, list[dict[str, Any]]] = {}
+_SELECTIONS: dict[int, dict[str, set[str]]] = {}
+_PAGE_SIZE = 8
 
 CATEGORY_LABELS = {
     "media_empty": "MEDIA_EMPTY",
@@ -65,25 +54,30 @@ def _buttons(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 def _menu() -> InlineKeyboardMarkup:
     return _buttons(
         [
-            [("📊 Dashboard", "dashboard:view")],
-            [("📚 Source Library", "sources:view"), ("🚚 Delivery Matrix", "matrix:view")],
-            [("🚨 Issue Center", "issues:view"), ("📈 ETA & Storage", "capacity:view")],
-            [("📥 Tukar Source", "source:set")],
-            [("➕ Tambah Destination", "dest:add"), ("🗑 Buang Destination", "dest:remove")],
-            [("📋 Lihat Setting", "settings:view")],
-            [("📊 Live Status", "status:view"), ("⏹ Stop Current Job", "stop:current")],
-            [("▶️ Sync Sekarang", "run:now")],
-            [("🧰 Advanced Tools", "advanced:menu")],
+            [("📚 Channel Manager", "channels:view")],
+            [("🧠 Smart Center", "smart:menu"), ("⚙️ Settings", "settings:view")],
+            [("▶️ Sync", "run:now"), ("⏹ Stop", "stop:current")],
+            [("🔄 Refresh", "dashboard:view")],
         ]
     )
 
 
-def _back(target: str = "menu", label: str = "⬅️ Menu") -> InlineKeyboardMarkup:
+def _back(target: str = "menu", label: str = "⬅️ Dashboard") -> InlineKeyboardMarkup:
     return _buttons([[(label, target)]])
 
 
-def _refresh_menu(callback: str, back: str = "menu") -> InlineKeyboardMarkup:
-    return _buttons([[("🔄 Refresh", callback)], [("⬅️ Menu", back)]])
+def _smart_menu() -> InlineKeyboardMarkup:
+    return _buttons(
+        [
+            [("🤖 AI Error Doctor", "advanced:repair")],
+            [("🔍 Original Media Finder", "finder:view")],
+            [("👥 Duplicate Detector", "duplicates:view")],
+            [("🚨 Issue Center", "issues:view"), ("📈 Resource Monitor", "capacity:view")],
+            [("🩺 Pre-flight Check", "advanced:health")],
+            [("🧰 Recovery Tools", "advanced:menu")],
+            [("⬅️ Dashboard", "menu")],
+        ]
+    )
 
 
 def _advanced_menu() -> InlineKeyboardMarkup:
@@ -92,38 +86,8 @@ def _advanced_menu() -> InlineKeyboardMarkup:
             [("🩺 Health Check", "advanced:health"), ("🛠 Repair Queue", "advanced:repair")],
             [("▶️ Resume Pending", "advanced:resume"), ("🆕 Sync New Posts", "advanced:sync")],
             [("🔍 Full Scan", "advanced:full"), ("📍 Checkpoints", "checkpoint:view")],
-            [("⬅️ Menu", "menu")],
+            [("⬅️ Smart Center", "smart:menu")],
         ]
-    )
-
-
-def _health_menu() -> InlineKeyboardMarkup:
-    return _buttons(
-        [[("▶️ Run Check", "health:run"), ("🔄 Refresh", "health:refresh")], [("⬅️ Advanced Tools", "advanced:menu")]]
-    )
-
-
-def _repair_menu() -> InlineKeyboardMarkup:
-    return _buttons(
-        [
-            [("🔄 Retry masalah sementara", "repair:retry:all")],
-            [("🎞 Retry MEDIA_EMPTY", "repair:retry:media_empty"), ("🔑 Retry Permission", "repair:retry:permission")],
-            [("🧩 Retry Peer ID", "repair:retry:peer_id"), ("📋 Lihat Butiran", "repair:details")],
-            [("🔄 Refresh", "advanced:repair")],
-            [("⬅️ Advanced Tools", "advanced:menu")],
-        ]
-    )
-
-
-def _checkpoint_menu() -> InlineKeyboardMarkup:
-    return _buttons(
-        [[("🔄 Refresh", "checkpoint:refresh"), ("♻️ Reset + Full Scan", "checkpoint:reset:confirm")], [("⬅️ Advanced Tools", "advanced:menu")]]
-    )
-
-
-def _status_menu() -> InlineKeyboardMarkup:
-    return _buttons(
-        [[("🔄 Refresh", "status:refresh"), ("⏹ Stop Current Job", "stop:current")], [("⬅️ Menu", "menu")]]
     )
 
 
@@ -163,104 +127,69 @@ def _request_mode(config: AppConfig, mode: str) -> None:
     request_run_mode(config, mode)
 
 
-def _extract_chat(message: Message) -> str:
-    forwarded = getattr(message, "forward_from_chat", None)
-    if forwarded:
-        return f"@{forwarded.username}" if forwarded.username else str(forwarded.id)
-    value = (message.text or message.caption or "").strip()
-    if not value:
-        raise ValueError("Hantar @username, link t.me, -100 ID, atau forward satu post channel.")
-    return value
-
-
-def _settings_text(path: Path) -> str:
-    sources = get_sources(path)
-    destinations = list_destinations(path)
-    lines = ["⚙️ Setting Migration", "", f"Source: {sources[0].get('chat') if sources else 'Belum ditetapkan'}", "", "Destinations:"]
-    if not destinations:
-        lines.append("Belum ada destination")
-    for index, destination in enumerate(destinations, 1):
-        topic = f" (topic {destination['topic_id']})" if destination.get("topic_id") is not None else ""
-        lines.append(f"{index}. {destination.get('chat', '')}{topic}")
-    return "\n".join(lines)
-
-
 def _dashboard_text(config: AppConfig) -> str:
     db = _database(config)
     try:
         data = dashboard_snapshot(db, config.queue.db_path)
     finally:
         db.close()
+    status = read_status(config)
     q, s, d, v, t, storage = (
         data["queue"], data["sources"], data["destinations"], data["verification"], data["telemetry"], data["storage"]
     )
+    phase = str(status.get("phase") or "idle").lower()
+    active = q["downloading"] + q["uploading"]
     issue_total = q["failed"] + q["skipped"] + d["paused"] + v["failed"]
-    state = "🟢 Sihat" if issue_total == 0 else "🟠 Perlu perhatian"
+    state = "🟢 Healthy" if issue_total == 0 else "🟠 Perlu perhatian"
+    phase_labels = {
+        "idle": "Idle", "watching": "Live watcher", "scanning": "Scanning", "processing": "Processing",
+        "downloading": "Downloading", "uploading": "Uploading", "stopping": "Stopping", "stopped": "Stopped",
+        "error": "Error", "health_check": "Pre-flight check", "health_complete": "Health check complete",
+    }
+    current = phase_labels.get(phase, phase.replace("_", " ").title())
+    lines = [
+        "🏠 Migration Dashboard",
+        "",
+        f"{state}",
+        f"Status: {current}",
+        "",
+        f"Pending   {q['pending']}",
+        f"Running   {active}",
+        f"Completed {q['copied']}",
+        f"Failed    {q['failed'] + q['skipped']}",
+        "",
+        f"Speed: {format_bytes(t['speed_bps'])}/s",
+        f"ETA: {format_eta(t['eta_seconds'])}",
+        f"Sources: {s['total']} · Destinations: {d['total']}",
+    ]
+    if status.get("job_id") is not None:
+        lines += ["", f"Current job: #{status['job_id']}", f"Media: {status.get('media_type') or '-'}"]
+    if status.get("current") is not None and status.get("total") is not None:
+        lines.append(f"Progress: {status['current']}/{status['total']}")
+    error = status.get("last_error") or status.get("error")
+    if error:
+        lines += ["", f"Last error: {str(error).replace(chr(10), ' ')[:300]}"]
+    if storage.percent_used >= 80:
+        level = "🚨 Critical" if storage.percent_used >= 90 else "⚠️ Low working storage"
+        lines += ["", level, f"Free: {format_bytes(storage.free_bytes)}"]
+    lines += ["", "Dashboard dikemas kini secara automatik."]
+    return "\n".join(lines)[:3900]
+
+
+def _settings_text(path: Path) -> str:
+    sources = get_sources(path)
+    destinations = list_destinations(path)
     return "\n".join(
         [
-            "📊 Migration Dashboard V2",
+            "⚙️ System Settings",
             "",
-            f"System: {state}",
-            f"Sources: {s['total']} · Live {s['live']} · Verified {s['verified']} · Issues {s['issues']}",
-            f"Destinations tracked: {d['total']} · Paused {d['paused']}",
+            f"Selected sources: {len(sources)}",
+            f"Selected destinations: {len(destinations)}",
             "",
-            "Queue",
-            f"• Pending {q['pending']} · Active {q['downloading'] + q['uploading']}",
-            f"• Completed {q['copied']} · Failed {q['failed']} · Skipped {q['skipped']}",
-            "",
-            "Verification",
-            f"• Verified {v['verified']} · Repairing {v['repairing']} · Failed {v['failed']}",
-            "",
-            f"Speed: {format_bytes(t['speed_bps'])}/s · ETA: {format_eta(t['eta_seconds'])}",
-            f"Storage: {storage.percent_used:.1f}% used · {format_bytes(storage.free_bytes)} free",
+            "Source dan destination diurus melalui Channel Manager.",
+            "Tetapan worker, retry, cache dan log kekal dalam konfigurasi sistem.",
         ]
-    )[:3900]
-
-
-def _source_text(config: AppConfig) -> str:
-    db = _database(config)
-    try:
-        rows = source_library(db)
-    finally:
-        db.close()
-    lines = ["📚 Source Library", ""]
-    if not rows:
-        return "\n".join(lines + ["Belum ada source dalam registry."])
-    icons = {"verified": "✅", "issues": "🚨", "in_progress": "🔄", "not_started": "⚪"}
-    for row in rows[:25]:
-        icon = icons.get(str(row.get("migration_state")), "•")
-        live = " LIVE" if row.get("live_watch_enabled") else ""
-        lines.extend(
-            [
-                f"{icon} {row.get('title') or row.get('source_chat_id')}{live}",
-                f"   State: {row.get('migration_state')} · Access: {row.get('access_status')}",
-                f"   Latest {row.get('latest_seen_message_id') or '-'} · Scanned {row.get('history_scanned_through') or '-'} · Verified {row.get('history_verified_through') or '-'}",
-                "",
-            ]
-        )
-    return "\n".join(lines)[:3900]
-
-
-def _matrix_text(config: AppConfig) -> str:
-    db = _database(config)
-    try:
-        rows = delivery_matrix(db)
-    finally:
-        db.close()
-    lines = ["🚚 Delivery Matrix", ""]
-    if not rows:
-        return "\n".join(lines + ["Belum ada delivery direkodkan."])
-    for row in rows[:25]:
-        icon = "⏸" if row["paused"] else "✅" if row["issues"] == 0 else "⚠️"
-        lines.extend(
-            [
-                f"{icon} Destination {row['dest_chat_id']}",
-                f"   Total {row['total']} · Copied {row['copied']} · Active {row['active']} · Issues {row['issues']}",
-                *([f"   Pause: {row.get('pause_reason') or row.get('last_error') or '-'}"] if row["paused"] else []),
-                "",
-            ]
-        )
-    return "\n".join(lines)[:3900]
+    )
 
 
 def _issues_text(config: AppConfig) -> str:
@@ -274,16 +203,9 @@ def _issues_text(config: AppConfig) -> str:
         return "\n".join(lines + ["✅ Tiada isu aktif."])
     for item in rows:
         if item["kind"] == "destination":
-            lines.extend([f"⏸ Destination {item['id']} paused", str(item["error"])[:180], ""])
+            lines += [f"⏸ Destination {item['id']} paused", str(item["error"])[:180], ""]
         else:
-            lines.extend(
-                [
-                    f"❌ Job #{item['id']} · {item['status']} · {item['media_type']}",
-                    f"Source message {item['source_message_id']} · Attempts {item['attempts']}",
-                    str(item["error"]).replace("\n", " ")[:180],
-                    "",
-                ]
-            )
+            lines += [f"❌ Job #{item['id']} · {item['status']}", str(item["error"]).replace("\n", " ")[:180], ""]
     return "\n".join(lines)[:3900]
 
 
@@ -294,56 +216,23 @@ def _capacity_text(config: AppConfig) -> str:
     finally:
         db.close()
     telemetry, storage = data["telemetry"], data["storage"]
-    warning = "🚨 Kritikal" if storage.percent_used >= 90 else "⚠️ Tinggi" if storage.percent_used >= 80 else "✅ Sihat"
+    warning = "🚨 Critical" if storage.percent_used >= 90 else "⚠️ Low" if storage.percent_used >= 80 else "✅ Healthy"
     return "\n".join(
         [
-            "📈 ETA & Storage",
-            "",
-            f"Active telemetry jobs: {telemetry['active']}",
-            f"Combined speed: {format_bytes(telemetry['speed_bps'])}/s",
-            f"Current ETA: {format_eta(telemetry['eta_seconds'])}",
-            "",
-            f"Storage status: {warning}",
-            f"Used: {format_bytes(storage.used_bytes)} / {format_bytes(storage.total_bytes)} ({storage.percent_used:.1f}%)",
+            "📈 Resource Monitor", "", f"Status: {warning}",
+            f"Speed: {format_bytes(telemetry['speed_bps'])}/s", f"ETA: {format_eta(telemetry['eta_seconds'])}",
+            f"Working storage: {format_bytes(storage.used_bytes)} / {format_bytes(storage.total_bytes)}",
             f"Free: {format_bytes(storage.free_bytes)}",
+            "", "Temporary files are removed after verified upload.",
         ]
     )
-
-
-def _status_text(config: AppConfig) -> str:
-    status, counts = read_status(config), _queue_counts(config)
-    phase = str(status.get("phase") or "idle").lower()
-    labels = {"starting": "🟡 Starting", "waiting": "⚪ Waiting", "scanning": "🔎 Scanning", "scan_complete": "✅ Scan Complete", "processing": "🔄 Processing", "downloading": "⬇️ Downloading", "uploading": "⬆️ Uploading", "batch_pause": "⏸ Batch Pause", "stopping": "🛑 Stopping", "stopped": "⏹ Stopped", "health_check": "🩺 Health Check", "health_complete": "✅ Health Complete", "idle": "✅ Idle", "watching": "👀 Live Watcher", "error": "❌ Error"}
-    lines = ["📊 Live Migration Status", "", f"Status: {labels.get(phase, phase.title())}"]
-    for key, label in (("message", ""), ("source", "Source: "), ("destination_chat", "Destination: ")):
-        if status.get(key):
-            lines.append(f"{label}{status[key]}")
-    if status.get("job_id") is not None:
-        lines += ["", f"Current job: #{status['job_id']}", f"Media: {status.get('media_type') or '-'}", f"Source message: {status.get('source_message_id') or '-'}"]
-    if status.get("current") is not None and status.get("total") is not None:
-        lines.append(f"Progress: {status['current']}/{status['total']}")
-    error = status.get("last_error") or status.get("error")
-    if error:
-        lines += ["", f"Last error: {str(error)[:500]}"]
-    lines += ["", "Queue:", f"• Pending: {counts.get('pending', 0)}", f"• Active: {counts.get('downloading', 0) + counts.get('uploading', 0)}", f"• Completed: {counts.get('copied', 0)}", f"• Failed: {counts.get('failed', 0)}", f"• Skipped: {counts.get('skipped', 0)}", "", "Auto-refresh setiap 3 saat."]
-    return "\n".join(lines)[:3900]
-
-
-def _advanced_text(config: AppConfig) -> str:
-    counts, status = _queue_counts(config), read_status(config)
-    db = _database(config)
-    try:
-        checkpoints = len(checkpoint_rows(db))
-    finally:
-        db.close()
-    return "\n".join(["🧰 Advanced Tools", "", f"Migration: {'sedang berjalan' if is_active_phase(status.get('phase')) else 'tidak aktif'}", f"Pending: {counts.get('pending', 0)}", f"Failed: {counts.get('failed', 0)}", f"Skipped: {counts.get('skipped', 0)}", f"Active checkpoints: {checkpoints}"])
 
 
 def _health_text(config: AppConfig) -> str:
     report = load_health_report(config)
     if not report:
         return "🩺 Pre-flight Health Check\n\nBelum ada laporan. Tekan Run Check."
-    lines = ["🩺 Pre-flight Health Check", "", f"Overall: {str(report.get('overall') or 'unknown').upper()}", f"Checked: {report.get('generated_at') or '-'} UTC", ""]
+    lines = ["🩺 Pre-flight Health Check", "", f"Overall: {str(report.get('overall') or 'unknown').upper()}", ""]
     for item in report.get("checks") or []:
         icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}.get(str(item.get("status")), "•")
         lines.append(f"{icon} {item.get('name')}: {item.get('detail')}")
@@ -358,16 +247,26 @@ def _repair_text(config: AppConfig, details: bool = False) -> str:
             for category in REPAIR_CATEGORIES:
                 rows.extend((category, item) for item in repair_samples(db, category, limit=5))
             rows.sort(key=lambda pair: int(pair[1]["id"]), reverse=True)
-            lines = ["📋 Repair Queue Details", ""]
+            lines = ["🤖 AI Error Doctor", ""]
             for category, item in rows[:15]:
-                lines += [f"#{item['id']} · {CATEGORY_LABELS[category]} · {item['media_type']}", f"Source message: {item['source_message_id']} · Attempts: {item['attempts']}", str(item['last_error']).replace("\n", " ")[:160], ""]
+                lines += [f"#{item['id']} · {CATEGORY_LABELS[category]}", str(item['last_error']).replace("\n", " ")[:180], ""]
             return "\n".join(lines or ["Tiada isu."])[:3900]
         summary = repair_summary(db)
     finally:
         db.close()
-    lines = ["🛠 Repair Queue", "", f"Jumlah job bermasalah: {sum(summary.values())}", ""]
+    lines = ["🤖 AI Error Doctor", "", f"Jobs requiring attention: {sum(summary.values())}", ""]
     lines += [f"• {CATEGORY_LABELS[key]}: {summary.get(key, 0)}" for key in REPAIR_CATEGORIES]
     return "\n".join(lines)
+
+
+def _advanced_text(config: AppConfig) -> str:
+    counts, status = _queue_counts(config), read_status(config)
+    db = _database(config)
+    try:
+        checkpoints = len(checkpoint_rows(db))
+    finally:
+        db.close()
+    return "\n".join(["🧰 Recovery Tools", "", f"Migration: {'active' if is_active_phase(status.get('phase')) else 'idle'}", f"Pending: {counts.get('pending', 0)}", f"Failed: {counts.get('failed', 0)}", f"Checkpoints: {checkpoints}"])
 
 
 def _checkpoint_text(config: AppConfig) -> str:
@@ -377,11 +276,97 @@ def _checkpoint_text(config: AppConfig) -> str:
     finally:
         db.close()
     lines = ["📍 Incremental Sync Checkpoints", ""]
-    if not rows:
-        return "\n".join(lines + ["Belum ada checkpoint rasmi."])
     for index, row in enumerate(rows, 1):
-        lines += [f"{index}. Source {row['source_chat_id']}", f"   Last message ID: {row['last_scanned_message_id']}", f"   Mode: {row['last_scan_mode']} · Updated: {row['updated_at']} UTC", ""]
-    return "\n".join(lines)[:3900]
+        lines += [f"{index}. Source {row['source_chat_id']}", f"Last message: {row['last_scanned_message_id']}", ""]
+    return "\n".join(lines + ([] if rows else ["Belum ada checkpoint."]))[:3900]
+
+
+def _selection_for(user_id: int, path: Path) -> dict[str, set[str]]:
+    if user_id not in _SELECTIONS:
+        _SELECTIONS[user_id] = {
+            "sources": {str(item["chat"]) for item in get_sources(path)},
+            "destinations": {str(item["chat"]) for item in list_destinations(path)},
+        }
+    return _SELECTIONS[user_id]
+
+
+async def _scan_channels(config: AppConfig) -> list[dict[str, Any]]:
+    client = make_user_client(config)
+    channels: list[dict[str, Any]] = []
+    await client.start()
+    try:
+        async for dialog in client.get_dialogs():
+            chat = dialog.chat
+            kind = str(getattr(chat, "type", "")).lower()
+            if not any(value in kind for value in ("channel", "group", "supergroup")):
+                continue
+            chat_id = str(chat.id)
+            title = str(chat.title or chat.username or chat.id)
+            can_destination = False
+            access = "🟢 Ready"
+            try:
+                member = await client.get_chat_member(chat.id, "me")
+                status = str(getattr(member, "status", "")).lower()
+                can_destination = "owner" in status or "administrator" in status
+            except Exception:
+                access = "🟡 Limited"
+            channels.append({
+                "chat": chat_id,
+                "title": title,
+                "kind": "Channel" if "channel" in kind else "Group",
+                "can_source": True,
+                "can_destination": can_destination,
+                "access": access,
+            })
+    finally:
+        await client.stop()
+    channels.sort(key=lambda item: (item["title"].lower(), item["chat"]))
+    return channels
+
+
+def _channel_text(user_id: int, path: Path, page: int = 0) -> str:
+    channels = _CHANNEL_CACHE.get(user_id, [])
+    selected = _selection_for(user_id, path)
+    if not channels:
+        return "📚 Channel Manager\n\nBelum scan Telegram. Tekan Scan / Refresh."
+    start = page * _PAGE_SIZE
+    end = min(len(channels), start + _PAGE_SIZE)
+    return "\n".join([
+        "📚 Channel Manager", "", f"Found: {len(channels)} channels/groups",
+        f"Selected: {len(selected['sources'])} source · {len(selected['destinations'])} destination",
+        "", f"Showing {start + 1}-{end}", "Tap S or D to tick/untick, then Save.",
+    ])
+
+
+def _channel_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarkup:
+    channels = _CHANNEL_CACHE.get(user_id, [])
+    selected = _selection_for(user_id, path)
+    rows: list[list[tuple[str, str]]] = []
+    start = page * _PAGE_SIZE
+    for index, item in enumerate(channels[start:start + _PAGE_SIZE], start=start):
+        chat = item["chat"]
+        source_icon = "☑" if chat in selected["sources"] else "☐"
+        dest_icon = "☑" if chat in selected["destinations"] else "☐"
+        title = item["title"][:28]
+        rows.append([(f"{item['access']} {title}"[:48], f"channels:noop:{index}")])
+        role_row = [(f"{source_icon} Source", f"channels:toggle:s:{index}")]
+        if item["can_destination"]:
+            role_row.append((f"{dest_icon} Destination", f"channels:toggle:d:{index}"))
+        else:
+            role_row.append(("🔒 No post access", f"channels:noop:{index}"))
+        rows.append(role_row)
+    nav: list[tuple[str, str]] = []
+    if page > 0:
+        nav.append(("⬅️", f"channels:page:{page - 1}"))
+    if start + _PAGE_SIZE < len(channels):
+        nav.append(("➡️", f"channels:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows += [
+        [("🔄 Scan / Refresh", "channels:scan"), ("✅ Save", "channels:save")],
+        [("⬅️ Dashboard", "menu")],
+    ]
+    return _buttons(rows)
 
 
 def _cancel_live(user_id: int) -> None:
@@ -413,14 +398,12 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
         last: str | None = None
         try:
             while _LIVE_TASKS.get(user_id) is asyncio.current_task():
-                text = _status_text(config)
+                text = _dashboard_text(config)
                 if text != last:
-                    try:
-                        await message.edit_text(text, reply_markup=_status_menu())
-                    except MessageNotModified:
-                        pass
+                    with suppress(MessageNotModified):
+                        await message.edit_text(text, reply_markup=_menu())
                     last = text
-                await asyncio.sleep(3)
+                await asyncio.sleep(4)
         except (asyncio.CancelledError, Exception):
             pass
         finally:
@@ -438,9 +421,8 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await reject(message=message)
             return
         assert user_id is not None
-        _cancel_live(user_id)
-        _PENDING.pop(user_id, None)
-        await message.reply_text(_dashboard_text(config), reply_markup=_menu())
+        sent = await message.reply_text(_dashboard_text(config), reply_markup=_menu())
+        start_live(user_id, sent)
 
     @app.on_callback_query()
     async def callback_handler(_: Client, query: CallbackQuery) -> None:
@@ -450,43 +432,104 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             return
         assert user_id is not None
         data = query.data or ""
-        if data not in {"status:view", "status:refresh", "stop:current"}:
+        if data not in {"menu", "dashboard:view", "stop:current"}:
             _cancel_live(user_id)
 
-        pages: dict[str, tuple[Callable[[AppConfig], str], InlineKeyboardMarkup]] = {
-            "dashboard:view": (_dashboard_text, _refresh_menu("dashboard:view")),
-            "sources:view": (_source_text, _refresh_menu("sources:view")),
-            "matrix:view": (_matrix_text, _refresh_menu("matrix:view")),
-            "issues:view": (_issues_text, _buttons([[("🔄 Refresh", "issues:view"), ("🛠 Repair Queue", "advanced:repair")], [("⬅️ Menu", "menu")]])),
-            "capacity:view": (_capacity_text, _refresh_menu("capacity:view")),
-            "advanced:menu": (_advanced_text, _advanced_menu()),
-            "advanced:health": (_health_text, _health_menu()),
-            "health:refresh": (_health_text, _health_menu()),
-            "advanced:repair": (_repair_text, _repair_menu()),
-            "checkpoint:view": (_checkpoint_text, _checkpoint_menu()),
-            "checkpoint:refresh": (_checkpoint_text, _checkpoint_menu()),
-        }
-        if data == "menu":
-            _PENDING.pop(user_id, None)
+        if data in {"menu", "dashboard:view"}:
             await edit(query, _dashboard_text(config), _menu())
+            start_live(user_id, query.message)
+            await query.answer("Dikemas kini" if data == "dashboard:view" else None)
+            return
+        if data == "channels:view":
+            await edit(query, _channel_text(user_id, path), _channel_menu(user_id, path))
             await query.answer()
             return
+        if data == "channels:scan":
+            await query.answer("Scanning Telegram…", show_alert=False)
+            await edit(query, "📚 Channel Manager\n\nScanning channel dan group…", _back("channels:view", "⬅️ Cancel"))
+            try:
+                _CHANNEL_CACHE[user_id] = await _scan_channels(config)
+                _SELECTIONS.pop(user_id, None)
+                await edit(query, _channel_text(user_id, path), _channel_menu(user_id, path))
+            except Exception as exc:
+                await edit(query, f"📚 Channel Manager\n\n❌ Scan gagal: {str(exc)[:500]}\n\nPastikan user session tidak sedang dikunci proses lain.", _back())
+            return
+        if data.startswith("channels:page:"):
+            page = max(0, int(data.rsplit(":", 1)[1]))
+            await edit(query, _channel_text(user_id, path, page), _channel_menu(user_id, path, page))
+            await query.answer()
+            return
+        if data.startswith("channels:toggle:"):
+            _, _, role, raw_index = data.split(":", 3)
+            index = int(raw_index)
+            channels = _CHANNEL_CACHE.get(user_id, [])
+            if index >= len(channels):
+                await query.answer("Channel cache expired. Scan semula.", show_alert=True)
+                return
+            item = channels[index]
+            selected = _selection_for(user_id, path)
+            key = "sources" if role == "s" else "destinations"
+            other = "destinations" if key == "sources" else "sources"
+            chat = item["chat"]
+            if chat in selected[key]:
+                selected[key].remove(chat)
+            else:
+                if chat in selected[other]:
+                    await query.answer("Channel yang sama tak boleh jadi source dan destination.", show_alert=True)
+                    return
+                selected[key].add(chat)
+            page = index // _PAGE_SIZE
+            await edit(query, _channel_text(user_id, path, page), _channel_menu(user_id, path, page))
+            await query.answer()
+            return
+        if data.startswith("channels:noop:"):
+            await query.answer()
+            return
+        if data == "channels:save":
+            selected = _selection_for(user_id, path)
+            if not selected["sources"] or not selected["destinations"]:
+                await query.answer("Pilih sekurang-kurangnya satu source dan satu destination.", show_alert=True)
+                return
+            overlap = selected["sources"] & selected["destinations"]
+            if overlap:
+                await query.answer("Source dan destination tak boleh channel yang sama.", show_alert=True)
+                return
+            set_sources(sorted(selected["sources"]), path)
+            set_destinations(sorted(selected["destinations"]), path)
+            _request_mode(config, "run")
+            await query.answer("Channel selection disimpan.", show_alert=True)
+            await edit(query, _dashboard_text(config), _menu())
+            start_live(user_id, query.message)
+            return
+
+        pages: dict[str, tuple[Callable[[AppConfig], str], InlineKeyboardMarkup]] = {
+            "smart:menu": (lambda _: "🧠 Smart Center\n\nDiagnostics, recovery dan media intelligence.", _smart_menu()),
+            "settings:view": (lambda _: _settings_text(path), _back()),
+            "issues:view": (_issues_text, _buttons([[("🔄 Refresh", "issues:view"), ("🛠 Repair", "advanced:repair")], [("⬅️ Smart Center", "smart:menu")]])),
+            "capacity:view": (_capacity_text, _back("smart:menu", "⬅️ Smart Center")),
+            "advanced:menu": (_advanced_text, _advanced_menu()),
+            "advanced:health": (_health_text, _buttons([[("▶️ Run Check", "health:run"), ("🔄 Refresh", "advanced:health")], [("⬅️ Smart Center", "smart:menu")]])),
+            "advanced:repair": (_repair_text, _buttons([[("🔄 Retry temporary", "repair:retry:all")], [("📋 Details", "repair:details")], [("⬅️ Smart Center", "smart:menu")]])),
+            "checkpoint:view": (_checkpoint_text, _buttons([[("♻️ Reset + Full Scan", "checkpoint:reset:confirm")], [("⬅️ Recovery Tools", "advanced:menu")]])),
+            "finder:view": (lambda _: "🔍 Original Media Finder\n\nFingerprint engine aktif. Gunakan command-line finder untuk carian terperinci sementara UI carian media dibina.", _back("smart:menu", "⬅️ Smart Center")),
+            "duplicates:view": (lambda _: "👥 Duplicate Detector\n\nDuplicate fingerprint direkodkan oleh media engine. Paparan kumpulan duplicate akan ditambah pada release seterusnya.", _back("smart:menu", "⬅️ Smart Center")),
+        }
         if data in pages:
             fn, markup = pages[data]
             await edit(query, fn(config), markup)
-            await query.answer("Dikemas kini" if data.endswith("refresh") else None)
+            await query.answer()
             return
         if data == "repair:details":
-            await edit(query, _repair_text(config, True), _repair_menu())
+            await edit(query, _repair_text(config, True), _back("advanced:repair", "⬅️ AI Error Doctor"))
             await query.answer()
             return
         if data == "health:run":
             _request_mode(config, "health")
-            await query.answer("Health check telah dijadualkan.", show_alert=True)
+            await query.answer("Pre-flight check dijadualkan.", show_alert=True)
             return
         if data.startswith("repair:retry:"):
             if is_active_phase(read_status(config).get("phase")):
-                await query.answer("Migration masih aktif. Stop atau tunggu selesai.", show_alert=True)
+                await query.answer("Migration masih aktif.", show_alert=True)
                 return
             category = data.rsplit(":", 1)[1]
             db = _database(config)
@@ -497,72 +540,42 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             if revived:
                 _request_mode(config, "process")
             await query.answer(f"{revived} job dikembalikan ke pending.", show_alert=True)
-            await edit(query, _repair_text(config), _repair_menu())
             return
         if data == "checkpoint:reset:confirm":
-            await edit(query, "♻️ Reset semua checkpoint?\n\nQueue lama tidak dipadam.", _buttons([[("✅ Ya, reset dan full scan", "checkpoint:reset:all")], [("❌ Batal", "checkpoint:view")]]))
+            await edit(query, "♻️ Reset semua checkpoint?\n\nQueue lama tidak dipadam.", _buttons([[("✅ Reset", "checkpoint:reset:all")], [("❌ Cancel", "checkpoint:view")]]))
             await query.answer()
             return
         if data == "checkpoint:reset:all":
-            if is_active_phase(read_status(config).get("phase")):
-                await query.answer("Migration masih aktif.", show_alert=True)
-                return
             db = _database(config)
             try:
                 removed = reset_all_checkpoints(db)
             finally:
                 db.close()
             _request_mode(config, "run")
-            await query.answer(f"{removed} checkpoint dibuang. Full Scan dijadualkan.", show_alert=True)
+            await query.answer(f"{removed} checkpoint dibuang.", show_alert=True)
             return
         if data in {"advanced:resume", "advanced:full", "advanced:sync", "run:now"}:
+            if data == "run:now":
+                sources, destinations = get_sources(path), list_destinations(path)
+                if not sources or not destinations:
+                    await query.answer("Pilih source dan destination dalam Channel Manager dahulu.", show_alert=True)
+                    return
+                if {item["chat"] for item in sources} & {item["chat"] for item in destinations}:
+                    await query.answer("Source dan destination bertindih. Betulkan dalam Channel Manager.", show_alert=True)
+                    return
             mode = {"advanced:resume": "process", "advanced:full": "run", "advanced:sync": "sync", "run:now": "sync"}[data]
             _request_mode(config, mode)
-            await query.answer("Arahan telah dijadualkan.", show_alert=True)
-            return
-        if data in {"source:set", "dest:add"}:
-            _PENDING[user_id] = "source" if data == "source:set" else "destination"
-            await edit(query, "Hantar @username, link t.me, -100 ID, atau forward satu post channel.", _back())
-            await query.answer()
-            return
-        if data == "settings:view":
-            await edit(query, _settings_text(path), _back())
-            await query.answer()
-            return
-        if data in {"status:view", "status:refresh"}:
-            await edit(query, _status_text(config), _status_menu())
-            start_live(user_id, query.message)
-            await query.answer("Status dikemas kini" if data == "status:refresh" else None)
+            await query.answer("Arahan dijadualkan.", show_alert=True)
             return
         if data == "stop:current":
-            _cancel_live(user_id)
             if is_active_phase(read_status(config).get("phase")):
                 request_stop(config)
                 write_status(config, "stopping", message="Arahan stop dihantar. Menunggu operasi semasa selesai.")
                 await query.answer("Arahan stop dihantar.", show_alert=True)
             else:
                 await query.answer("Tiada migration aktif.", show_alert=True)
-            await edit(query, _status_text(config), _status_menu())
+            await edit(query, _dashboard_text(config), _menu())
             start_live(user_id, query.message)
-            return
-        if data == "dest:remove":
-            destinations = list_destinations(path)
-            if not destinations:
-                await query.answer("Belum ada destination", show_alert=True)
-                return
-            rows = [[(f"🗑 {index}. {item.get('chat', '')}"[:60], f"dest:delete:{index}")] for index, item in enumerate(destinations, 1)]
-            rows.append([("⬅️ Menu", "menu")])
-            await edit(query, "Pilih destination yang nak dibuang:", _buttons(rows))
-            await query.answer()
-            return
-        if data.startswith("dest:delete:"):
-            try:
-                removed = remove_destination(int(data.rsplit(":", 1)[1]), path)
-                _request_mode(config, "run")
-                await query.answer(f"Dibuang: {removed.get('chat', '')}", show_alert=True)
-                await edit(query, _settings_text(path), _back())
-            except Exception as exc:
-                await query.answer(str(exc), show_alert=True)
             return
         await query.answer()
 
@@ -572,22 +585,10 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
         if not _is_authorized(config, user_id):
             await reject(message=message)
             return
-        assert user_id is not None
-        _cancel_live(user_id)
-        pending = _PENDING.get(user_id)
-        if not pending:
-            if not (message.text or "").startswith("/start"):
-                await message.reply_text(_dashboard_text(config), reply_markup=_menu())
-            return
-        try:
-            chat = _extract_chat(message)
-            saved = set_source(chat, path) if pending == "source" else add_destination(chat, None, path)
-            _PENDING.pop(user_id, None)
-            _request_mode(config, "run")
-            label = "Source disimpan" if pending == "source" else "Destination ditambah"
-            await message.reply_text(f"✅ {label}: {saved['chat']}", reply_markup=_menu())
-        except Exception as exc:
-            await message.reply_text(f"Tak berjaya: {exc}\n\nCuba hantar semula atau tekan Menu.", reply_markup=_back())
+        if not (message.text or "").startswith("/start"):
+            sent = await message.reply_text(_dashboard_text(config), reply_markup=_menu())
+            if user_id is not None:
+                start_live(user_id, sent)
 
     await app.start()
     try:
