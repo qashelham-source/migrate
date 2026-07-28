@@ -32,6 +32,7 @@ services:
       - -c
       - |
         set -eu
+        python optimize_database.py --config /app/config.yaml
         python main.py recover
         python main.py admin &
         admin_pid=$$!
