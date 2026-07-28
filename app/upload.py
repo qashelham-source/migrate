@@ -278,7 +278,13 @@ class Uploader:
                 if media_type == "photo":
                     media.append(InputMediaPhoto(str(path), caption=caption))
                 elif media_type == "video":
-                    media.append(InputMediaVideo(str(path), caption=caption, supports_streaming=True))
+                    media.append(
+                        InputMediaVideo(
+                            str(path),
+                            caption=caption,
+                            **self._video_metadata(message),
+                        )
+                    )
                 else:
                     media.append(InputMediaDocument(str(path), caption=caption))
             try:
@@ -349,7 +355,7 @@ class Uploader:
                 "upload",
                 self.writer.send_video,
                 video=str(path),
-                supports_streaming=True,
+                **self._video_metadata(message),
                 **common,
             )
         return await self.limiter.call(
@@ -358,6 +364,20 @@ class Uploader:
             document=str(path),
             **common,
         )
+
+    @staticmethod
+    def _video_metadata(message: Message) -> dict[str, Any]:
+        video = getattr(message, "video", None)
+        if not video:
+            return {"supports_streaming": True}
+        metadata: dict[str, Any] = {
+            "supports_streaming": bool(getattr(video, "supports_streaming", True)),
+        }
+        for key in ("duration", "width", "height"):
+            value = getattr(video, key, None)
+            if value is not None:
+                metadata[key] = int(value)
+        return metadata
 
     def _destination_kwargs(self, job: MessageJob) -> dict[str, Any]:
         return {"reply_to_message_id": job.dest_topic_id} if job.dest_topic_id else {}
