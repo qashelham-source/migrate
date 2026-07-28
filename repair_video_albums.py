@@ -18,6 +18,9 @@ from app.upload import Uploader
 from main import choose_writer_for_destinations, warm_dialog_cache
 
 
+REPAIR_ACTION = "replace_large_video_album"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Safely replace migrated albums containing large videos")
     parser.add_argument("--config", default="config.yaml")
@@ -25,20 +28,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--confirm", action="store_true")
+    parser.add_argument(
+        "--force-repair",
+        action="store_true",
+        help="Include albums already recorded as successfully repaired",
+    )
     return parser.parse_args()
 
 
-def candidate_jobs(db: Database, limit: int) -> list[MessageJob]:
+def candidate_jobs(db: Database, limit: int, *, include_repaired: bool = False) -> list[MessageJob]:
+    repaired_filter = "" if include_repaired else """
+          AND NOT EXISTS (
+              SELECT 1
+              FROM repair_actions ra
+              WHERE ra.job_id = messages.id
+                AND ra.action = ?
+                AND ra.outcome = 'replaced'
+          )
+    """
+    params: tuple[Any, ...]
+    if include_repaired:
+        params = (max(1, int(limit)),)
+    else:
+        params = (REPAIR_ACTION, max(1, int(limit)))
     rows = db.query(
-        """
+        f"""
         SELECT * FROM messages
         WHERE status = 'copied'
           AND media_group_id IS NOT NULL
           AND dest_message_ids IS NOT NULL
+          {repaired_filter}
         ORDER BY id ASC
         LIMIT ?
         """,
-        (max(1, int(limit)),),
+        params,
     )
     jobs = [MessageJob.from_row(row) for row in rows]
     return [job for job in jobs if len(job.source_message_ids) > 1 and job.dest_message_ids]
@@ -154,7 +177,7 @@ async def replace_job(
             (json.dumps(new_ids), now, now, job.id),
         )
     queue.log_repair(
-        action="replace_large_video_album",
+        action=REPAIR_ACTION,
         job=job,
         reason="Previously migrated album contained a large video",
         outcome="replaced",
@@ -174,9 +197,12 @@ async def run(args: argparse.Namespace) -> None:
     db = Database(config.queue.db_path)
     db.initialize()
     queue = MessageQueue(db, config)
-    jobs = candidate_jobs(db, args.limit)
+    jobs = candidate_jobs(db, args.limit, include_repaired=args.force_repair)
     print(f"Candidate album jobs: {len(jobs)}")
+    if args.force_repair:
+        print("WARNING: --force-repair includes albums already repaired successfully")
     if not jobs:
+        print("No unrepaired candidate albums remain.")
         db.close()
         return
 
@@ -207,7 +233,7 @@ async def run(args: argparse.Namespace) -> None:
                 except Exception as exc:
                     failed += 1
                     queue.log_repair(
-                        action="replace_large_video_album",
+                        action=REPAIR_ACTION,
                         job=job,
                         reason=f"{exc.__class__.__name__}: {exc}",
                         outcome="failed",
