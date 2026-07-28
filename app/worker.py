@@ -65,12 +65,8 @@ class Worker:
         return details
 
     async def run(self, stop_event: asyncio.Event) -> None:
-        recovered = self.queue.recover_in_progress()
-        if recovered and self.logger:
-            self.logger.info("Recovered %s interrupted jobs back to pending", recovered)
-
         while not stop_event.is_set():
-            jobs = self.queue.fetch_due(self.config.batch.size)
+            jobs = self.queue.claim_due(self.config.batch.size)
             if not jobs:
                 if self.logger:
                     self.logger.info("No due pending jobs")
@@ -132,7 +128,7 @@ class Worker:
         batch_index: int,
         batch_total: int,
     ) -> None:
-        attempts = self.queue.start_attempt(job)
+        attempts = job.attempts
         if self.logger:
             self.logger.info("Processing job %s attempt %s", job.id, attempts)
 
