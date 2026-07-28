@@ -164,6 +164,15 @@ def _status_menu() -> InlineKeyboardMarkup:
 
 def _authorized_ids(config: AppConfig) -> set[int]:
     result: set[int] = set()
+
+    # config.yaml is the source of truth; accounts.json may not exist yet when
+    # the control panel starts before the migration service has cached a session.
+    for configured_id in config.telegram.admin_ids:
+        try:
+            result.add(int(configured_id))
+        except (TypeError, ValueError):
+            continue
+
     for account in load_accounts(config).values():
         try:
             result.add(int(account.get("id")))
