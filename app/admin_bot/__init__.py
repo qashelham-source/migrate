@@ -141,42 +141,42 @@ def _progress_bar(percent: int, width: int = 10) -> str:
 def _phase_summary(phase: str, current_source: dict[str, Any] | None) -> tuple[str, str]:
     blocked = int(current_source.get("blocked_items") or 0) if current_source else 0
     if phase == "blocked":
-        return "⛔ Queue tersekat", "Tindakan diperlukan sebelum queue boleh sambung."
+        return "⛔ Queue blocked", "Action is required before the queue can continue."
     if phase == "waiting_retry":
-        return "🟡 Retry automatik", "Bot akan sambung sendiri bila masa retry tiba."
+        return "🟡 Automatic retry", "The bot will resume automatically when the retry time arrives."
     if phase == "watching":
-        return "🛰 Live Watcher", "Menunggu post baharu atau arahan Start Queue."
+        return "🛰 Live Watcher", "Waiting for new posts or a Start Queue command."
     if phase == "queued":
-        return "⏸ Queue menunggu mula", "Tekan Start Queue untuk sambung source yang tertangguh."
+        return "⏸ Queue waiting to start", "Tap Start Queue to resume queued sources."
     if phase == "scanning":
-        return "🔎 Sedang scan source", "Menyusun post/album untuk migration."
+        return "🔎 Scanning source", "Organising posts/albums for migration."
     if phase in {"downloading", "uploading", "processing", "batch_pause"}:
         if blocked:
-            return "🟠 Ada isu pada source aktif", "Queue masih meneruskan job yang selamat."
-        return "🟢 Sedang berjalan", {
-            "downloading": "⬇️ Sedang download kandungan.",
-            "uploading": "⬆️ Sedang hantar ke destination.",
-            "processing": "⚙️ Sedang proses migration.",
-            "batch_pause": "⏳ Rehat antara batch; queue akan sambung sendiri.",
+            return "🟠 Active source needs attention", "The queue continues with safe jobs."
+        return "🟢 Running now", {
+            "downloading": "⬇️ Downloading content.",
+            "uploading": "⬆️ Uploading to the destination.",
+            "processing": "⚙️ Processing migration.",
+            "batch_pause": "⏳ Paused between batches; the queue will resume automatically.",
         }[phase]
     if phase == "stopping":
-        return "⏹ Sedang berhenti", "Menunggu operasi semasa selesai dengan selamat."
+        return "⏹ Stopping safely", "Waiting for the current operation to finish safely."
     if phase == "stopped":
-        return "⏹ Dihentikan", "Queue kekal disimpan dan boleh disambung kemudian."
+        return "⏹ Stopped", "The queue is saved and can be resumed later."
     if phase == "waiting":
-        return "⚙️ Setup diperlukan", "Tetapkan source dan destination dahulu."
+        return "⚙️ Setup required", "Set a source and destination first."
     if phase == "error":
-        return "🔴 Ralat migration", "Semak Issue Center untuk butiran."
-    return "🟢 Sedia", "Pilih Start Queue apabila anda mahu mula."
+        return "🔴 Migration error", "Open Issue Center for details."
+    return "🟢 Ready", "Tap Start Queue when you are ready to begin."
 
 
 def _media_label(value: Any) -> str:
     labels = {
         "album": "Album",
         "video": "Video",
-        "photo": "Foto",
-        "document": "Dokumen",
-        "text": "Teks",
+        "photo": "Photo",
+        "document": "Document",
+        "text": "Text",
     }
     return labels.get(str(value or "").lower(), str(value or "Media").title())
 
@@ -206,27 +206,27 @@ def _dashboard_text(config: AppConfig) -> str:
         in_progress = int(current_source["active_items"])
         blocked = int(current_source["blocked_items"])
         percent = int(current_source["percent"])
-        lines += ["", "🎯 Sedang Migrasi", title]
+        lines += ["", "🎯 Active Migration", title]
         if eligible:
             lines += [
                 f"{_progress_bar(percent)}  {percent}%",
-                f"{copied:,} / {eligible:,} post/album",
+                f"{copied:,} / {eligible:,} posts/albums",
             ]
             details: list[str] = []
             if remaining:
-                details.append(f"Baki {remaining:,}")
+                details.append(f"{remaining:,} remaining")
             if in_progress:
-                details.append(f"⚡ {in_progress:,} aktif")
+                details.append(f"⚡ {in_progress:,} active")
             if details:
                 lines.append(" · ".join(details))
             if blocked:
-                lines.append(f"⚠️ {blocked:,} item perlu semakan")
+                lines.append(f"⚠️ {blocked:,} items need review")
         else:
-            lines.append("Tiada item yang sepadan dengan tetapan filter.")
+            lines.append("No items match the current filter settings.")
     else:
         source_name = str(status.get("source") or status.get("source_chat") or "").strip()
         if source_name and phase not in {"watching", "idle", "stopped", "source_complete"}:
-            lines += ["", "🎯 Source Semasa", source_name[:52]]
+            lines += ["", "🎯 Current Source", source_name[:52]]
         if phase == "scanning" and status.get("current") is not None and status.get("total") is not None:
             try:
                 scanned = max(0, int(status["current"]))
@@ -236,17 +236,20 @@ def _dashboard_text(config: AppConfig) -> str:
             except (TypeError, ValueError):
                 pass
         elif phase in {"downloading", "uploading", "processing"} and active_jobs:
-            lines += ["", f"⚡ {active_jobs:,} job sedang bekerja"]
+            lines += ["", f"⚡ {active_jobs:,} active job(s)"]
 
     if status.get("source_index") is not None and status.get("source_total") is not None:
         try:
             source_index = int(status["source_index"])
             source_total = int(status["source_total"])
-            lines += ["", f"📦 Queue source {source_index}/{source_total} · {d['total']} destination"]
+            destination_label = "destination" if int(d["total"]) == 1 else "destinations"
+            lines += ["", f"📦 Source queue {source_index}/{source_total} · {d['total']} {destination_label}"]
         except (TypeError, ValueError):
             pass
     else:
-        lines += ["", f"📦 {s['total']} source · {d['total']} destination"]
+        source_label = "source" if int(s["total"]) == 1 else "sources"
+        destination_label = "destination" if int(d["total"]) == 1 else "destinations"
+        lines += ["", f"📦 {s['total']} {source_label} · {d['total']} {destination_label}"]
 
     speed = float(t["speed_bps"] or 0)
     if speed > 0:
@@ -255,15 +258,15 @@ def _dashboard_text(config: AppConfig) -> str:
             speed_line += f" · ETA {format_eta(t['eta_seconds'])}"
         lines.append(speed_line)
     if status.get("media_type"):
-        lines.append(f"📎 Sekarang: {_media_label(status['media_type'])}")
+        lines.append(f"📎 Now processing: {_media_label(status['media_type'])}")
 
     error = status.get("last_error") or status.get("error")
     if error and phase in {"blocked", "waiting_retry", "error"}:
         lines += ["", f"⚠️ {str(error).replace(chr(10), ' ')[:220]}"]
     if storage.percent_used >= 80:
-        level = "🚨 Storage kritikal" if storage.percent_used >= 90 else "⚠️ Storage rendah"
+        level = "🚨 Critical storage" if storage.percent_used >= 90 else "⚠️ Low storage"
         lines += ["", level, f"Free: {format_bytes(storage.free_bytes)}"]
-    lines += ["", "↻ Dikemas kini automatik"]
+    lines += ["", "↻ Updates automatically"]
     return "\n".join(lines)[:3900]
 
 def _settings_text(path: Path) -> str:
@@ -276,8 +279,8 @@ def _settings_text(path: Path) -> str:
             f"Selected sources: {len(sources)}",
             f"Selected destinations: {len(destinations)}",
             "",
-            "Source diurus dalam Source Queue. Destination diurus dalam menu Destinations.",
-            "Tetapan worker, retry, cache dan log kekal dalam konfigurasi sistem.",
+            "Sources are managed in Source Queue. Destinations are managed in the Destinations menu.",
+            "Worker, retry, cache, and log settings remain in the system configuration.",
         ]
     )
 
@@ -290,7 +293,7 @@ def _issues_text(config: AppConfig) -> str:
         db.close()
     lines = ["🚨 Issue Center", ""]
     if not rows:
-        return "\n".join(lines + ["✅ Tiada isu aktif."])
+        return "\n".join(lines + ["✅ No active issues."])
     for item in rows:
         if item["kind"] == "destination":
             lines += [f"⏸ Destination {item['id']} paused", str(item["error"])[:180], ""]
@@ -328,11 +331,11 @@ def _finder_text_from_stats(stats: dict[str, Any], indexed_now: int | None = Non
         f"Search history: {stats['match_history']}",
     ]
     if indexed_now is not None:
-        lines += ["", f"✅ {indexed_now} media queue item baru diindex."]
+        lines += ["", f"✅ {indexed_now} new media queue item(s) indexed."]
     lines += [
         "",
-        "Index Queue membaca metadata sedia ada sahaja—tiada media dimuat turun atau diubah.",
-        "Find Link menerima t.me link atau nombor message yang sudah diindex.",
+        "Index Queue reads existing metadata only—no media is downloaded or changed.",
+        "Find Link accepts a t.me link or an indexed message number.",
     ]
     return "\n".join(lines)[:3900]
 
@@ -369,15 +372,15 @@ def _duplicates_text_from_data(
         f"Duplicate records: {stats['duplicate_records']} ({stats['duplicate_rate']}%)",
     ]
     if indexed_now is not None:
-        lines += ["", f"✅ {indexed_now} media queue item baru diindex."]
+        lines += ["", f"✅ {indexed_now} new media queue item(s) indexed."]
     if not groups:
-        lines += ["", "✅ Tiada duplicate dijumpai dalam media yang telah diindex."]
+        lines += ["", "✅ No duplicates found in indexed media."]
         return "\n".join(lines)
     lines += ["", f"Top duplicate groups: {len(groups)}"]
     for index, group in enumerate(groups, start=1):
         lines += [
             "",
-            f"{index}. {int(group.get('copies') or 0)} salinan",
+            f"{index}. {int(group.get('copies') or 0)} copies",
             f"Original: {group.get('original_chat_id')}/{group.get('original_message_id')}",
         ]
         locations = str(group.get("locations") or "")
@@ -411,15 +414,15 @@ def _finder_result_text(reference: str, match: dict[str, Any] | None) -> str:
             [
                 "🔍 Original Media Finder",
                 "",
-                "❌ Media asal tidak dijumpai dalam index.",
-                "Tekan Index Queue dahulu, kemudian cuba t.me link atau message ID semula.",
+                "❌ Original media was not found in the index.",
+                "Tap Index Queue, then try the t.me link or message ID again.",
             ]
         )
     size = int(match.get("file_size") or 0)
     lines = [
         "🔍 Original Media Finder",
         "",
-        "✅ Media asal dijumpai.",
+        "✅ Original media found.",
         f"Source: {match.get('source_chat_id')}",
         f"Message ID: {match.get('source_message_id')}",
         f"Type: {match.get('media_type') or '-'}",
@@ -433,7 +436,7 @@ def _finder_result_text(reference: str, match: dict[str, Any] | None) -> str:
 def _health_text(config: AppConfig) -> str:
     report = load_health_report(config)
     if not report:
-        return "🩺 Pre-flight Health Check\n\nBelum ada laporan. Tekan Run Check."
+        return "🩺 Pre-flight Health Check\n\nNo report yet. Tap Run Check."
     lines = ["🩺 Pre-flight Health Check", "", f"Overall: {str(report.get('overall') or 'unknown').upper()}", ""]
     for item in report.get("checks") or []:
         icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}.get(str(item.get("status")), "•")
@@ -452,7 +455,7 @@ def _repair_text(config: AppConfig, details: bool = False) -> str:
             lines = ["🤖 AI Error Doctor", ""]
             for category, item in rows[:15]:
                 lines += [f"#{item['id']} · {CATEGORY_LABELS[category]}", str(item['last_error']).replace("\n", " ")[:180], ""]
-            return "\n".join(lines or ["Tiada isu."])[:3900]
+            return "\n".join(lines or ["No issues."])[:3900]
         summary = repair_summary(db)
     finally:
         db.close()
@@ -480,7 +483,7 @@ def _checkpoint_text(config: AppConfig) -> str:
     lines = ["📍 Incremental Sync Checkpoints", ""]
     for index, row in enumerate(rows, 1):
         lines += [f"{index}. Source {row['source_chat_id']}", f"Last message: {row['last_scanned_message_id']}", ""]
-    return "\n".join(lines + ([] if rows else ["Belum ada checkpoint."]))[:3900]
+    return "\n".join(lines + ([] if rows else ["No checkpoints yet."]))[:3900]
 
 
 def _ordered_chats(values: list[str] | set[str]) -> list[str]:
@@ -517,7 +520,7 @@ def _toggle_selection(selected: list[str], chat: str) -> bool:
 def _snapshot_session_database(source: Path, destination: Path) -> None:
     """Create an isolated SQLite snapshot without locking the live Telegram session."""
     if not source.is_file():
-        raise RuntimeError("Session Telegram tidak ditemui. Jalankan login dahulu.")
+        raise RuntimeError("Telegram session was not found. Run login first.")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     source_uri = f"{source.resolve().as_uri()}?mode=ro"
@@ -536,7 +539,7 @@ def _snapshot_session_database(source: Path, destination: Path) -> None:
             last_error = exc
             time.sleep(0.15 * (attempt + 1))
 
-    raise RuntimeError("Session Telegram masih sibuk. Cuba Scan / Refresh lagi.") from last_error
+    raise RuntimeError("Telegram session is still busy. Try Scan / Refresh again.") from last_error
 
 
 async def _scan_channels(config: AppConfig, user_id: int) -> list[dict[str, Any]]:
@@ -605,13 +608,13 @@ def _channel_title(user_id: int, chat: str) -> str:
 
 def _source_queue_lines(user_id: int, selected: list[str]) -> list[str]:
     if not selected:
-        return ["Belum ada source dalam queue."]
-    lines = ["Turutan queue:"]
+        return ["No sources in the queue."]
+    lines = ["Queue order:"]
     for index, chat in enumerate(selected[:8], start=1):
-        state = "🟢 Semasa" if index == 1 else "⏳ Waiting"
+        state = "🟢 Current" if index == 1 else "⏳ Waiting"
         lines.append(f"{index}. {state} · {_channel_title(user_id, chat)[:54]}")
     if len(selected) > 8:
-        lines.append(f"… dan {len(selected) - 8} source lagi.")
+        lines.append(f"… and {len(selected) - 8} more source(s).")
     return lines
 
 
@@ -624,18 +627,18 @@ def _source_text(user_id: int, path: Path, page: int = 0) -> str:
             "",
             * _source_queue_lines(user_id, selected["sources"]),
             "",
-            "Belum scan Telegram. Tekan Scan / Refresh untuk tambah source.",
+            "Telegram has not been scanned. Tap Scan / Refresh to add sources.",
         ])
     start = page * _PAGE_SIZE
     end = min(len(channels), start + _PAGE_SIZE)
     return "\n".join([
         "📚 Source Queue",
         "",
-        f"Source dipilih: {len(selected['sources'])}",
+        f"Selected sources: {len(selected['sources'])}",
         * _source_queue_lines(user_id, selected["sources"]),
         "",
-        f"Channel tersedia: {start + 1}-{end} daripada {len(channels)}",
-        "Pilih source mengikut turutan kerja. Source seterusnya kekal waiting sehingga yang pertama siap.",
+        f"Available channels: {start + 1}-{end} of {len(channels)}",
+        "Select sources in the order they should run. The next source stays in the waiting list until the first one is complete.",
     ])
 
 
@@ -657,9 +660,9 @@ def _source_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarku
     if nav:
         rows.append(nav)
     rows += [
-        [("📋 Susun Queue", "sources:queue"), ("🔄 Scan / Refresh", "sources:scan")],
-        [("✅ Simpan + Mula Queue", "sources:save")],
-        [("🎯 Urus Destinations", "destinations:view"), ("⬅️ Dashboard", "menu")],
+        [("📋 Arrange Queue", "sources:queue"), ("🔄 Scan / Refresh", "sources:scan")],
+        [("✅ Save & Start Queue", "sources:save")],
+        [("🎯 Manage Destinations", "destinations:view"), ("⬅️ Dashboard", "menu")],
     ]
     return _buttons(rows)
 
@@ -667,11 +670,11 @@ def _source_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarku
 def _source_queue_text(user_id: int, path: Path) -> str:
     selected = _selection_for(user_id, path)
     return "\n".join([
-        "📋 Susun Source Queue",
+        "📋 Arrange Source Queue",
         "",
         * _source_queue_lines(user_id, selected["sources"]),
         "",
-        "Gunakan ▲ atau ▼ untuk ubah turutan. Hanya source pertama akan berjalan.",
+        "Use ▲ or ▼ to change the order. Only the first source will run.",
     ])
 
 
@@ -688,7 +691,7 @@ def _source_queue_menu(user_id: int, path: Path) -> InlineKeyboardMarkup:
         ])
     rows += [
         [("⬅️ Source Queue", "sources:view")],
-        [("✅ Simpan + Mula Queue", "sources:save")],
+        [("✅ Save & Start Queue", "sources:save")],
     ]
     return _buttons(rows)
 
@@ -701,24 +704,24 @@ def _destination_text(user_id: int, path: Path, page: int = 0) -> str:
         return "\n".join([
             "🎯 Destinations",
             "",
-            f"Destination dipilih: {len(selected['destinations'])}",
-            "Belum scan Telegram. Tekan Scan / Refresh untuk pilih destination.",
+            f"Selected destinations: {len(selected['destinations'])}",
+            "Telegram has not been scanned. Tap Scan / Refresh to select destinations.",
         ])
     start = page * _PAGE_SIZE
     end = min(len(available), start + _PAGE_SIZE)
     lines = [
         "🎯 Destinations",
         "",
-        f"Destination dipilih: {len(selected['destinations'])}",
-        "Hanya channel/group yang anda boleh post dipaparkan.",
+        f"Selected destinations: {len(selected['destinations'])}",
+        "Only channels/groups you can post to are shown.",
         "",
     ]
     if selected["destinations"]:
-        lines.append("Aktif: " + ", ".join(_channel_title(user_id, chat)[:24] for chat in selected["destinations"][:4]))
+        lines.append("Active: " + ", ".join(_channel_title(user_id, chat)[:24] for chat in selected["destinations"][:4]))
     if available:
-        lines += [f"Channel tersedia: {start + 1}-{end} daripada {len(available)}", "Pilih destination, kemudian simpan."]
+        lines += [f"Available channels: {start + 1}-{end} of {len(available)}", "Choose destinations, then save."]
     else:
-        lines += ["Tiada channel dengan akses post ditemui. Pastikan akaun anda admin di destination."]
+        lines += ["No channel with posting access was found. Make sure your account is an admin in the destination."]
     return "\n".join(lines)
 
 
@@ -740,7 +743,7 @@ def _destination_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboard
     if nav:
         rows.append(nav)
     rows += [
-        [("🔄 Scan / Refresh", "destinations:scan"), ("✅ Simpan Destination", "destinations:save")],
+        [("🔄 Scan / Refresh", "destinations:scan"), ("✅ Save Destinations", "destinations:save")],
         [("📚 Source Queue", "sources:view"), ("⬅️ Dashboard", "menu")],
     ]
     return _buttons(rows)
@@ -765,7 +768,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             pass
 
     async def reject(message: Message | None = None, query: CallbackQuery | None = None) -> None:
-        text = "Akses ditolak. Bot ini hanya untuk pemilik user session."
+        text = "Access denied. This bot is only for the user-session owner."
         if query:
             await query.answer(text, show_alert=True)
         elif message:
@@ -817,7 +820,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
         if data in {"menu", "dashboard:view"}:
             await edit(query, _dashboard_text(config), _menu())
             start_live(user_id, query.message)
-            await query.answer("Dikemas kini" if data == "dashboard:view" else None)
+            await query.answer("Updated" if data == "dashboard:view" else None)
             return
         if data in {"sources:view", "channels:view"}:
             await edit(query, _source_text(user_id, path), _source_menu(user_id, path))
@@ -831,7 +834,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             target = "destinations" if data == "destinations:scan" else "sources"
             title = "🎯 Destinations" if target == "destinations" else "📚 Source Queue"
             await query.answer("Scanning Telegram…", show_alert=False)
-            await edit(query, f"{title}\n\nScanning channel dan group…", _back(f"{target}:view", "⬅️ Cancel"))
+            await edit(query, f"{title}\n\nScanning channels and groups…", _back(f"{target}:view", "⬅️ Cancel"))
             try:
                 _CHANNEL_CACHE[user_id] = await _scan_channels(config, user_id)
                 _SELECTIONS.pop(user_id, None)
@@ -842,8 +845,8 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             except Exception as exc:
                 await edit(
                     query,
-                    f"{title}\n\n❌ Scan gagal: {str(exc)[:500]}\n\nPastikan user session tidak sedang dikunci proses lain.",
-                    _back(f"{target}:view", "⬅️ Kembali"),
+                    f"{title}\n\n❌ Scan failed: {str(exc)[:500]}\n\nMake sure the user session is not locked by another process.",
+                    _back(f"{target}:view", "⬅️ Back"),
                 )
             return
         if data.startswith("sources:page:"):
@@ -860,12 +863,12 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             index = int(data.rsplit(":", 1)[1])
             channels = _CHANNEL_CACHE.get(user_id, [])
             if index >= len(channels):
-                await query.answer("Channel cache expired. Scan semula.", show_alert=True)
+                await query.answer("Channel cache expired. Scan again.", show_alert=True)
                 return
             selected = _selection_for(user_id, path)
             chat = str(channels[index]["chat"])
             if chat not in selected["sources"] and chat in selected["destinations"]:
-                await query.answer("Channel yang sama tak boleh jadi source dan destination.", show_alert=True)
+                await query.answer("The same channel cannot be both a source and a destination.", show_alert=True)
                 return
             _toggle_selection(selected["sources"], chat)
             page = index // _PAGE_SIZE
@@ -876,12 +879,12 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             index = int(data.rsplit(":", 1)[1])
             channels = [item for item in _CHANNEL_CACHE.get(user_id, []) if item["can_destination"]]
             if index >= len(channels):
-                await query.answer("Channel cache expired. Scan semula.", show_alert=True)
+                await query.answer("Channel cache expired. Scan again.", show_alert=True)
                 return
             selected = _selection_for(user_id, path)
             chat = str(channels[index]["chat"])
             if chat not in selected["destinations"] and chat in selected["sources"]:
-                await query.answer("Channel yang sama tak boleh jadi source dan destination.", show_alert=True)
+                await query.answer("The same channel cannot be both a source and a destination.", show_alert=True)
                 return
             _toggle_selection(selected["destinations"], chat)
             page = index // _PAGE_SIZE
@@ -917,17 +920,17 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             selected = _selection_for(user_id, path)
             destinations = [str(item["chat"]) for item in list_destinations(path)]
             if not selected["sources"]:
-                await query.answer("Pilih sekurang-kurangnya satu source dahulu.", show_alert=True)
+                await query.answer("Select at least one source first.", show_alert=True)
                 return
             if not destinations:
-                await query.answer("Tambah destination dalam menu Destinations dahulu.", show_alert=True)
+                await query.answer("Add a destination in the Destinations menu first.", show_alert=True)
                 return
             if set(selected["sources"]) & set(destinations):
-                await query.answer("Source dan destination tak boleh channel yang sama.", show_alert=True)
+                await query.answer("The source and destination cannot be the same channel.", show_alert=True)
                 return
             set_sources(selected["sources"], path)
             _request_mode(config, "run")
-            await query.answer("Source queue disimpan dan dimulakan mengikut turutan.", show_alert=True)
+            await query.answer("Source queue saved and started in order.", show_alert=True)
             await edit(query, _dashboard_text(config), _menu())
             start_live(user_id, query.message)
             return
@@ -935,21 +938,21 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             selected = _selection_for(user_id, path)
             sources = [str(item["chat"]) for item in get_sources(path)]
             if not selected["destinations"]:
-                await query.answer("Pilih sekurang-kurangnya satu destination dahulu.", show_alert=True)
+                await query.answer("Select at least one destination first.", show_alert=True)
                 return
             if set(sources) & set(selected["destinations"]):
-                await query.answer("Source dan destination tak boleh channel yang sama.", show_alert=True)
+                await query.answer("The source and destination cannot be the same channel.", show_alert=True)
                 return
             set_destinations(selected["destinations"], path)
             await query.answer(
-                "Destination disimpan. Queue sedia ada tidak diulang secara automatik.",
+                "Destinations saved. The existing queue will not be rerun automatically.",
                 show_alert=True,
             )
             await edit(query, _destination_text(user_id, path), _destination_menu(user_id, path))
             return
 
         pages: dict[str, tuple[Callable[[AppConfig], str], InlineKeyboardMarkup]] = {
-            "smart:menu": (lambda _: "🧠 Smart Center\n\nDiagnostics, recovery dan media intelligence.", _smart_menu()),
+            "smart:menu": (lambda _: "🧠 Smart Center\n\nDiagnostics, recovery, and media intelligence.", _smart_menu()),
             "settings:view": (lambda _: _settings_text(path), _back()),
             "issues:view": (_issues_text, _buttons([[("🔄 Refresh", "issues:view"), ("🛠 Repair", "advanced:repair")], [("⬅️ Smart Center", "smart:menu")]])),
             "capacity:view": (_capacity_text, _back("smart:menu", "⬅️ Smart Center")),
@@ -966,13 +969,13 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             _FINDER_INPUTS.add(user_id)
             await edit(
                 query,
-                "🔍 Original Media Finder\n\nHantar t.me link atau nombor message untuk cari media asal dalam index.",
+                "🔍 Original Media Finder\n\nSend a t.me link or a message number to find the original media in the index.",
                 _back("finder:view", "⬅️ Finder"),
             )
             await query.answer()
             return
         if data in {"finder:index", "duplicates:index"}:
-            await query.answer("Mengindex hingga 500 media queue item…")
+            await query.answer("Indexing up to 500 media queue items…")
             db = _database(config)
             try:
                 indexed = index_existing_queue(db, limit=500)
@@ -998,11 +1001,11 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             return
         if data == "health:run":
             _request_mode(config, "health")
-            await query.answer("Pre-flight check dijadualkan.", show_alert=True)
+            await query.answer("Pre-flight check scheduled.", show_alert=True)
             return
         if data.startswith("repair:retry:"):
             if is_active_phase(read_status(config).get("phase")):
-                await query.answer("Migration masih aktif.", show_alert=True)
+                await query.answer("Migration is still active.", show_alert=True)
                 return
             category = data.rsplit(":", 1)[1]
             db = _database(config)
@@ -1012,10 +1015,10 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 db.close()
             if revived:
                 _request_mode(config, "process")
-            await query.answer(f"{revived} job dikembalikan ke pending.", show_alert=True)
+            await query.answer(f"{revived} job(s) returned to pending.", show_alert=True)
             return
         if data == "checkpoint:reset:confirm":
-            await edit(query, "♻️ Reset semua checkpoint?\n\nQueue lama tidak dipadam.", _buttons([[("✅ Reset", "checkpoint:reset:all")], [("❌ Cancel", "checkpoint:view")]]))
+            await edit(query, "♻️ Reset all checkpoints?\n\nThe existing queue will not be deleted.", _buttons([[("✅ Reset", "checkpoint:reset:all")], [("❌ Cancel", "checkpoint:view")]]))
             await query.answer()
             return
         if data == "checkpoint:reset:all":
@@ -1025,28 +1028,28 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             finally:
                 db.close()
             _request_mode(config, "run")
-            await query.answer(f"{removed} checkpoint dibuang.", show_alert=True)
+            await query.answer(f"{removed} checkpoint(s) removed.", show_alert=True)
             return
         if data in {"advanced:resume", "advanced:full", "advanced:sync", "run:now"}:
             if data == "run:now":
                 sources, destinations = get_sources(path), list_destinations(path)
                 if not sources or not destinations:
-                    await query.answer("Sediakan Source Queue dan Destination dahulu.", show_alert=True)
+                    await query.answer("Set up Source Queue and Destinations first.", show_alert=True)
                     return
                 if {item["chat"] for item in sources} & {item["chat"] for item in destinations}:
-                    await query.answer("Source dan destination bertindih. Betulkan dalam menu masing-masing.", show_alert=True)
+                    await query.answer("Sources and destinations overlap. Fix them in their respective menus.", show_alert=True)
                     return
             mode = {"advanced:resume": "process", "advanced:full": "run", "advanced:sync": "sync", "run:now": "sync"}[data]
             _request_mode(config, mode)
-            await query.answer("Arahan dijadualkan.", show_alert=True)
+            await query.answer("Command scheduled.", show_alert=True)
             return
         if data == "stop:current":
             if is_active_phase(read_status(config).get("phase")):
                 request_stop(config)
-                write_status(config, "stopping", message="Arahan stop dihantar. Menunggu operasi semasa selesai.")
-                await query.answer("Arahan stop dihantar.", show_alert=True)
+                write_status(config, "stopping", message="Stop request sent. Waiting for the current operation to finish.")
+                await query.answer("Stop request sent.", show_alert=True)
             else:
-                await query.answer("Tiada migration aktif.", show_alert=True)
+                await query.answer("No active migration.", show_alert=True)
             await edit(query, _dashboard_text(config), _menu())
             start_live(user_id, query.message)
             return
