@@ -924,14 +924,22 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 return
             source_index = channels.index(item)
             title = str(item["title"])[:40]
-            blacklisted = blacklist_source(chat, path)
+            try:
+                blacklisted = blacklist_source(chat, path)
+            except Exception as exc:
+                await query.answer(
+                    f"Could not blacklist source: {exc.__class__.__name__}: {exc}"[:190],
+                    show_alert=True,
+                )
+                return
             selected = _selection_for(user_id, path)
             selected["sources"] = [
                 value for value in selected["sources"] if str(value).lower() != blacklisted.lower()
             ]
-            page = _source_page(_source_channels(user_id, path), source_index // _PAGE_SIZE)
-            await edit(query, _source_text(user_id, path, page), _source_menu(user_id, path, page))
             await query.answer(f"Blacklisted and removed: {title}", show_alert=True)
+            page = _source_page(_source_channels(user_id, path), source_index // _PAGE_SIZE)
+            with suppress(Exception):
+                await edit(query, _source_text(user_id, path, page), _source_menu(user_id, path, page))
             return
         if data.startswith("destinations:toggle:"):
             index = int(data.rsplit(":", 1)[1])
