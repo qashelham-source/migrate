@@ -35,7 +35,7 @@ from app.telegram_client import load_accounts
 
 _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
 _CHANNEL_CACHE: dict[int, list[dict[str, Any]]] = {}
-_SELECTIONS: dict[int, dict[str, set[str]]] = {}
+_SELECTIONS: dict[int, dict[str, list[str]]] = {}
 _FINDER_INPUTS: set[int] = set()
 _PAGE_SIZE = 8
 
@@ -59,9 +59,9 @@ def _buttons(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 def _menu() -> InlineKeyboardMarkup:
     return _buttons(
         [
-            [("📚 Channel Manager", "channels:view")],
+            [("📚 Source Queue", "sources:view"), ("🎯 Destinations", "destinations:view")],
             [("🧠 Smart Center", "smart:menu"), ("⚙️ Settings", "settings:view")],
-            [("▶️ Sync", "run:now"), ("⏹ Stop", "stop:current")],
+            [("▶️ Start Queue", "run:now"), ("⏹ Stop", "stop:current")],
             [("🔄 Refresh", "dashboard:view")],
         ]
     )
@@ -150,6 +150,10 @@ def _dashboard_text(config: AppConfig) -> str:
     phase_labels = {
         "idle": "Idle", "watching": "Live watcher", "scanning": "Scanning", "processing": "Processing",
         "downloading": "Downloading", "uploading": "Uploading", "stopping": "Stopping", "stopped": "Stopped",
+        "waiting": "Setup diperlukan", "queued": "Queue menunggu mula",
+        "waiting_retry": "Retry automatik", "blocked": "Queue tersekat",
+        "source_complete": "Source lengkap", "scan_complete": "Scan selesai",
+        "batch_pause": "Rehat antara batch",
         "error": "Error", "health_check": "Pre-flight check", "health_complete": "Health check complete",
     }
     current = phase_labels.get(phase, phase.replace("_", " ").title())
@@ -168,6 +172,20 @@ def _dashboard_text(config: AppConfig) -> str:
         f"ETA: {format_eta(t['eta_seconds'])}",
         f"Sources: {s['total']} · Destinations: {d['total']}",
     ]
+    if status.get("source_index") is not None and status.get("source_total") is not None:
+        try:
+            source_index = int(status["source_index"])
+            source_total = int(status["source_total"])
+            source_name = str(status.get("source") or status.get("source_chat") or "-")[:52]
+            lines += ["", f"Source Queue: {source_index}/{source_total} · {source_name}"]
+            if phase == "waiting_retry":
+                lines.append("⏳ Source ini retry sendiri; source lain kekal menunggu.")
+            elif phase == "blocked":
+                lines.append("⛔ Source ini perlukan tindakan; source lain kekal menunggu.")
+            elif phase == "queued":
+                lines.append("⏸ Tekan Start Queue untuk meneruskan kerja tertangguh.")
+        except (TypeError, ValueError):
+            pass
     if source_progress:
         lines += ["", "Source Migration:"]
         for item in source_progress[:3]:
@@ -218,7 +236,7 @@ def _settings_text(path: Path) -> str:
             f"Selected sources: {len(sources)}",
             f"Selected destinations: {len(destinations)}",
             "",
-            "Source dan destination diurus melalui Channel Manager.",
+            "Source diurus dalam Source Queue. Destination diurus dalam menu Destinations.",
             "Tetapan worker, retry, cache dan log kekal dalam konfigurasi sistem.",
         ]
     )
@@ -425,13 +443,35 @@ def _checkpoint_text(config: AppConfig) -> str:
     return "\n".join(lines + ([] if rows else ["Belum ada checkpoint."]))[:3900]
 
 
-def _selection_for(user_id: int, path: Path) -> dict[str, set[str]]:
+def _ordered_chats(values: list[str] | set[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        chat = str(value)
+        if chat not in seen:
+            seen.add(chat)
+            result.append(chat)
+    return result
+
+
+def _selection_for(user_id: int, path: Path) -> dict[str, list[str]]:
     if user_id not in _SELECTIONS:
         _SELECTIONS[user_id] = {
-            "sources": {str(item["chat"]) for item in get_sources(path)},
-            "destinations": {str(item["chat"]) for item in list_destinations(path)},
+            "sources": _ordered_chats([str(item["chat"]) for item in get_sources(path)]),
+            "destinations": _ordered_chats([str(item["chat"]) for item in list_destinations(path)]),
         }
-    return _SELECTIONS[user_id]
+    selection = _SELECTIONS[user_id]
+    for key in ("sources", "destinations"):
+        selection[key] = _ordered_chats(selection.get(key, []))
+    return selection
+
+
+def _toggle_selection(selected: list[str], chat: str) -> bool:
+    if chat in selected:
+        selected.remove(chat)
+        return False
+    selected.append(chat)
+    return True
 
 
 def _snapshot_session_database(source: Path, destination: Path) -> None:
@@ -516,47 +556,152 @@ async def _scan_channels(config: AppConfig, user_id: int) -> list[dict[str, Any]
     return channels
 
 
-def _channel_text(user_id: int, path: Path, page: int = 0) -> str:
+def _channel_title(user_id: int, chat: str) -> str:
+    for item in _CHANNEL_CACHE.get(user_id, []):
+        if str(item["chat"]) == str(chat):
+            return str(item["title"])
+    return str(chat)
+
+
+def _source_queue_lines(user_id: int, selected: list[str]) -> list[str]:
+    if not selected:
+        return ["Belum ada source dalam queue."]
+    lines = ["Turutan queue:"]
+    for index, chat in enumerate(selected[:8], start=1):
+        state = "🟢 Semasa" if index == 1 else "⏳ Waiting"
+        lines.append(f"{index}. {state} · {_channel_title(user_id, chat)[:54]}")
+    if len(selected) > 8:
+        lines.append(f"… dan {len(selected) - 8} source lagi.")
+    return lines
+
+
+def _source_text(user_id: int, path: Path, page: int = 0) -> str:
     channels = _CHANNEL_CACHE.get(user_id, [])
     selected = _selection_for(user_id, path)
     if not channels:
-        return "📚 Channel Manager\n\nBelum scan Telegram. Tekan Scan / Refresh."
+        return "\n".join([
+            "📚 Source Queue",
+            "",
+            * _source_queue_lines(user_id, selected["sources"]),
+            "",
+            "Belum scan Telegram. Tekan Scan / Refresh untuk tambah source.",
+        ])
     start = page * _PAGE_SIZE
     end = min(len(channels), start + _PAGE_SIZE)
     return "\n".join([
-        "📚 Channel Manager", "", f"Found: {len(channels)} channels/groups",
-        f"Selected: {len(selected['sources'])} source · {len(selected['destinations'])} destination",
-        "", f"Showing {start + 1}-{end}", "Tap S or D to tick/untick, then Save.",
+        "📚 Source Queue",
+        "",
+        f"Source dipilih: {len(selected['sources'])}",
+        * _source_queue_lines(user_id, selected["sources"]),
+        "",
+        f"Channel tersedia: {start + 1}-{end} daripada {len(channels)}",
+        "Pilih source mengikut turutan kerja. Source seterusnya kekal waiting sehingga yang pertama siap.",
     ])
 
 
-def _channel_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarkup:
+def _source_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarkup:
     channels = _CHANNEL_CACHE.get(user_id, [])
     selected = _selection_for(user_id, path)
     rows: list[list[tuple[str, str]]] = []
     start = page * _PAGE_SIZE
     for index, item in enumerate(channels[start:start + _PAGE_SIZE], start=start):
-        chat = item["chat"]
-        source_icon = "☑" if chat in selected["sources"] else "☐"
-        dest_icon = "☑" if chat in selected["destinations"] else "☐"
-        title = item["title"][:28]
-        rows.append([(f"{item['access']} {title}"[:48], f"channels:noop:{index}")])
-        role_row = [(f"{source_icon} Source", f"channels:toggle:s:{index}")]
-        if item["can_destination"]:
-            role_row.append((f"{dest_icon} Destination", f"channels:toggle:d:{index}"))
-        else:
-            role_row.append(("🔒 No post access", f"channels:noop:{index}"))
-        rows.append(role_row)
+        chat = str(item["chat"])
+        source_icon = "☑️" if chat in selected["sources"] else "☐"
+        title = str(item["title"])[:34]
+        rows.append([(f"{source_icon} {item['access']} {title}"[:48], f"sources:toggle:{index}")])
     nav: list[tuple[str, str]] = []
     if page > 0:
-        nav.append(("⬅️", f"channels:page:{page - 1}"))
+        nav.append(("⬅️", f"sources:page:{page - 1}"))
     if start + _PAGE_SIZE < len(channels):
-        nav.append(("➡️", f"channels:page:{page + 1}"))
+        nav.append(("➡️", f"sources:page:{page + 1}"))
     if nav:
         rows.append(nav)
     rows += [
-        [("🔄 Scan / Refresh", "channels:scan"), ("✅ Save", "channels:save")],
-        [("⬅️ Dashboard", "menu")],
+        [("📋 Susun Queue", "sources:queue"), ("🔄 Scan / Refresh", "sources:scan")],
+        [("✅ Simpan + Mula Queue", "sources:save")],
+        [("🎯 Urus Destinations", "destinations:view"), ("⬅️ Dashboard", "menu")],
+    ]
+    return _buttons(rows)
+
+
+def _source_queue_text(user_id: int, path: Path) -> str:
+    selected = _selection_for(user_id, path)
+    return "\n".join([
+        "📋 Susun Source Queue",
+        "",
+        * _source_queue_lines(user_id, selected["sources"]),
+        "",
+        "Gunakan ▲ atau ▼ untuk ubah turutan. Hanya source pertama akan berjalan.",
+    ])
+
+
+def _source_queue_menu(user_id: int, path: Path) -> InlineKeyboardMarkup:
+    selected = _selection_for(user_id, path)
+    rows: list[list[tuple[str, str]]] = []
+    for index, chat in enumerate(selected["sources"]):
+        label = _channel_title(user_id, chat)[:28]
+        rows.append([
+            (f"{index + 1}. {label}", f"sources:noopq:{index}"),
+            ("▲", f"sources:move:{index}:up"),
+            ("▼", f"sources:move:{index}:down"),
+            ("✕", f"sources:remove:{index}"),
+        ])
+    rows += [
+        [("⬅️ Source Queue", "sources:view")],
+        [("✅ Simpan + Mula Queue", "sources:save")],
+    ]
+    return _buttons(rows)
+
+
+def _destination_text(user_id: int, path: Path, page: int = 0) -> str:
+    channels = _CHANNEL_CACHE.get(user_id, [])
+    selected = _selection_for(user_id, path)
+    available = [item for item in channels if item["can_destination"]]
+    if not channels:
+        return "\n".join([
+            "🎯 Destinations",
+            "",
+            f"Destination dipilih: {len(selected['destinations'])}",
+            "Belum scan Telegram. Tekan Scan / Refresh untuk pilih destination.",
+        ])
+    start = page * _PAGE_SIZE
+    end = min(len(available), start + _PAGE_SIZE)
+    lines = [
+        "🎯 Destinations",
+        "",
+        f"Destination dipilih: {len(selected['destinations'])}",
+        "Hanya channel/group yang anda boleh post dipaparkan.",
+        "",
+    ]
+    if selected["destinations"]:
+        lines.append("Aktif: " + ", ".join(_channel_title(user_id, chat)[:24] for chat in selected["destinations"][:4]))
+    if available:
+        lines += [f"Channel tersedia: {start + 1}-{end} daripada {len(available)}", "Pilih destination, kemudian simpan."]
+    else:
+        lines += ["Tiada channel dengan akses post ditemui. Pastikan akaun anda admin di destination."]
+    return "\n".join(lines)
+
+
+def _destination_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarkup:
+    selected = _selection_for(user_id, path)
+    channels = [item for item in _CHANNEL_CACHE.get(user_id, []) if item["can_destination"]]
+    rows: list[list[tuple[str, str]]] = []
+    start = page * _PAGE_SIZE
+    for index, item in enumerate(channels[start:start + _PAGE_SIZE], start=start):
+        chat = str(item["chat"])
+        icon = "☑️" if chat in selected["destinations"] else "☐"
+        title = str(item["title"])[:34]
+        rows.append([(f"{icon} 🟢 {title}"[:48], f"destinations:toggle:{index}")])
+    nav: list[tuple[str, str]] = []
+    if page > 0:
+        nav.append(("⬅️", f"destinations:page:{page - 1}"))
+    if start + _PAGE_SIZE < len(channels):
+        nav.append(("➡️", f"destinations:page:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows += [
+        [("🔄 Scan / Refresh", "destinations:scan"), ("✅ Simpan Destination", "destinations:save")],
+        [("📚 Source Queue", "sources:view"), ("⬅️ Dashboard", "menu")],
     ]
     return _buttons(rows)
 
@@ -634,66 +779,133 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             start_live(user_id, query.message)
             await query.answer("Dikemas kini" if data == "dashboard:view" else None)
             return
-        if data == "channels:view":
-            await edit(query, _channel_text(user_id, path), _channel_menu(user_id, path))
+        if data in {"sources:view", "channels:view"}:
+            await edit(query, _source_text(user_id, path), _source_menu(user_id, path))
             await query.answer()
             return
-        if data == "channels:scan":
+        if data == "destinations:view":
+            await edit(query, _destination_text(user_id, path), _destination_menu(user_id, path))
+            await query.answer()
+            return
+        if data in {"sources:scan", "destinations:scan", "channels:scan"}:
+            target = "destinations" if data == "destinations:scan" else "sources"
+            title = "🎯 Destinations" if target == "destinations" else "📚 Source Queue"
             await query.answer("Scanning Telegram…", show_alert=False)
-            await edit(query, "📚 Channel Manager\n\nScanning channel dan group…", _back("channels:view", "⬅️ Cancel"))
+            await edit(query, f"{title}\n\nScanning channel dan group…", _back(f"{target}:view", "⬅️ Cancel"))
             try:
                 _CHANNEL_CACHE[user_id] = await _scan_channels(config, user_id)
                 _SELECTIONS.pop(user_id, None)
-                await edit(query, _channel_text(user_id, path), _channel_menu(user_id, path))
+                if target == "destinations":
+                    await edit(query, _destination_text(user_id, path), _destination_menu(user_id, path))
+                else:
+                    await edit(query, _source_text(user_id, path), _source_menu(user_id, path))
             except Exception as exc:
-                await edit(query, f"📚 Channel Manager\n\n❌ Scan gagal: {str(exc)[:500]}\n\nPastikan user session tidak sedang dikunci proses lain.", _back())
+                await edit(
+                    query,
+                    f"{title}\n\n❌ Scan gagal: {str(exc)[:500]}\n\nPastikan user session tidak sedang dikunci proses lain.",
+                    _back(f"{target}:view", "⬅️ Kembali"),
+                )
             return
-        if data.startswith("channels:page:"):
+        if data.startswith("sources:page:"):
             page = max(0, int(data.rsplit(":", 1)[1]))
-            await edit(query, _channel_text(user_id, path, page), _channel_menu(user_id, path, page))
+            await edit(query, _source_text(user_id, path, page), _source_menu(user_id, path, page))
             await query.answer()
             return
-        if data.startswith("channels:toggle:"):
-            _, _, role, raw_index = data.split(":", 3)
-            index = int(raw_index)
+        if data.startswith("destinations:page:"):
+            page = max(0, int(data.rsplit(":", 1)[1]))
+            await edit(query, _destination_text(user_id, path, page), _destination_menu(user_id, path, page))
+            await query.answer()
+            return
+        if data.startswith("sources:toggle:"):
+            index = int(data.rsplit(":", 1)[1])
             channels = _CHANNEL_CACHE.get(user_id, [])
             if index >= len(channels):
                 await query.answer("Channel cache expired. Scan semula.", show_alert=True)
                 return
-            item = channels[index]
             selected = _selection_for(user_id, path)
-            key = "sources" if role == "s" else "destinations"
-            other = "destinations" if key == "sources" else "sources"
-            chat = item["chat"]
-            if chat in selected[key]:
-                selected[key].remove(chat)
-            else:
-                if chat in selected[other]:
-                    await query.answer("Channel yang sama tak boleh jadi source dan destination.", show_alert=True)
-                    return
-                selected[key].add(chat)
-            page = index // _PAGE_SIZE
-            await edit(query, _channel_text(user_id, path, page), _channel_menu(user_id, path, page))
-            await query.answer()
-            return
-        if data.startswith("channels:noop:"):
-            await query.answer()
-            return
-        if data == "channels:save":
-            selected = _selection_for(user_id, path)
-            if not selected["sources"] or not selected["destinations"]:
-                await query.answer("Pilih sekurang-kurangnya satu source dan satu destination.", show_alert=True)
+            chat = str(channels[index]["chat"])
+            if chat not in selected["sources"] and chat in selected["destinations"]:
+                await query.answer("Channel yang sama tak boleh jadi source dan destination.", show_alert=True)
                 return
-            overlap = selected["sources"] & selected["destinations"]
-            if overlap:
+            _toggle_selection(selected["sources"], chat)
+            page = index // _PAGE_SIZE
+            await edit(query, _source_text(user_id, path, page), _source_menu(user_id, path, page))
+            await query.answer()
+            return
+        if data.startswith("destinations:toggle:"):
+            index = int(data.rsplit(":", 1)[1])
+            channels = [item for item in _CHANNEL_CACHE.get(user_id, []) if item["can_destination"]]
+            if index >= len(channels):
+                await query.answer("Channel cache expired. Scan semula.", show_alert=True)
+                return
+            selected = _selection_for(user_id, path)
+            chat = str(channels[index]["chat"])
+            if chat not in selected["destinations"] and chat in selected["sources"]:
+                await query.answer("Channel yang sama tak boleh jadi source dan destination.", show_alert=True)
+                return
+            _toggle_selection(selected["destinations"], chat)
+            page = index // _PAGE_SIZE
+            await edit(query, _destination_text(user_id, path, page), _destination_menu(user_id, path, page))
+            await query.answer()
+            return
+        if data == "sources:queue":
+            await edit(query, _source_queue_text(user_id, path), _source_queue_menu(user_id, path))
+            await query.answer()
+            return
+        if data.startswith("sources:move:"):
+            _, _, raw_index, direction = data.split(":", 3)
+            index = int(raw_index)
+            selected = _selection_for(user_id, path)["sources"]
+            target = index - 1 if direction == "up" else index + 1
+            if 0 <= index < len(selected) and 0 <= target < len(selected):
+                selected[index], selected[target] = selected[target], selected[index]
+            await edit(query, _source_queue_text(user_id, path), _source_queue_menu(user_id, path))
+            await query.answer()
+            return
+        if data.startswith("sources:remove:"):
+            index = int(data.rsplit(":", 1)[1])
+            selected = _selection_for(user_id, path)["sources"]
+            if 0 <= index < len(selected):
+                selected.pop(index)
+            await edit(query, _source_queue_text(user_id, path), _source_queue_menu(user_id, path))
+            await query.answer()
+            return
+        if data.startswith(("sources:noop:", "sources:noopq:", "destinations:noop:", "channels:noop:")):
+            await query.answer()
+            return
+        if data in {"sources:save", "channels:save"}:
+            selected = _selection_for(user_id, path)
+            destinations = [str(item["chat"]) for item in list_destinations(path)]
+            if not selected["sources"]:
+                await query.answer("Pilih sekurang-kurangnya satu source dahulu.", show_alert=True)
+                return
+            if not destinations:
+                await query.answer("Tambah destination dalam menu Destinations dahulu.", show_alert=True)
+                return
+            if set(selected["sources"]) & set(destinations):
                 await query.answer("Source dan destination tak boleh channel yang sama.", show_alert=True)
                 return
-            set_sources(sorted(selected["sources"]), path)
-            set_destinations(sorted(selected["destinations"]), path)
+            set_sources(selected["sources"], path)
             _request_mode(config, "run")
-            await query.answer("Channel selection disimpan.", show_alert=True)
+            await query.answer("Source queue disimpan dan dimulakan mengikut turutan.", show_alert=True)
             await edit(query, _dashboard_text(config), _menu())
             start_live(user_id, query.message)
+            return
+        if data == "destinations:save":
+            selected = _selection_for(user_id, path)
+            sources = [str(item["chat"]) for item in get_sources(path)]
+            if not selected["destinations"]:
+                await query.answer("Pilih sekurang-kurangnya satu destination dahulu.", show_alert=True)
+                return
+            if set(sources) & set(selected["destinations"]):
+                await query.answer("Source dan destination tak boleh channel yang sama.", show_alert=True)
+                return
+            set_destinations(selected["destinations"], path)
+            await query.answer(
+                "Destination disimpan. Queue sedia ada tidak diulang secara automatik.",
+                show_alert=True,
+            )
+            await edit(query, _destination_text(user_id, path), _destination_menu(user_id, path))
             return
 
         pages: dict[str, tuple[Callable[[AppConfig], str], InlineKeyboardMarkup]] = {
@@ -779,10 +991,10 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             if data == "run:now":
                 sources, destinations = get_sources(path), list_destinations(path)
                 if not sources or not destinations:
-                    await query.answer("Pilih source dan destination dalam Channel Manager dahulu.", show_alert=True)
+                    await query.answer("Sediakan Source Queue dan Destination dahulu.", show_alert=True)
                     return
                 if {item["chat"] for item in sources} & {item["chat"] for item in destinations}:
-                    await query.answer("Source dan destination bertindih. Betulkan dalam Channel Manager.", show_alert=True)
+                    await query.answer("Source dan destination bertindih. Betulkan dalam menu masing-masing.", show_alert=True)
                     return
             mode = {"advanced:resume": "process", "advanced:full": "run", "advanced:sync": "sync", "run:now": "sync"}[data]
             _request_mode(config, mode)
