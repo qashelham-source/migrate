@@ -473,6 +473,7 @@ async def _execute_cycle(
     config: AppConfig,
     command: str,
     *,
+    config_path: str | Path | None = None,
     reader: Client,
     bot: Client | None,
     limiter: TelegramLimiter,
@@ -553,6 +554,22 @@ async def _execute_cycle(
     for source_index, source in enumerate(sources, start=1):
         if stop_event.is_set():
             break
+        if config_path is not None:
+            try:
+                live_sources = _configured_sources(load_config(config_path))
+            except Exception as exc:
+                if logger:
+                    logger.warning("Could not refresh source queue before source %s: %s", source.chat, exc)
+            else:
+                still_configured = any(
+                    str(item.chat) == str(source.chat)
+                    and getattr(item, "topic_id", None) == getattr(source, "topic_id", None)
+                    for item in live_sources
+                )
+                if not still_configured:
+                    if logger:
+                        logger.info("Skipping blacklisted source %s", source.chat)
+                    continue
 
         try:
             resolved_source = await resolve_chat(reader, limiter, source)
@@ -777,6 +794,7 @@ async def _run_live_service(
             outcome = await _execute_cycle(
                 config,
                 command,
+                config_path=config_path,
                 reader=reader,
                 bot=bot,
                 limiter=limiter,
@@ -907,6 +925,7 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
                 await _execute_cycle(
                     config,
                     command,
+                    config_path=config_path,
                     reader=reader,
                     bot=bot,
                     limiter=limiter,
