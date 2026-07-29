@@ -128,7 +128,8 @@ Queue states are `pending`, `downloading`, `uploading`, `copied`, `failed`, and 
 - destination permission failures pause that destination;
 - verification mismatches are recorded for review or item-level repair;
 - a terminal repair failure changes the parent verification to `failed` for review instead of leaving it stuck in `repairing`;
-- schema initialization never changes job states.
+- schema initialization never changes job states;
+- deliberate skips—such as configured filters, same-destination duplicates, and media above the bot upload cap—remain recorded for checkpoints but do not block source advancement or appear in Issue Center.
 
 Legacy `SendMultiMedia MEDIA_EMPTY` failures are not silently requeued during startup. Retry them through the repair controls after reviewing the destination.
 
