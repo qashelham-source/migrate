@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from contextlib import suppress
 from pathlib import Path
 from typing import Any
@@ -163,27 +162,22 @@ def _status_menu() -> InlineKeyboardMarkup:
 
 
 def _authorized_ids(config: AppConfig) -> set[int]:
-    result: set[int] = set()
+    """Return explicit admin IDs, with a narrow first-run fallback for the active session."""
+    configured = {
+        int(user_id)
+        for user_id in config.telegram.admin_ids
+        if isinstance(user_id, int) or str(user_id).strip().isdigit()
+    }
+    if configured:
+        return configured
 
-    # config.yaml is the source of truth; accounts.json may not exist yet when
-    # the control panel starts before the migration service has cached a session.
-    for configured_id in config.telegram.admin_ids:
-        try:
-            result.add(int(configured_id))
-        except (TypeError, ValueError):
-            continue
-
-    for account in load_accounts(config).values():
-        try:
-            result.add(int(account.get("id")))
-        except (TypeError, ValueError, AttributeError):
-            continue
-
-    for value in os.getenv("ADMIN_USER_ID", "").split(","):
-        value = value.strip()
-        if value.isdigit():
-            result.add(int(value))
-    return result
+    # A fresh install can bootstrap from the logged-in operator, but a stale
+    # account cache must never grant access to every session it happens to contain.
+    active_account = load_accounts(config).get(config.telegram.user_session)
+    try:
+        return {int(active_account["id"])}
+    except (KeyError, TypeError, ValueError):
+        return set()
 
 
 def _is_authorized(config: AppConfig, user_id: int | None) -> bool:
