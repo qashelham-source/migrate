@@ -197,7 +197,7 @@ class Uploader:
         kwargs = self._destination_kwargs(job)
         first = messages[0]
         if self.config.transfer.hide_sender:
-            if len(messages) > 1 and first.media_group_id:
+            if len(messages) > 1 and job.media_group_id and first.media_group_id:
                 result = await self.limiter.call(
                     "copy",
                     self.reader.copy_media_group,
@@ -207,6 +207,21 @@ class Uploader:
                     captions="" if self.config.transfer.drop_caption else None,
                     **kwargs,
                 )
+            elif len(messages) > 1:
+                # A filtered album must not call copy_media_group: Telegram would
+                # copy disabled members from the original album as well.
+                result = [
+                    await self.limiter.call(
+                        "copy",
+                        self.reader.copy_message,
+                        chat_id=job.dest_chat_id,
+                        from_chat_id=job.source_chat_id,
+                        message_id=message.id,
+                        caption="" if self.config.transfer.drop_caption else None,
+                        **kwargs,
+                    )
+                    for message in messages
+                ]
             else:
                 result = await self.limiter.call(
                     "copy",

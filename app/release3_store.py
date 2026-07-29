@@ -526,10 +526,55 @@ class Release3Store:
             ) VALUES (?, ?, ?, 'pending', ?, ?)
             ON CONFLICT(parent_job_id, source_message_id) DO UPDATE SET
                 repair_job_id = excluded.repair_job_id,
+                status = 'pending',
                 updated_at = excluded.updated_at
             """,
             (parent_job_id, repair_job_id, source_message_id, now, now),
         )
+
+    def fail_repair_job(self, repair_job_id: int, reason: str) -> int | None:
+        """Surface a terminal repair failure on its parent instead of leaving it repairing."""
+        row = self.db.query_one(
+            "SELECT parent_job_id FROM repair_links WHERE repair_job_id = ?",
+            (repair_job_id,),
+        )
+        if not row:
+            return None
+
+        parent_job_id = int(row["parent_job_id"])
+        now = utc_now()
+        self.db.execute(
+            "UPDATE repair_links SET status = 'failed', updated_at = ? WHERE repair_job_id = ?",
+            (now, repair_job_id),
+        )
+        current = self.db.query_one(
+            "SELECT job_id FROM verification_results WHERE job_id = ?",
+            (parent_job_id,),
+        )
+        if current:
+            self.db.execute(
+                "UPDATE verification_results SET status = 'failed', checked_at = ? WHERE job_id = ?",
+                (now, parent_job_id),
+            )
+        else:
+            self.record_verification(
+                job_id=parent_job_id,
+                status="failed",
+                expected_count=0,
+                present_count=0,
+                media_match=None,
+                caption_match=None,
+                size_match=None,
+                details={"repair_failure": True},
+            )
+        self.log_repair(
+            action="repair_failed",
+            job_id=repair_job_id,
+            reason=reason,
+            outcome="failed",
+            details={"parent_job_id": parent_job_id},
+        )
+        return parent_job_id
 
     def complete_repair_job(self, repair_job_id: int) -> int | None:
         row = self.db.query_one(

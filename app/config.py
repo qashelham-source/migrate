@@ -310,6 +310,13 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     if logging_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
         raise ValueError("logging.level must be CRITICAL, ERROR, WARNING, INFO, or DEBUG")
 
+    sources = [ChatSpec.from_config(item) for item in migration.get("sources", [])]
+    destinations = [ChatSpec.from_config(item) for item in migration.get("destinations", [])]
+    if any(source.topic_id is not None for source in sources):
+        raise ValueError(
+            "migration.sources topic_id is not supported; refusing to scan an entire forum by accident"
+        )
+
     return AppConfig(
         base_dir=base_dir,
         telegram=TelegramConfig(
@@ -405,6 +412,6 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             level=logging_level,
             file=_path(base_dir, str(log_file)) if log_file else None,
         ),
-        sources=[ChatSpec.from_config(item) for item in migration.get("sources", [])],
-        destinations=[ChatSpec.from_config(item) for item in migration.get("destinations", [])],
+        sources=sources,
+        destinations=destinations,
     )

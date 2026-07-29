@@ -180,6 +180,10 @@ class MessageQueue:
     def mark_skipped(self, job_id: int, reason: str) -> None:
         self.db.set_status(job_id, "skipped", last_error=reason)
         self.release3.finish_telemetry(job_id, stage="skipped")
+        parent_job_id = self.release3.fail_repair_job(job_id, reason)
+        row = self.db.query_one("SELECT source_chat_id FROM messages WHERE id = ?", (parent_job_id or job_id,))
+        if row:
+            self.release3.recompute_source_state(row["source_chat_id"])
 
     def mark_verified(self, job_id: int) -> None:
         self.db.set_status(job_id, "copied", verified_at=utc_now())
@@ -192,7 +196,13 @@ class MessageQueue:
         if attempts >= self.config.queue.max_attempts:
             self.db.set_status(job.id, "failed", last_error=error)
             self.release3.finish_telemetry(job.id, stage="failed")
-            self.release3.recompute_source_state(job.source_chat_id)
+            parent_job_id = self.release3.fail_repair_job(job.id, error)
+            row = self.db.query_one(
+                "SELECT source_chat_id FROM messages WHERE id = ?",
+                (parent_job_id or job.id,),
+            )
+            if row:
+                self.release3.recompute_source_state(row["source_chat_id"])
             return "failed"
         backoff = self._backoff_for_attempt(attempts)
         next_retry = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat(timespec="seconds")
@@ -222,40 +232,76 @@ class MessageQueue:
         )
         self.db.set_status(job.id, "failed", last_error=reason)
         self.release3.finish_telemetry(job.id, stage="failed")
-        self.release3.recompute_source_state(job.source_chat_id)
+        parent_job_id = self.release3.fail_repair_job(job.id, reason)
+        row = self.db.query_one(
+            "SELECT source_chat_id FROM messages WHERE id = ?",
+            (parent_job_id or job.id,),
+        )
+        if row:
+            self.release3.recompute_source_state(row["source_chat_id"])
         return reason
 
     def enqueue_repair_item(self, parent: MessageJob, source_message_id: int) -> int | None:
-        unique_key = f"repair:{parent.id}:{int(source_message_id)}"
-        inserted = self.enqueue(
-            source_chat_id=parent.source_chat_id,
-            source_message_id=int(source_message_id),
-            dest_chat_id=parent.dest_chat_id,
-            file_unique_key=unique_key,
-            source_message_ids=[int(source_message_id)],
-            source_topic_id=parent.source_topic_id,
-            dest_topic_id=parent.dest_topic_id,
-            media_group_id=None,
-            media_type=parent.media_type,
-            file_size=None,
-            caption=parent.caption if int(source_message_id) == parent.source_message_ids[0] else None,
-            status="pending",
-            last_error="Repair missing destination item",
-        )
-        row = self.db.query_one(
+        """Create or safely requeue one repair child for a missing destination item."""
+        source_message_id = int(source_message_id)
+        unique_key = f"repair:{parent.id}:{source_message_id}"
+        existing = self.db.query_one(
             """
-            SELECT id FROM messages
+            SELECT id, status FROM messages
             WHERE source_chat_id = ? AND dest_chat_id = ? AND file_unique_key = ?
+            ORDER BY id DESC
+            LIMIT 1
             """,
             (str(parent.source_chat_id), str(parent.dest_chat_id), unique_key),
         )
-        if not row:
-            return None
-        repair_job_id = int(row["id"])
+        inserted = False
+        if existing:
+            repair_job_id = int(existing["id"])
+            if str(existing["status"]) in {"failed", "skipped"}:
+                self.db.execute(
+                    """
+                    UPDATE messages
+                    SET status = 'pending', attempts = 0,
+                        last_error = ?, next_retry_at = NULL,
+                        dest_message_ids = NULL, verified_at = NULL,
+                        updated_at = ?
+                    WHERE id = ?
+                    """,
+                    ("Repair requeued after review", utc_now(), repair_job_id),
+                )
+        else:
+            inserted = self.enqueue(
+                source_chat_id=parent.source_chat_id,
+                source_message_id=source_message_id,
+                dest_chat_id=parent.dest_chat_id,
+                file_unique_key=unique_key,
+                source_message_ids=[source_message_id],
+                source_topic_id=parent.source_topic_id,
+                dest_topic_id=parent.dest_topic_id,
+                media_group_id=None,
+                media_type=parent.media_type,
+                file_size=None,
+                caption=parent.caption if source_message_id == parent.source_message_ids[0] else None,
+                status="pending",
+                last_error="Repair missing destination item",
+            )
+            row = self.db.query_one(
+                """
+                SELECT id FROM messages
+                WHERE source_chat_id = ? AND dest_chat_id = ? AND file_unique_key = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (str(parent.source_chat_id), str(parent.dest_chat_id), unique_key),
+            )
+            if not row:
+                return None
+            repair_job_id = int(row["id"])
+
         self.release3.link_repair(
             parent_job_id=parent.id,
             repair_job_id=repair_job_id,
-            source_message_id=int(source_message_id),
+            source_message_id=source_message_id,
         )
         if inserted:
             self.log_repair(
@@ -263,7 +309,7 @@ class MessageQueue:
                 job=parent,
                 reason=f"Destination item for source message #{source_message_id} was missing",
                 outcome="queued",
-                details={"repair_job_id": repair_job_id, "source_message_id": int(source_message_id)},
+                details={"repair_job_id": repair_job_id, "source_message_id": source_message_id},
             )
         return repair_job_id
 

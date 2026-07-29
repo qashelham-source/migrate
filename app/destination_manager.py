@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import os
 import re
+import tempfile
 from pathlib import Path
 from threading import Lock
 from typing import Any, Iterable
@@ -25,16 +26,25 @@ def _load_yaml(config_path: str | Path) -> tuple[Path, dict[str, Any]]:
     return path, data
 
 
+def _open_secure_temporary(path: Path) -> tuple[int, Path]:
+    """Stage beside config when possible, or in the container tmpfs when it is read-only."""
+    prefix = f".{path.name}."
+    for directory in (path.parent, Path(tempfile.gettempdir())):
+        try:
+            descriptor, temporary = tempfile.mkstemp(prefix=prefix, suffix=".tmp", dir=directory)
+            return descriptor, Path(temporary)
+        except OSError as exc:
+            if directory == path.parent and exc.errno in (errno.EACCES, errno.EPERM, errno.EROFS):
+                continue
+            raise
+    raise RuntimeError("No writable temporary directory is available for config updates")
+
+
 def _save_yaml(path: Path, data: dict[str, Any]) -> None:
-    """Atomically replace config without leaving a credential-bearing backup behind."""
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.unlink(missing_ok=True)
+    """Atomically replace config, or safely copy from tmpfs into a bind-mounted file."""
+    temporary: Path | None = None
     try:
-        descriptor = os.open(
-            temporary,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-            0o600,
-        )
+        descriptor, temporary = _open_secure_temporary(path)
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             yaml.safe_dump(data, handle, allow_unicode=True, sort_keys=False)
             handle.flush()
@@ -42,17 +52,19 @@ def _save_yaml(path: Path, data: dict[str, Any]) -> None:
         try:
             temporary.replace(path)
         except OSError as exc:
-            if exc.errno != errno.EBUSY:
+            if exc.errno not in (errno.EBUSY, errno.EXDEV, errno.EACCES, errno.EPERM, errno.EROFS):
                 raise
-            # Docker bind-mounted files cannot be replaced with os.rename().
-            # The complete, synced temporary file is copied into the mounted file instead.
+            # Docker bind-mounted files cannot be replaced with os.rename(), and
+            # a read-only root forces staging into /tmp. Copy the complete, synced
+            # temporary file into the writable bind mount instead.
             with temporary.open("rb") as source, path.open("wb") as target:
                 target.write(source.read())
                 target.flush()
                 os.fsync(target.fileno())
             temporary.unlink(missing_ok=True)
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
         raise
 
 

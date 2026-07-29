@@ -199,6 +199,8 @@ class Scanner:
 
     async def scan(self, stop_event: asyncio.Event) -> None:
         destinations = await self._resolve_destinations()
+        if destinations is None:
+            return
         sources = [source for source in self.config.sources if source.chat and not _is_placeholder(source.chat)]
 
         if not sources or not destinations:
@@ -231,8 +233,10 @@ class Scanner:
                 source_total=source_total,
             )
 
-    async def _resolve_destinations(self) -> list[ResolvedChat]:
+    async def _resolve_destinations(self) -> list[ResolvedChat] | None:
+        """Resolve every configured destination or safely pause before scanning."""
         resolved: list[ResolvedChat] = []
+        unavailable: list[str] = []
         sending_client = self.writer or self.reader
 
         for spec in self.config.destinations:
@@ -240,10 +244,9 @@ class Scanner:
                 continue
 
             try:
-                destination = await resolve_chat(sending_client, self.limiter, spec)
-                resolved.append(destination)
-                continue
+                resolved.append(await resolve_chat(sending_client, self.limiter, spec))
             except Exception as exc:
+                unavailable.append(str(spec.chat))
                 if self.logger:
                     client_name = "Writer" if sending_client is not self.reader else "Reader"
                     self.logger.warning(
@@ -253,17 +256,19 @@ class Scanner:
                         exc,
                     )
 
+        if unavailable:
             write_status(
                 self.config,
-                "error",
-                message="The destination cannot be recognised by the upload bot.",
-                destination_chat=spec.chat,
+                "blocked",
+                message="Every destination must be available before the source checkpoint can advance.",
+                destination_chat=", ".join(unavailable),
                 error=(
-                    "Make sure the MANAGER bot is an admin in the destination, then add it again "
-                    "by forwarding a post or sending the -100 ID."
+                    "Make sure the selected uploader is an admin in every destination, "
+                    "then retry without changing the source checkpoint."
                 ),
                 scan_mode=self.scan_mode,
             )
+            return None
 
         return resolved
 
@@ -509,19 +514,27 @@ class Scanner:
                     checkpoint=plan.baseline,
                 )
 
-            first = group[0]
-            processable = self._group_should_process(group)
+            selected = self._processable_messages(group)
+            processable = bool(selected)
             status = "pending" if processable else "skipped"
             if not processable and not self.config.queue.record_skipped:
                 continue
 
-            unique_key = self._group_unique_key(resolved_source.chat_id, group)
-            media_type = self._group_media_type(group)
-            source_message_ids = [msg.id for msg in group]
-            file_size = sum(message_file_size(msg) or 0 for msg in group) or None
+            # A pending job must describe exactly the messages it will upload.
+            # Keeping a filtered-out album member in source_message_ids makes
+            # verification request a repair for content the operator disabled.
+            queued_messages = selected if processable else group
+            first = queued_messages[0]
+            unique_key = self._group_unique_key(resolved_source.chat_id, queued_messages)
+            media_type = self._group_media_type(queued_messages)
+            source_message_ids = [msg.id for msg in queued_messages]
+            file_size = sum(message_file_size(msg) or 0 for msg in queued_messages) or None
             caption = message_caption(first)
             if caption and len(caption) > 1000:
                 caption = caption[:1000]
+            # Retain Telegram's native album copy only for a complete album.
+            # A filtered subset is copied/uploaded item-by-item by the uploader.
+            media_group_id = first.media_group_id if processable and len(selected) == len(group) else None
 
             for dest in destinations:
                 inserted = self.queue.enqueue(
@@ -532,7 +545,7 @@ class Scanner:
                     source_message_ids=source_message_ids,
                     source_topic_id=resolved_source.topic_id,
                     dest_topic_id=dest.topic_id,
-                    media_group_id=first.media_group_id,
+                    media_group_id=media_group_id,
                     media_type=media_type,
                     file_size=file_size,
                     caption=caption,
@@ -629,8 +642,11 @@ class Scanner:
         grouped = [sorted(group, key=lambda msg: msg.id) for group in groups.values()]
         return sorted(grouped, key=lambda group: group[0].id)
 
+    def _processable_messages(self, messages: list[Message]) -> list[Message]:
+        return [message for message in messages if self._message_should_process(message)]
+
     def _group_should_process(self, messages: list[Message]) -> bool:
-        return any(self._message_should_process(message) for message in messages)
+        return bool(self._processable_messages(messages))
 
     def _message_should_process(self, message: Message) -> bool:
         media_type = message_media_type(message)
