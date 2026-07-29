@@ -341,6 +341,31 @@ class MessageQueue:
         """Delete all persisted work for a source that was removed by an admin."""
         return self.release3.purge_source_jobs(source_chat_id)
 
+    def clear_source_history(
+        self,
+        source_chat_id: int | str,
+        latest_message_id: int,
+        *,
+        source_topic_id: int | None = None,
+    ) -> dict[str, int]:
+        """Forget old work while keeping the source ready for future posts."""
+        return self.release3.clear_source_history(
+            source_chat_id,
+            latest_message_id,
+            source_topic_id=source_topic_id,
+        )
+
+    def history_clear_is_pending(
+        self,
+        source_chat_id: int | str,
+        *,
+        source_topic_id: int | None = None,
+    ) -> bool:
+        return self.release3.history_clear_is_pending(
+            source_chat_id,
+            source_topic_id=source_topic_id,
+        )
+
     def set_source_scan_progress(
         self,
         source_chat_id: int | str,
