@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import sqlite3
 import tempfile
 import time
@@ -106,16 +105,22 @@ def _advanced_menu() -> InlineKeyboardMarkup:
 
 
 def _authorized_ids(config: AppConfig) -> set[int]:
-    result: set[int] = set()
-    for account in load_accounts(config).values():
-        try:
-            result.add(int(account.get("id")))
-        except (TypeError, ValueError, AttributeError):
-            pass
-    for value in os.getenv("ADMIN_USER_ID", "").split(","):
-        if value.strip().isdigit():
-            result.add(int(value.strip()))
-    return result
+    """Return explicit admin IDs, with a narrow first-run fallback for the active session."""
+    configured = {
+        int(user_id)
+        for user_id in config.telegram.admin_ids
+        if isinstance(user_id, int) or str(user_id).strip().isdigit()
+    }
+    if configured:
+        return configured
+
+    # A fresh install can bootstrap from the logged-in operator, but a stale
+    # account cache must never grant access to every session it happens to contain.
+    active_account = load_accounts(config).get(config.telegram.user_session)
+    try:
+        return {int(active_account["id"])}
+    except (KeyError, TypeError, ValueError):
+        return set()
 
 
 def _is_authorized(config: AppConfig, user_id: int | None) -> bool:
