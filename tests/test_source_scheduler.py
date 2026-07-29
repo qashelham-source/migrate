@@ -151,6 +151,75 @@ def test_blacklisting_source_removes_it_from_queue_and_keeps_it_hidden(tmp_path:
     ]
 
 
+def test_purging_a_blacklisted_source_deletes_its_jobs_and_checkpoints(tmp_path: Path) -> None:
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, _config(tmp_path))  # type: ignore[arg-type]
+        queue.register_source(
+            source_chat_id=-100001,
+            title="Old source",
+            username="old_source",
+            chat_type="channel",
+            latest_seen_message_id=2,
+        )
+        queue.register_source(
+            source_chat_id=-100002,
+            title="Keep source",
+            username="keep_source",
+            chat_type="channel",
+            latest_seen_message_id=1,
+        )
+        _enqueue(queue, source_chat_id=-100001, source_message_id=1)
+        _enqueue(queue, source_chat_id=-100001, source_message_id=2)
+        _enqueue(queue, source_chat_id=-100002, source_message_id=1)
+        old_jobs = db.query("SELECT id FROM messages WHERE source_chat_id = ? ORDER BY id", ("-100001",))
+        assert len(old_jobs) == 2
+        parent_id, repair_id = (int(row["id"]) for row in old_jobs)
+        queue.record_verification(
+            job_id=parent_id,
+            status="repairing",
+            expected_count=1,
+            present_count=0,
+            media_match=False,
+            caption_match=None,
+            size_match=None,
+        )
+        queue.update_telemetry(parent_id, stage="processing")
+        queue.release3.link_repair(
+            parent_job_id=parent_id,
+            repair_job_id=repair_id,
+            source_message_id=2,
+        )
+        queue.release3.log_repair(
+            action="test_cleanup",
+            job_id=parent_id,
+            source_chat_id=-100001,
+            dest_chat_id=-100900,
+        )
+        queue.set_scan_checkpoint(-100001, None, 2, "full")
+        queue.set_scan_checkpoint(-100001, 99, 2, "full")
+        queue.set_scan_checkpoint(-100002, None, 1, "full")
+        queue.save_media_cache("shared-cache", ["file-id"], ["video"])
+
+        deleted = queue.purge_source_jobs("@old_source")
+
+        assert deleted["jobs"] == 2
+        assert db.query_one("SELECT id FROM messages WHERE source_chat_id = ?", ("-100001",)) is None
+        assert db.query_one("SELECT id FROM messages WHERE source_chat_id = ?", ("-100002",)) is not None
+        assert db.query_one("SELECT 1 FROM scan_checkpoints WHERE source_chat_id = ?", ("-100001",)) is None
+        assert db.query_one("SELECT 1 FROM scan_checkpoints WHERE source_chat_id = ?", ("-100002",)) is not None
+        assert db.query_one("SELECT 1 FROM source_registry WHERE source_chat_id = ?", ("-100001",)) is None
+        assert db.query_one("SELECT 1 FROM source_registry WHERE source_chat_id = ?", ("-100002",)) is not None
+        assert db.query_one("SELECT 1 FROM verification_results WHERE job_id = ?", (parent_id,)) is None
+        assert db.query_one("SELECT 1 FROM job_telemetry WHERE job_id = ?", (parent_id,)) is None
+        assert db.query_one("SELECT 1 FROM repair_links WHERE parent_job_id = ?", (parent_id,)) is None
+        assert db.query_one("SELECT 1 FROM repair_actions WHERE job_id = ?", (parent_id,)) is None
+        assert queue.media_cache_count() == 1
+    finally:
+        db.close()
+
+
 def test_config_save_falls_back_when_bind_mounted_file_is_busy(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
