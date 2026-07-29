@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 import re
 from pathlib import Path
@@ -38,7 +39,18 @@ def _save_yaml(path: Path, data: dict[str, Any]) -> None:
             yaml.safe_dump(data, handle, allow_unicode=True, sort_keys=False)
             handle.flush()
             os.fsync(handle.fileno())
-        temporary.replace(path)
+        try:
+            temporary.replace(path)
+        except OSError as exc:
+            if exc.errno != errno.EBUSY:
+                raise
+            # Docker bind-mounted files cannot be replaced with os.rename().
+            # The complete, synced temporary file is copied into the mounted file instead.
+            with temporary.open("rb") as source, path.open("wb") as target:
+                target.write(source.read())
+                target.flush()
+                os.fsync(target.fileno())
+            temporary.unlink(missing_ok=True)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
