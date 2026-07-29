@@ -96,8 +96,8 @@ def validate_init_data(
 
 
 def _title(value: Any, chat: str) -> str:
-    candidate = str(value or "").strip()
-    if candidate and candidate != str(chat) and not _CHAT_ID_PATTERN.fullmatch(candidate):
+    candidate = _CHAT_ID_PATTERN.sub("", str(value or "")).strip()
+    if candidate and candidate != str(chat):
         return candidate
     if str(chat).startswith("@"):
         return str(chat)
@@ -123,6 +123,9 @@ def _state_label(phase: str) -> str:
         "stopping": "Sedang berhenti",
         "stopped": "Dihentikan",
         "source_complete": "Sumber selesai",
+        "queued": "Menunggu mula",
+        "blocked": "Perlu perhatian",
+        "error": "Perlu perhatian",
     }
     return labels.get(phase, "Sedia")
 
@@ -140,8 +143,8 @@ def _source_record(
     return records_by_id.get(chat) or records_by_handle.get(chat.casefold())
 
 
-def _source_state(progress: dict[str, Any] | None, active: dict[str, Any] | None) -> tuple[str, str]:
-    if active is progress:
+def _source_state(progress: dict[str, Any] | None, active_source_id: str) -> tuple[str, str]:
+    if progress and active_source_id and str(progress.get("source_chat_id") or "") == active_source_id:
         return "running", "Sedang berjalan"
     if progress:
         eligible = int(progress.get("eligible_items") or 0)
@@ -183,7 +186,7 @@ def dashboard_payload(config: AppConfig, config_path: str | Path) -> dict[str, A
             progress = progress_by_id.get(str((record or {}).get("source_chat_id") or chat))
             if progress is None and chat == active_id:
                 progress = active
-            state, state_label = _source_state(progress, active if active_id else None)
+            state, state_label = _source_state(progress, active_id)
             title = _title((record or {}).get("title") or (progress or {}).get("title"), chat)
             sources.append(
                 {
@@ -237,6 +240,10 @@ def dashboard_payload(config: AppConfig, config_path: str | Path) -> dict[str, A
         telemetry = snapshot["telemetry"]
         storage = snapshot["storage"]
         phase = str(status.get("phase") or "idle").strip().lower()
+        eta = format_eta(telemetry.get("eta_seconds"))
+        if eta == "not enough data":
+            eta = "Belum cukup data"
+
         return {
             "updated_at": status.get("updated_at"),
             "state": {
@@ -250,7 +257,7 @@ def dashboard_payload(config: AppConfig, config_path: str | Path) -> dict[str, A
                 "copied": int(queue.get("copied") or 0),
                 "issues": len(issues),
                 "speed": format_bytes(float(telemetry.get("speed_bps") or 0)) + "/s",
-                "eta": format_eta(telemetry.get("eta_seconds")),
+                "eta": eta,
                 "storage_free": format_bytes(storage.free_bytes),
             },
             "active": active_payload,
