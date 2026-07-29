@@ -26,7 +26,7 @@ from app.advanced import (
 )
 from app.config import AppConfig
 from app.control import clear_stop, is_active_phase, read_status, request_stop, write_status
-from app.dashboard_v2 import dashboard_snapshot, format_bytes, format_eta, issue_center
+from app.dashboard_v2 import active_source_progress, dashboard_snapshot, format_bytes, format_eta, issue_center
 from app.db import Database
 from app.destination_manager import get_sources, list_destinations, set_destinations, set_sources
 from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
@@ -132,6 +132,55 @@ def _request_mode(config: AppConfig, mode: str) -> None:
     request_run_mode(config, mode)
 
 
+def _progress_bar(percent: int, width: int = 10) -> str:
+    value = max(0, min(100, int(percent)))
+    filled = min(width, (value * width) // 100)
+    return "█" * filled + "░" * (width - filled)
+
+
+def _phase_summary(phase: str, current_source: dict[str, Any] | None) -> tuple[str, str]:
+    blocked = int(current_source.get("blocked_items") or 0) if current_source else 0
+    if phase == "blocked":
+        return "⛔ Queue tersekat", "Tindakan diperlukan sebelum queue boleh sambung."
+    if phase == "waiting_retry":
+        return "🟡 Retry automatik", "Bot akan sambung sendiri bila masa retry tiba."
+    if phase == "watching":
+        return "🛰 Live Watcher", "Menunggu post baharu atau arahan Start Queue."
+    if phase == "queued":
+        return "⏸ Queue menunggu mula", "Tekan Start Queue untuk sambung source yang tertangguh."
+    if phase == "scanning":
+        return "🔎 Sedang scan source", "Menyusun post/album untuk migration."
+    if phase in {"downloading", "uploading", "processing", "batch_pause"}:
+        if blocked:
+            return "🟠 Ada isu pada source aktif", "Queue masih meneruskan job yang selamat."
+        return "🟢 Sedang berjalan", {
+            "downloading": "⬇️ Sedang download kandungan.",
+            "uploading": "⬆️ Sedang hantar ke destination.",
+            "processing": "⚙️ Sedang proses migration.",
+            "batch_pause": "⏳ Rehat antara batch; queue akan sambung sendiri.",
+        }[phase]
+    if phase == "stopping":
+        return "⏹ Sedang berhenti", "Menunggu operasi semasa selesai dengan selamat."
+    if phase == "stopped":
+        return "⏹ Dihentikan", "Queue kekal disimpan dan boleh disambung kemudian."
+    if phase == "waiting":
+        return "⚙️ Setup diperlukan", "Tetapkan source dan destination dahulu."
+    if phase == "error":
+        return "🔴 Ralat migration", "Semak Issue Center untuk butiran."
+    return "🟢 Sedia", "Pilih Start Queue apabila anda mahu mula."
+
+
+def _media_label(value: Any) -> str:
+    labels = {
+        "album": "Album",
+        "video": "Video",
+        "photo": "Foto",
+        "document": "Dokumen",
+        "text": "Teks",
+    }
+    return labels.get(str(value or "").lower(), str(value or "Media").title())
+
+
 def _dashboard_text(config: AppConfig) -> str:
     db = _database(config)
     try:
@@ -139,92 +188,83 @@ def _dashboard_text(config: AppConfig) -> str:
     finally:
         db.close()
     status = read_status(config)
-    q, s, d, v, t, storage = (
-        data["queue"], data["sources"], data["destinations"], data["verification"], data["telemetry"], data["storage"]
+    q, s, d, t, storage = (
+        data["queue"], data["sources"], data["destinations"], data["telemetry"], data["storage"]
     )
-    source_progress = data["source_progress"]
     phase = str(status.get("phase") or "idle").lower()
-    active = q["downloading"] + q["uploading"]
-    issue_total = q["failed"] + q["skipped"] + d["paused"] + v["failed"]
-    state = "🟢 Healthy" if issue_total == 0 else "🟠 Perlu perhatian"
-    phase_labels = {
-        "idle": "Idle", "watching": "Live watcher", "scanning": "Scanning", "processing": "Processing",
-        "downloading": "Downloading", "uploading": "Uploading", "stopping": "Stopping", "stopped": "Stopped",
-        "waiting": "Setup diperlukan", "queued": "Queue menunggu mula",
-        "waiting_retry": "Retry automatik", "blocked": "Queue tersekat",
-        "source_complete": "Source lengkap", "scan_complete": "Scan selesai",
-        "batch_pause": "Rehat antara batch",
-        "error": "Error", "health_check": "Pre-flight check", "health_complete": "Health check complete",
-    }
-    current = phase_labels.get(phase, phase.replace("_", " ").title())
-    lines = [
-        "🏠 Migration Dashboard",
-        "",
-        f"{state}",
-        f"Status: {current}",
-        "",
-        f"Pending   {q['pending']}",
-        f"Running   {active}",
-        f"Completed {q['copied']}",
-        f"Failed    {q['failed'] + q['skipped']}",
-        "",
-        f"Speed: {format_bytes(t['speed_bps'])}/s",
-        f"ETA: {format_eta(t['eta_seconds'])}",
-        f"Sources: {s['total']} · Destinations: {d['total']}",
-    ]
+    current_source = active_source_progress(status, data["source_progress"])
+    headline, subline = _phase_summary(phase, current_source)
+    active_jobs = q["downloading"] + q["uploading"]
+
+    lines = ["🏠 Migration Dashboard", "", headline, subline]
+
+    if current_source:
+        title = str(current_source["title"])[:52]
+        eligible = int(current_source["eligible_items"])
+        copied = int(current_source["copied_items"])
+        remaining = int(current_source["remaining_items"])
+        in_progress = int(current_source["active_items"])
+        blocked = int(current_source["blocked_items"])
+        percent = int(current_source["percent"])
+        lines += ["", "🎯 Sedang Migrasi", title]
+        if eligible:
+            lines += [
+                f"{_progress_bar(percent)}  {percent}%",
+                f"{copied:,} / {eligible:,} post/album",
+            ]
+            details: list[str] = []
+            if remaining:
+                details.append(f"Baki {remaining:,}")
+            if in_progress:
+                details.append(f"⚡ {in_progress:,} aktif")
+            if details:
+                lines.append(" · ".join(details))
+            if blocked:
+                lines.append(f"⚠️ {blocked:,} item perlu semakan")
+        else:
+            lines.append("Tiada item yang sepadan dengan tetapan filter.")
+    else:
+        source_name = str(status.get("source") or status.get("source_chat") or "").strip()
+        if source_name and phase not in {"watching", "idle", "stopped", "source_complete"}:
+            lines += ["", "🎯 Source Semasa", source_name[:52]]
+        if phase == "scanning" and status.get("current") is not None and status.get("total") is not None:
+            try:
+                scanned = max(0, int(status["current"]))
+                total = max(0, int(status["total"]))
+                percent = round((scanned / total) * 100) if total else 0
+                lines.append(f"{_progress_bar(percent)}  Scan {scanned:,}/{total:,}")
+            except (TypeError, ValueError):
+                pass
+        elif phase in {"downloading", "uploading", "processing"} and active_jobs:
+            lines += ["", f"⚡ {active_jobs:,} job sedang bekerja"]
+
     if status.get("source_index") is not None and status.get("source_total") is not None:
         try:
             source_index = int(status["source_index"])
             source_total = int(status["source_total"])
-            source_name = str(status.get("source") or status.get("source_chat") or "-")[:52]
-            lines += ["", f"Source Queue: {source_index}/{source_total} · {source_name}"]
-            if phase == "waiting_retry":
-                lines.append("⏳ Source ini retry sendiri; source lain kekal menunggu.")
-            elif phase == "blocked":
-                lines.append("⛔ Source ini perlukan tindakan; source lain kekal menunggu.")
-            elif phase == "queued":
-                lines.append("⏸ Tekan Start Queue untuk meneruskan kerja tertangguh.")
+            lines += ["", f"📦 Queue source {source_index}/{source_total} · {d['total']} destination"]
         except (TypeError, ValueError):
             pass
-    if source_progress:
-        lines += ["", "Source Migration:"]
-        for item in source_progress[:3]:
-            title = str(item["title"])[:44]
-            eligible = int(item["eligible_items"])
-            if eligible <= 0:
-                lines.append(f"• {title}: tiada item ikut filter")
-                continue
-            copied = int(item["copied_items"])
-            remaining = int(item["remaining_items"])
-            percent = int(item["percent"])
-            lines.append(f"• {title}: {percent}% siap — {copied}/{eligible} post/album")
-            lines.append(
-                f"  Baki: {remaining} ({100 - percent}%) · Jalan: {item['active_items']} · Isu: {item['blocked_items']}"
-            )
-            if item["filtered_items"]:
-                lines.append(f"  Tidak ikut filter: {item['filtered_items']}")
-    if status.get("job_id") is not None:
-        lines += ["", f"Current job: #{status['job_id']}", f"Media: {status.get('media_type') or '-'}"]
-    if status.get("current") is not None and status.get("total") is not None:
-        try:
-            current_count = max(0, int(status["current"]))
-            total_count = max(0, int(status["total"]))
-            label = "Scan source" if phase == "scanning" else "Progress"
-            if total_count:
-                lines.append(f"{label}: {current_count}/{total_count} ({round(current_count / total_count * 100)}%)")
-            else:
-                lines.append(f"{label}: {current_count}/{total_count}")
-        except (TypeError, ValueError):
-            lines.append(f"Progress: {status['current']}/{status['total']}")
-    error = status.get("last_error") or status.get("error")
-    if error:
-        lines += ["", f"Last error: {str(error).replace(chr(10), ' ')[:300]}"]
-    if storage.percent_used >= 80:
-        level = "🚨 Critical" if storage.percent_used >= 90 else "⚠️ Low working storage"
-        lines += ["", level, f"Free: {format_bytes(storage.free_bytes)}"]
-    lines += ["", "Dashboard dikemas kini secara automatik."]
-    return "\n".join(lines)[:3900]
+    else:
+        lines += ["", f"📦 {s['total']} source · {d['total']} destination"]
 
+    speed = float(t["speed_bps"] or 0)
+    if speed > 0:
+        speed_line = f"🚀 {format_bytes(speed)}/s"
+        if t["eta_seconds"] is not None:
+            speed_line += f" · ETA {format_eta(t['eta_seconds'])}"
+        lines.append(speed_line)
+    if status.get("media_type"):
+        lines.append(f"📎 Sekarang: {_media_label(status['media_type'])}")
+
+    error = status.get("last_error") or status.get("error")
+    if error and phase in {"blocked", "waiting_retry", "error"}:
+        lines += ["", f"⚠️ {str(error).replace(chr(10), ' ')[:220]}"]
+    if storage.percent_used >= 80:
+        level = "🚨 Storage kritikal" if storage.percent_used >= 90 else "⚠️ Storage rendah"
+        lines += ["", level, f"Free: {format_bytes(storage.free_bytes)}"]
+    lines += ["", "↻ Dikemas kini automatik"]
+    return "\n".join(lines)[:3900]
 
 def _settings_text(path: Path) -> str:
     sources = get_sources(path)
