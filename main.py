@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 from contextlib import AsyncExitStack, suppress
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +50,19 @@ COMMANDS = (
     "add-destination",
     "remove-destination",
 )
+
+
+@dataclass(frozen=True)
+class CycleOutcome:
+    """The point where a sequential source queue may safely pause."""
+
+    state: str
+    source_chat_id: int | None = None
+    source_index: int | None = None
+    source_total: int | None = None
+    next_retry_at: str | None = None
+    retry_after_seconds: float | None = None
+    message: str | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,7 +113,7 @@ def handle_destination_command(args: argparse.Namespace) -> bool:
 def _configured_destinations(config: AppConfig) -> list[Any]:
     return [
         spec
-        for spec in config.destinations
+        for spec in getattr(config, "destinations", [])
         if spec.chat
         and "destination_channel_or_-100_id" not in str(spec.chat).lower()
     ]
@@ -107,18 +122,124 @@ def _configured_destinations(config: AppConfig) -> list[Any]:
 def _configured_sources(config: AppConfig) -> list[Any]:
     return [
         spec
-        for spec in config.sources
+        for spec in getattr(config, "sources", [])
         if spec.chat and "source_channel_or_-100_id" not in str(spec.chat).lower()
     ]
 
 
 def _configured_numeric_peer_ids(config: AppConfig) -> set[int]:
     result: set[int] = set()
-    for spec in [*config.sources, *config.destinations]:
+    for spec in [*getattr(config, "sources", []), *getattr(config, "destinations", [])]:
         value = str(spec.chat or "").strip()
         if value.lstrip("-").isdigit():
             result.add(int(value))
     return result
+
+
+def _source_status_details(
+    state: dict[str, Any],
+    *,
+    source: str,
+    source_chat_id: int,
+    source_index: int,
+    source_total: int,
+) -> dict[str, Any]:
+    return {
+        "source": source,
+        "source_chat": source_chat_id,
+        "source_index": source_index,
+        "source_total": source_total,
+        "source_pending": state["pending_jobs"],
+        "source_active": state["active_jobs"],
+        "source_delayed": state["delayed_jobs"],
+        "source_paused": state["paused_jobs"],
+        "source_failed": state["failed_jobs"],
+        "source_skipped": state["skipped_issue_jobs"],
+        "source_verification_pending": state["verification_pending_jobs"],
+        "source_verification_failed": state["verification_failed_jobs"],
+        "source_verification_repairing": state["verification_repairing_jobs"],
+    }
+
+
+def _source_outcome(
+    state: dict[str, Any],
+    *,
+    source_chat_id: int,
+    source_index: int,
+    source_total: int,
+) -> CycleOutcome:
+    """Keep later sources waiting until this source is safe to advance."""
+    common = {
+        "source_chat_id": source_chat_id,
+        "source_index": source_index,
+        "source_total": source_total,
+    }
+    terminal_issues = (
+        int(state["failed_jobs"])
+        + int(state["skipped_issue_jobs"])
+        + int(state["verification_failed_jobs"])
+    )
+    if terminal_issues:
+        return CycleOutcome(
+            "blocked",
+            message="Ada job gagal atau verification gagal yang perlu semakan manual.",
+            **common,
+        )
+    if int(state["paused_jobs"]):
+        return CycleOutcome(
+            "blocked",
+            message="Destination untuk source ini dipause dan perlu dibetulkan dahulu.",
+            **common,
+        )
+    if int(state["active_jobs"]):
+        return CycleOutcome(
+            "blocked",
+            message="Ada job lama masih bertanda sedang diproses. Ia ditahan untuk elak upload berganda.",
+            **common,
+        )
+    if int(state["delayed_jobs"]):
+        return CycleOutcome(
+            "retry",
+            next_retry_at=state.get("next_retry_at"),
+            message="Retry automatik telah dijadualkan untuk source ini.",
+            **common,
+        )
+    if int(state["verification_pending_jobs"]):
+        return CycleOutcome(
+            "retry",
+            retry_after_seconds=60,
+            message="Menunggu verification semula sebelum source seterusnya.",
+            **common,
+        )
+    if int(state["verification_repairing_jobs"]):
+        return CycleOutcome(
+            "blocked",
+            message="Repair verification masih belum lengkap. Semak Issue Center sebelum sambung.",
+            **common,
+        )
+    if int(state["runnable_jobs"]):
+        return CycleOutcome(
+            "retry",
+            retry_after_seconds=2,
+            message="Masih ada job sah untuk diproses; worker akan sambung sendiri.",
+            **common,
+        )
+    return CycleOutcome("complete", **common)
+
+
+def _retry_wait_seconds(outcome: CycleOutcome) -> float:
+    if outcome.retry_after_seconds is not None:
+        return max(0.5, float(outcome.retry_after_seconds))
+    if outcome.next_retry_at:
+        try:
+            value = str(outcome.next_retry_at).replace("Z", "+00:00")
+            deadline = datetime.fromisoformat(value)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)
+            return max(0.5, (deadline - datetime.now(timezone.utc)).total_seconds())
+        except (TypeError, ValueError):
+            pass
+    return 30.0
 
 
 async def warm_dialog_cache(
@@ -256,6 +377,98 @@ async def _resolved_source_ids(
     return source_ids
 
 
+async def _write_initial_wait_status(
+    config: AppConfig,
+    queue: MessageQueue,
+    reader: Client,
+    limiter: TelegramLimiter,
+    *,
+    watched_sources: int,
+    reconciliation_seconds: float,
+    logger: Any | None = None,
+) -> None:
+    """Report queued or blocked work truthfully without starting migration on boot."""
+    sources = _configured_sources(config)
+    destinations = _configured_destinations(config)
+    if not sources or not destinations:
+        write_status(
+            config,
+            "waiting",
+            message="Tetapkan sekurang-kurangnya satu source dan satu destination dahulu.",
+            source="set" if sources else "missing",
+            destination="set" if destinations else "missing",
+        )
+        return
+
+    for source_index, source in enumerate(sources, start=1):
+        try:
+            resolved = await resolve_chat(reader, limiter, source)
+        except Exception as exc:
+            write_status(
+                config,
+                "blocked",
+                message="Source tidak dapat diakses. Queue tidak dijalankan secara automatik.",
+                source=source.chat,
+                source_index=source_index,
+                source_total=len(sources),
+                error=f"{exc.__class__.__name__}: {exc}"[:1000],
+            )
+            return
+        source_chat_id = int(resolved.chat_id)
+        state = queue.source_work_state(source_chat_id)
+        queue.recompute_source_state(source_chat_id)
+        outcome = _source_outcome(
+            state,
+            source_chat_id=source_chat_id,
+            source_index=source_index,
+            source_total=len(sources),
+        )
+        if outcome.state == "complete":
+            continue
+
+        details = _source_status_details(
+            state,
+            source=str(resolved.title or source.chat),
+            source_chat_id=source_chat_id,
+            source_index=source_index,
+            source_total=len(sources),
+        )
+        if outcome.state == "blocked":
+            write_status(
+                config,
+                "blocked",
+                message=(
+                    "Source queue mempunyai isu yang perlu perhatian. "
+                    "Source seterusnya kekal dalam waiting list."
+                ),
+                last_error=state.get("last_error"),
+                **details,
+            )
+        else:
+            write_status(
+                config,
+                "queued",
+                message=(
+                    "Source queue mempunyai kerja tertangguh. Tekan Start Queue untuk sambung; "
+                    "tiada migration dimulakan secara automatik selepas restart."
+                ),
+                retry_at=outcome.next_retry_at,
+                last_error=state.get("last_error"),
+                **details,
+            )
+        return
+
+    write_status(
+        config,
+        "watching",
+        message="Live Watcher aktif. Menunggu post baharu atau arahan admin sebelum migration dijalankan.",
+        live_watcher=True,
+        watched_sources=watched_sources,
+        reconciliation_seconds=reconciliation_seconds,
+        **queue.counts_by_status(),
+    )
+
+
 async def _execute_cycle(
     config: AppConfig,
     command: str,
@@ -269,7 +482,7 @@ async def _execute_cycle(
     writer_me: Any,
     logger: Any | None,
     trigger_reason: str | None = None,
-) -> None:
+) -> CycleOutcome:
     queue.config = config
     writer = bot if bot is not None and config.telegram.use_bot_for_uploads else reader
     writer, destinations_ready = await choose_writer_for_destinations(
@@ -308,47 +521,199 @@ async def _execute_cycle(
             logger=logger,
         )
         print(f"Health check: {report['overall']}")
-        return
+        return CycleOutcome("complete")
 
-    if command in {"scan", "sync", "run"}:
-        scanner = Scanner(
+    sources = _configured_sources(config)
+    destinations = _configured_destinations(config)
+    if not sources or not destinations:
+        write_status(
             config,
-            queue,
-            reader,
-            limiter,
-            writer=writer,
-            logger=logger,
-            scan_mode="incremental" if command == "sync" else "full",
+            "waiting",
+            message="Tetapkan sekurang-kurangnya satu source dan satu destination dahulu.",
+            source="set" if sources else "missing",
+            destination="set" if destinations else "missing",
         )
-        await scanner.scan(stop_event)
-
-    if command in {"process", "sync", "run"} and not stop_event.is_set():
-        uploader = Release3Uploader(
+        return CycleOutcome(
+            "blocked",
+            message="Source atau destination belum lengkap.",
+        )
+    if not destinations_ready:
+        write_status(
             config,
-            reader,
-            writer,
-            limiter,
-            queue=queue,
-            logger=logger,
+            "blocked",
+            message="Destination tidak dapat diakses. Source queue ditahan dengan selamat.",
+            destination_count=len(destinations),
         )
-        worker = Worker(config, queue, uploader, logger=logger)
-        await worker.run(stop_event)
-
-    if command in {"verify", "process", "sync", "run"} and not stop_event.is_set():
-        verifier = Verifier(
-            config,
-            queue,
-            reader,
-            writer,
-            limiter,
-            logger=logger,
+        return CycleOutcome(
+            "blocked",
+            message="Destination belum sedia untuk upload.",
         )
-        await verifier.run(stop_event)
 
-    for spec in _configured_sources(config):
-        value = str(spec.chat).strip()
-        if value.lstrip("-").isdigit():
-            queue.recompute_source_state(int(value))
+    source_total = len(sources)
+    for source_index, source in enumerate(sources, start=1):
+        if stop_event.is_set():
+            break
+
+        try:
+            resolved_source = await resolve_chat(reader, limiter, source)
+        except Exception as exc:
+            write_status(
+                config,
+                "blocked",
+                message="Source tidak dapat diakses. Source seterusnya kekal dalam waiting list.",
+                source=source.chat,
+                source_index=source_index,
+                source_total=source_total,
+                error=f"{exc.__class__.__name__}: {exc}"[:1000],
+            )
+            return CycleOutcome(
+                "blocked",
+                source_index=source_index,
+                source_total=source_total,
+                message="Source tidak dapat diakses.",
+            )
+
+        source_chat_id = int(resolved_source.chat_id)
+        source_title = str(resolved_source.title or source.chat)
+        source_config = replace(config, sources=[source])
+        queue.config = source_config
+
+        if command in {"scan", "sync", "run"}:
+            scanner = Scanner(
+                source_config,
+                queue,
+                reader,
+                limiter,
+                writer=writer,
+                logger=logger,
+                scan_mode="incremental" if command == "sync" else "full",
+                source_index_offset=source_index - 1,
+                source_total_override=source_total,
+            )
+            await scanner.scan(stop_event)
+
+        if command == "scan":
+            state = queue.source_work_state(source_chat_id)
+            queue.recompute_source_state(source_chat_id)
+            if state["pending_jobs"] or state["active_jobs"] or state["verification_pending_jobs"]:
+                write_status(
+                    config,
+                    "queued",
+                    message="Scan selesai. Queue source ini menunggu arahan process/run.",
+                    **_source_status_details(
+                        state,
+                        source=source_title,
+                        source_chat_id=source_chat_id,
+                        source_index=source_index,
+                        source_total=source_total,
+                    ),
+                )
+                return CycleOutcome(
+                    "queued",
+                    source_chat_id=source_chat_id,
+                    source_index=source_index,
+                    source_total=source_total,
+                    message="Scan membina queue tetapi tidak memulakan worker.",
+                )
+            continue
+
+        if command in {"process", "sync", "run"} and not stop_event.is_set():
+            uploader = Release3Uploader(
+                source_config,
+                reader,
+                writer,
+                limiter,
+                queue=queue,
+                logger=logger,
+            )
+            worker = Worker(
+                source_config,
+                queue,
+                uploader,
+                logger=logger,
+                source_chat_id=source_chat_id,
+                source_index=source_index,
+                source_total=source_total,
+                source_label=source_title,
+            )
+            await worker.run(stop_event)
+
+        if command in {"verify", "process", "sync", "run"} and not stop_event.is_set():
+            verifier = Verifier(
+                source_config,
+                queue,
+                reader,
+                writer,
+                limiter,
+                logger=logger,
+                source_chat_id=source_chat_id,
+            )
+            await verifier.run(stop_event)
+
+        if stop_event.is_set():
+            break
+
+        state = queue.source_work_state(source_chat_id)
+        queue.recompute_source_state(source_chat_id)
+        outcome = _source_outcome(
+            state,
+            source_chat_id=source_chat_id,
+            source_index=source_index,
+            source_total=source_total,
+        )
+        if outcome.state == "complete":
+            if source_index < source_total:
+                write_status(
+                    config,
+                    "source_complete",
+                    message="Source siap. Meneruskan ke source seterusnya dalam queue.",
+                    **_source_status_details(
+                        state,
+                        source=source_title,
+                        source_chat_id=source_chat_id,
+                        source_index=source_index,
+                        source_total=source_total,
+                    ),
+                )
+            continue
+
+        details = _source_status_details(
+            state,
+            source=source_title,
+            source_chat_id=source_chat_id,
+            source_index=source_index,
+            source_total=source_total,
+        )
+        if outcome.state == "retry":
+            write_status(
+                config,
+                "waiting_retry",
+                message=outcome.message,
+                retry_at=outcome.next_retry_at,
+                last_error=state.get("last_error"),
+                **details,
+            )
+        else:
+            write_status(
+                config,
+                "blocked",
+                message=outcome.message,
+                last_error=state.get("last_error"),
+                **details,
+            )
+        return outcome
+
+    if stop_event.is_set():
+        return CycleOutcome("blocked", message="Migration dihentikan.")
+
+    write_status(
+        config,
+        "source_complete",
+        message="Semua source dalam queue telah siap untuk cycle ini.",
+        source_total=source_total,
+        cycle_mode=cycle_mode,
+    )
+    return CycleOutcome("complete", source_total=source_total)
 
 
 async def _run_live_service(
@@ -379,14 +744,14 @@ async def _run_live_service(
             trigger.source_ids = await _resolved_source_ids(config, queue, reader, limiter, logger)
 
             if command is None:
-                write_status(
+                await _write_initial_wait_status(
                     config,
-                    "watching",
-                    message="Live Watcher aktif. Menunggu post baharu atau arahan admin sebelum migration dijalankan.",
-                    live_watcher=True,
+                    queue,
+                    reader,
+                    limiter,
                     watched_sources=len(trigger.source_ids),
                     reconciliation_seconds=trigger.settings.reconcile_interval_seconds,
-                    **queue.counts_by_status(),
+                    logger=logger,
                 )
                 next_trigger = await trigger.wait(
                     config,
@@ -409,7 +774,7 @@ async def _run_live_service(
                 live_trigger=reason,
                 cycle_number=cycle_number,
             )
-            await _execute_cycle(
+            outcome = await _execute_cycle(
                 config,
                 command,
                 reader=reader,
@@ -426,10 +791,32 @@ async def _run_live_service(
                 break
             if cycle_number % 12 == 0:
                 await refresh_source_registry(config, queue, reader, stop_event, logger)
+            if not isinstance(outcome, CycleOutcome):
+                outcome = CycleOutcome("complete")
+            if outcome.state == "retry":
+                next_trigger = await trigger.wait_for_retry(
+                    config,
+                    stop_event,
+                    _retry_wait_seconds(outcome),
+                )
+                if next_trigger is None:
+                    break
+                command, reason = next_trigger
+                continue
+            if outcome.state == "blocked":
+                next_trigger = await trigger.wait(
+                    config,
+                    stop_event,
+                    allow_reconciliation=False,
+                )
+                if next_trigger is None:
+                    break
+                command, reason = next_trigger
+                continue
             write_status(
                 config,
                 "watching",
-                message="Live Watcher menunggu post baharu; checkpoint reconciliation kekal aktif.",
+                message="Live Watcher menunggu post baharu; semua source aktif telah selesai.",
                 live_watcher=True,
                 watched_sources=len(trigger.source_ids),
                 reconciliation_seconds=trigger.settings.reconcile_interval_seconds,
@@ -467,6 +854,14 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
                 f"Held {recovery.held_uploads} interrupted upload job(s) for manual destination verification"
             )
             return
+
+        recovery = queue.recover_in_progress()
+        if recovery.total and logger:
+            logger.warning(
+                "Recovered interrupted queue state: downloads=%s uploads_held=%s",
+                recovery.requeued_downloads,
+                recovery.held_uploads,
+            )
 
         clear_stop(config)
         write_status(
