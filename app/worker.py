@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from typing import Any
 
 from pyrogram import Client
@@ -42,6 +43,20 @@ class Worker:
         self.source_total = source_total
         self.source_label = source_label
         self.storage_policy = StoragePolicy.from_environment()
+
+    @staticmethod
+    def _is_transport_interruption(exc: OSError) -> bool:
+        """Return whether an OS error represents a broken network connection."""
+        return isinstance(exc, (ConnectionError, TimeoutError)) or getattr(exc, "errno", None) in {
+            errno.EPIPE,
+            errno.ECONNABORTED,
+            errno.ECONNRESET,
+            errno.ETIMEDOUT,
+            errno.ENETDOWN,
+            errno.ENETUNREACH,
+            errno.EHOSTUNREACH,
+            errno.ECONNREFUSED,
+        }
 
     def _status_details(self, job: MessageJob | None = None, **extra: Any) -> dict[str, Any]:
         counts = self.queue.counts_by_status(self.source_chat_id)
@@ -153,6 +168,7 @@ class Worker:
         batch_total: int,
     ) -> None:
         attempts = job.attempts
+        phase = job.status if job.status in {"downloading", "uploading"} else "downloading"
         if self.logger:
             self.logger.info("Processing job %s attempt %s", job.id, attempts)
 
@@ -169,6 +185,8 @@ class Worker:
         )
 
         async def set_phase(status: str) -> None:
+            nonlocal phase
+            phase = status
             self.queue.set_phase(job.id, status)
             message = {
                 "downloading": "Downloading restricted media.",
@@ -288,6 +306,73 @@ class Worker:
                 self.config,
                 "processing",
                 message=f"Job #{job.id} had a media error and will go through recovery.",
+                last_result=status,
+                last_error=error,
+                **self._status_details(job, **common),
+            )
+        except OSError as exc:
+            error = compact_error(exc)
+            if self._is_transport_interruption(exc):
+                if phase == "uploading":
+                    status = "failed"
+                    reason = self.queue.hold_uncertain_upload(job, error)
+                    action = "hold_uncertain_upload"
+                    message = (
+                        f"Job #{job.id} lost its upload connection and was held to prevent a duplicate."
+                    )
+                    status_phase = "blocked"
+                elif stop_event.is_set():
+                    status = "pending"
+                    reason = error
+                    self.queue.set_phase(job.id, "pending")
+                    action = "stop_during_download"
+                    message = f"Job #{job.id} was returned to pending."
+                    status_phase = "stopping"
+                else:
+                    status = "pending"
+                    reason = self.queue.defer_download_transport_failure(job, error, attempts)
+                    action = "retry_download_transport"
+                    message = f"Job #{job.id} lost its download connection and will retry automatically."
+                    status_phase = "waiting_retry"
+                self.queue.log_repair(
+                    action=action,
+                    job=job,
+                    reason=reason,
+                    outcome=status,
+                    details={"attempt": attempts, "phase": phase},
+                )
+                if self.logger:
+                    self.logger.warning(
+                        "Job %s %s after transport interruption during %s: %s",
+                        job.id,
+                        status,
+                        phase,
+                        exc,
+                    )
+                write_status(
+                    self.config,
+                    status_phase,
+                    message=message,
+                    last_result=status,
+                    last_error=reason,
+                    **self._status_details(job, **common),
+                )
+                return
+
+            status = self.queue.mark_failure(job, error, attempts)
+            self.queue.log_repair(
+                action="automatic_retry",
+                job=job,
+                reason=error,
+                outcome=status,
+                details={"attempt": attempts},
+            )
+            if self.logger:
+                self.logger.exception("Job %s %s after failure", job.id, status)
+            write_status(
+                self.config,
+                "processing",
+                message=f"Job #{job.id} failed and recovery was recorded.",
                 last_result=status,
                 last_error=error,
                 **self._status_details(job, **common),
