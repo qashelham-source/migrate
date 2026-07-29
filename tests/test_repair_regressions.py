@@ -90,16 +90,8 @@ def test_admin_fallback_never_authorizes_an_unrelated_cached_account(
     config.ensure_directories()
     save_accounts(config, {"operator": {"id": 111}, "stale-session": {"id": 999}})
 
-    # Reload to model a fresh control-panel process rather than a module instance
-    # that another test may have imported before this regression scenario.
     reloaded_admin_bot = importlib.reload(admin_bot)
-    assert reloaded_admin_bot._authorized_ids(config) == {111}, {
-        "module_file": reloaded_admin_bot.__file__,
-        "source_has_new_logic": "active_account = load_accounts" in Path(
-            str(reloaded_admin_bot.__file__)
-        ).read_text(encoding="utf-8"),
-        "function_names": reloaded_admin_bot._authorized_ids.__code__.co_names,
-    }
+    assert reloaded_admin_bot._authorized_ids(config) == {111}
 
 
 def test_source_topic_configuration_is_rejected_before_any_scan(tmp_path: Path) -> None:
