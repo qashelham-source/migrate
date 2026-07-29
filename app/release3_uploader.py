@@ -176,7 +176,7 @@ class Release3Uploader(Uploader):
             write_status(
                 self.config,
                 "storage_guard",
-                message="Storage server tidak cukup untuk memulakan media baharu. Job dikekalkan dalam queue.",
+                message="Server storage is too low to start new media. The job remains in the queue.",
                 job_id=job.id,
                 source_message_id=job.source_message_id,
                 **snapshot.as_status(),
@@ -370,7 +370,7 @@ class Release3Uploader(Uploader):
         write_status(
             self.config,
             stage,
-            message="Sedang download media restricted." if stage == "downloading" else "Sedang upload media.",
+            message="Downloading restricted media." if stage == "downloading" else "Uploading media.",
             job_id=job.id,
             source_chat=job.source_chat_id,
             destination_chat=job.dest_chat_id,
