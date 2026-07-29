@@ -30,6 +30,15 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Validate deployment entrypoint
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n deploy.sh
+          test "$(git ls-files -s deploy.sh | awk '{print $1}')" = "100755"
+          grep -Fq 'exec bash "$APP_DIR/deploy.sh"' deploy.sh
+          grep -Fq 'python3 - "$APP_DIR/data/migration.sqlite3"' deploy.sh
+
       - name: Install dependencies and audit tools
         run: |
           python -m pip install --upgrade pip
