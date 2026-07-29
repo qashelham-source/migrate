@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app.db import Database
+from app.skip_policy import expected_skip_reason_sql
 
 
 @dataclass(frozen=True)
@@ -83,6 +84,7 @@ def source_migration_progress(db: Database) -> list[dict[str, Any]]:
         if has_registry
         else ""
     )
+    expected_skip = expected_skip_reason_sql("m.last_error")
     rows = db.query(
         f"""
         WITH source_items AS (
@@ -95,10 +97,10 @@ def source_migration_progress(db: Database) -> list[dict[str, Any]]:
                 SUM(
                     CASE
                         WHEN m.status = 'skipped'
-                         AND LOWER(COALESCE(m.last_error, '')) LIKE '%filtered out by config%'
+                         AND {expected_skip}
                         THEN 1 ELSE 0
                     END
-                ) AS filtered_destinations
+                ) AS expected_skip_destinations
             FROM messages m
             WHERE m.file_unique_key NOT LIKE 'repair:%'
             GROUP BY m.source_chat_id, m.file_unique_key
@@ -107,27 +109,28 @@ def source_migration_progress(db: Database) -> list[dict[str, Any]]:
                 source_chat_id,
                 COUNT(*) AS total_items,
                 SUM(
-                    CASE WHEN filtered_destinations = destination_count THEN 1 ELSE 0 END
-                ) AS filtered_items,
+                    CASE WHEN expected_skip_destinations = destination_count THEN 1 ELSE 0 END
+                ) AS excluded_items,
                 SUM(
                     CASE
-                        WHEN filtered_destinations != destination_count
-                         AND copied_destinations = destination_count
+                        WHEN expected_skip_destinations != destination_count
+                         AND copied_destinations + expected_skip_destinations = destination_count
+                         AND copied_destinations > 0
                         THEN 1 ELSE 0
                     END
                 ) AS copied_items,
                 SUM(
                     CASE
-                        WHEN filtered_destinations != destination_count
-                         AND copied_destinations != destination_count
+                        WHEN expected_skip_destinations != destination_count
+                         AND copied_destinations + expected_skip_destinations != destination_count
                          AND active_destinations > 0
                         THEN 1 ELSE 0
                     END
                 ) AS active_items,
                 SUM(
                     CASE
-                        WHEN filtered_destinations != destination_count
-                         AND copied_destinations != destination_count
+                        WHEN expected_skip_destinations != destination_count
+                         AND copied_destinations + expected_skip_destinations != destination_count
                          AND active_destinations = 0
                         THEN 1 ELSE 0
                     END
@@ -145,8 +148,8 @@ def source_migration_progress(db: Database) -> list[dict[str, Any]]:
     progress: list[dict[str, Any]] = []
     for row in rows:
         total_items = int(row["total_items"] or 0)
-        filtered_items = int(row["filtered_items"] or 0)
-        eligible_items = max(0, total_items - filtered_items)
+        excluded_items = int(row["excluded_items"] or 0)
+        eligible_items = max(0, total_items - excluded_items)
         copied_items = int(row["copied_items"] or 0)
         active_items = int(row["active_items"] or 0)
         blocked_items = int(row["blocked_items"] or 0)
@@ -156,7 +159,7 @@ def source_migration_progress(db: Database) -> list[dict[str, Any]]:
                 "source_chat_id": str(row["source_chat_id"]),
                 "title": str(row["title"] or row["source_chat_id"]),
                 "total_items": total_items,
-                "filtered_items": filtered_items,
+                "excluded_items": excluded_items,
                 "eligible_items": eligible_items,
                 "copied_items": copied_items,
                 "active_items": active_items,
@@ -244,16 +247,17 @@ def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]
                 states,
             )
 
+    expected_skip = expected_skip_reason_sql("last_error")
     review = {
         "repair_failed": _count(
             db,
-            """
+            f"""
             SELECT COUNT(*) FROM messages
             WHERE file_unique_key LIKE 'repair:%'
               AND (
                     status = 'failed'
                  OR (status = 'skipped'
-                     AND LOWER(COALESCE(last_error, '')) NOT LIKE '%filtered out by config%')
+                     AND NOT {expected_skip})
               )
             """,
         ),
@@ -294,14 +298,16 @@ def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]
 def issue_center(db: Database, limit: int = 20) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     issue_job_ids: set[int] = set()
+    expected_skip = expected_skip_reason_sql("last_error")
 
     for row in db.query(
-        """
+        f"""
         SELECT id, source_chat_id, dest_chat_id, source_message_id, media_type,
                status, attempts, last_error, updated_at
         FROM messages
         WHERE status IN ('failed', 'skipped')
           AND COALESCE(last_error, '') != ''
+          AND NOT (status = 'skipped' AND {expected_skip})
         ORDER BY id DESC
         LIMIT ?
         """,
