@@ -741,6 +741,9 @@ def _source_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarku
         nav.append(("➡️", f"sources:page:{page + 1}"))
     if nav:
         rows.append(nav)
+    if selected["sources"]:
+        current = _channel_title(user_id, selected["sources"][0])[:26]
+        rows.append([(f"🗑 Delete Current: {current}"[:48], "sources:delete:0")])
     rows += [
         [("📋 Arrange Queue", "sources:queue"), ("🔄 Scan / Refresh", "sources:scan")],
         [("✅ Save & Start Queue", "sources:save")],
@@ -757,6 +760,7 @@ def _source_queue_text(user_id: int, path: Path) -> str:
         * _source_queue_lines(user_id, selected["sources"]),
         "",
         "Use ▲ or ▼ to change the order. Only the first source will run.",
+        "Delete Jobs permanently removes the source, its saved jobs, and its checkpoints. The next source starts automatically.",
     ])
 
 
@@ -765,11 +769,11 @@ def _source_queue_menu(user_id: int, path: Path) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
     for index, chat in enumerate(selected["sources"]):
         label = _channel_title(user_id, chat)[:28]
+        rows.append([(f"{index + 1}. {label}", f"sources:noopq:{index}")])
         rows.append([
-            (f"{index + 1}. {label}", f"sources:noopq:{index}"),
-            ("▲", f"sources:move:{index}:up"),
-            ("▼", f"sources:move:{index}:down"),
-            ("✕", f"sources:remove:{index}"),
+            ("▲ Up", f"sources:move:{index}:up"),
+            ("▼ Down", f"sources:move:{index}:down"),
+            ("🗑 Delete Jobs", f"sources:delete:{index}"),
         ])
     rows += [
         [("⬅️ Source Queue", "sources:view")],
@@ -1012,6 +1016,64 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 selected[index], selected[target] = selected[target], selected[index]
             await edit(query, _source_queue_text(user_id, path), _source_queue_menu(user_id, path))
             await query.answer()
+            return
+        if data.startswith("sources:delete:"):
+            index = int(data.rsplit(":", 1)[1])
+            selected = _selection_for(user_id, path)["sources"]
+            if not 0 <= index < len(selected):
+                await query.answer("Source queue changed. Open Arrange Queue again.", show_alert=True)
+                return
+            chat = selected[index]
+            title = _channel_title(user_id, chat)[:60]
+            await edit(
+                query,
+                "\n".join([
+                    "🗑 Delete Source Jobs?",
+                    "",
+                    title,
+                    "",
+                    "This permanently removes the source from the queue, adds it to the blacklist, and deletes all saved migration jobs and checkpoints.",
+                    "",
+                    "It will not be scanned again. The next source will start automatically.",
+                ]),
+                _buttons([
+                    [("🗑 Delete Permanently", f"sources:purge:{index}")],
+                    [("⬅️ Cancel", "sources:queue")],
+                ]),
+            )
+            await query.answer()
+            return
+        if data.startswith("sources:purge:"):
+            index = int(data.rsplit(":", 1)[1])
+            selected = _selection_for(user_id, path)["sources"]
+            if not 0 <= index < len(selected):
+                await query.answer("Source queue changed. Nothing was deleted.", show_alert=True)
+                return
+            chat = selected[index]
+            title = _channel_title(user_id, chat)[:60]
+            try:
+                db = _database(config)
+                try:
+                    deleted = MessageQueue(db, config).purge_source_jobs(chat)
+                finally:
+                    db.close()
+                blacklisted = blacklist_source(chat, path)
+            except Exception as exc:
+                await query.answer(
+                    f"Could not delete source jobs: {exc.__class__.__name__}: {exc}"[:190],
+                    show_alert=True,
+                )
+                return
+            selected["sources"] = [
+                value for value in selected["sources"] if str(value).lower() != blacklisted.lower()
+            ]
+            _request_mode(config, "run")
+            await query.answer(
+                f"Deleted {deleted['jobs']} saved job(s) for {title}. Starting the next source.",
+                show_alert=True,
+            )
+            await edit(query, _dashboard_text(config), _menu())
+            start_live(user_id, query.message)
             return
         if data.startswith("sources:remove:"):
             index = int(data.rsplit(":", 1)[1])
