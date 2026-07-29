@@ -1,7 +1,8 @@
 from pathlib import Path
 
-from app.dashboard_v2 import active_source_progress, dashboard_snapshot, source_migration_progress
+from app.dashboard_v2 import active_source_progress, dashboard_snapshot, issue_center, source_migration_progress
 from app.db import Database
+from app.release3_store import Release3Store
 
 
 def _enqueue(
@@ -126,6 +127,43 @@ def test_source_migration_percentage_uses_registered_channel_title(tmp_path: Pat
         )
 
         assert source_migration_progress(db)[0]["title"] == "Primary Channel"
+    finally:
+        db.close()
+
+
+def test_issue_center_exposes_failed_verification_with_its_job_number(tmp_path: Path) -> None:
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        _enqueue(
+            db,
+            source_message_id=7,
+            dest_chat_id="-100101",
+            file_unique_key="item:7",
+            status="copied",
+        )
+        row = db.query_one("SELECT id FROM messages WHERE source_message_id = ?", (7,))
+        assert row is not None
+        store = Release3Store(db)
+        store.initialize()
+        store.record_verification(
+            job_id=int(row["id"]),
+            status="failed",
+            expected_count=1,
+            present_count=0,
+            media_match=False,
+            caption_match=False,
+            size_match=False,
+            missing_source_message_ids=[7],
+        )
+
+        issues = issue_center(db)
+
+        assert issues[0]["kind"] == "verification"
+        assert issues[0]["id"] == int(row["id"])
+        assert issues[0]["source_message_id"] == 7
+        assert "destination has 0/1 item(s)" in issues[0]["error"]
+        assert "missing source item(s): 7" in issues[0]["error"]
     finally:
         db.close()
 
