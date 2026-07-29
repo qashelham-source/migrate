@@ -115,7 +115,7 @@ def test_source_migration_percentage_uses_registered_channel_title(tmp_path: Pat
         )
         db.execute(
             "INSERT INTO source_registry (source_chat_id, title) VALUES (?, ?)",
-            ("-100001", "Channel Utama"),
+            ("-100001", "Primary Channel"),
         )
         _enqueue(
             db,
@@ -125,7 +125,7 @@ def test_source_migration_percentage_uses_registered_channel_title(tmp_path: Pat
             status="copied",
         )
 
-        assert source_migration_progress(db)[0]["title"] == "Channel Utama"
+        assert source_migration_progress(db)[0]["title"] == "Primary Channel"
     finally:
         db.close()
 
