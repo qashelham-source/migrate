@@ -1,4 +1,4 @@
-name: Test and package
+name: Test, secure, and package
 
 on:
   push:
@@ -13,21 +13,34 @@ permissions:
 jobs:
   test-and-package:
     runs-on: ubuntu-latest
+    env:
+      API_ID: "12345"
+      API_HASH: "ci-test-hash"
+      BOT_TOKEN: "123456:ci-test-token"
+      ADMIN_USER_ID: "12345"
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
 
-      - name: Install dependencies
+      - name: Install dependencies and audit tools
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest
+          pip install pytest ruff pip-audit
+
+      - name: Check fatal Python errors
+        run: python -m ruff check --select E9,F63,F7,F82 app tests main.py bot.py optimize_database.py reliability_check.py
 
       - name: Compile Python files
-        run: python -m compileall -q app main.py bot.py
+        run: python -m compileall -q app tests main.py bot.py optimize_database.py reliability_check.py
 
       - name: Run tests
         shell: bash
@@ -43,6 +56,14 @@ jobs:
           path: pytest.log
           if-no-files-found: warn
 
+      - name: Audit Python dependencies
+        run: python -m pip_audit --requirement requirements.txt
+
+      - name: Scan changed history for secrets
+        uses: gitleaks/gitleaks-action@v2.3.4
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Validate Docker Compose
         run: |
           cp config.example.yaml config.yaml
@@ -50,6 +71,27 @@ jobs:
 
       - name: Build Docker image
         run: docker build -t migration-manager:test .
+
+      - name: Verify fresh database startup in read-only container
+        run: |
+          docker run --rm \
+            --read-only \
+            --tmpfs /tmp:size=256m,mode=1777 \
+            -e API_ID \
+            -e API_HASH \
+            -e BOT_TOKEN \
+            -e ADMIN_USER_ID \
+            migration-manager:test \
+            /bin/sh -c 'cp /app/config.example.yaml /tmp/config.yaml && python /app/optimize_database.py --config /tmp/config.yaml && python /app/reliability_check.py --config /tmp/config.yaml --deep'
+
+      - name: Scan container for high-severity vulnerabilities
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: migration-manager:test
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
 
       - name: Build clean ZIP
         run: |
@@ -63,7 +105,10 @@ jobs:
                'config.yaml*' \
                'sessions/*' \
                'data/*' \
-               'downloads/*'
+               'downloads/*' \
+               'backups/*' \
+               '*.zip' \
+               '*.zip.zip'
 
       - name: Upload ZIP artifact
         uses: actions/upload-artifact@v4
