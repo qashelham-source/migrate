@@ -341,18 +341,27 @@ class Release3Store:
         row = self.db.query_one(
             """
             SELECT
-                MAX(source_message_id) AS highest,
-                SUM(CASE WHEN status IN ('pending', 'downloading', 'uploading', 'failed') THEN 1 ELSE 0 END) AS open_jobs,
-                SUM(CASE WHEN status = 'skipped' AND LOWER(COALESCE(last_error, '')) NOT LIKE '%filtered out by config%' THEN 1 ELSE 0 END) AS issue_jobs,
-                SUM(CASE WHEN status = 'copied' AND verified_at IS NULL
+                MAX(CASE
+                    WHEN m.file_unique_key NOT LIKE 'repair:%' THEN m.source_message_id
+                    ELSE 0
+                END) AS highest,
+                SUM(CASE WHEN m.status IN ('pending', 'downloading', 'uploading') THEN 1 ELSE 0 END) AS open_jobs,
+                SUM(CASE
+                    WHEN m.status = 'failed'
+                     OR (m.status = 'skipped'
+                         AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%')
+                     OR vr.status = 'failed'
+                    THEN 1 ELSE 0
+                END) AS issue_jobs,
+                SUM(CASE WHEN m.status = 'copied' AND m.verified_at IS NULL
                     AND NOT EXISTS (
                         SELECT 1 FROM verification_results vr
-                        WHERE vr.job_id = messages.id
+                        WHERE vr.job_id = m.id
                           AND vr.status IN ('verified', 'verified_repaired')
                     ) THEN 1 ELSE 0 END) AS unverified_jobs
-            FROM messages
-            WHERE source_chat_id = ?
-              AND file_unique_key NOT LIKE 'repair:%'
+            FROM messages m
+            LEFT JOIN verification_results vr ON vr.job_id = m.id
+            WHERE m.source_chat_id = ?
             """,
             (source_id,),
         )
