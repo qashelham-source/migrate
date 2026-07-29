@@ -150,6 +150,53 @@ class Scanner:
             deleted_jobs=summary["jobs"],
         )
 
+    def _history_clear_arrived(
+        self,
+        history_clear_pending_at_start: bool,
+        source_chat_id: int | str,
+        source_topic_id: int | None,
+    ) -> bool:
+        return (
+            not history_clear_pending_at_start
+            and self.queue.history_clear_is_pending(
+                source_chat_id,
+                source_topic_id=source_topic_id,
+            )
+        )
+
+    def _finish_history_clear(
+        self,
+        *,
+        source_chat_id: int | str,
+        source_topic_id: int | None,
+        source_title: str,
+        source_index: int,
+        source_total: int,
+    ) -> None:
+        checkpoint = self.queue.get_scan_checkpoint(source_chat_id, source_topic_id) or 0
+        summary = self.queue.clear_source_history(
+            source_chat_id,
+            checkpoint,
+            source_topic_id=source_topic_id,
+        )
+        if self.logger:
+            self.logger.info(
+                "Source %s old history was cleared by an admin; removed %s saved job(s)",
+                source_chat_id,
+                summary["jobs"],
+            )
+        write_status(
+            self.config,
+            "source_complete",
+            message="Old source jobs were cleared. Only future posts will migrate.",
+            source=source_title,
+            source_chat=source_chat_id,
+            source_index=source_index,
+            source_total=source_total,
+            deleted_jobs=summary["jobs"],
+            checkpoint=summary["checkpoint"],
+        )
+
     async def scan(self, stop_event: asyncio.Event) -> None:
         destinations = await self._resolve_destinations()
         sources = [source for source in self.config.sources if source.chat and not _is_placeholder(source.chat)]
@@ -256,6 +303,20 @@ class Scanner:
             )
             return
 
+        history_clear_pending_at_start = self.queue.history_clear_is_pending(
+            resolved_source.chat_id,
+            source_topic_id=resolved_source.topic_id,
+        )
+        if self.scan_mode == "full" and history_clear_pending_at_start:
+            self._finish_history_clear(
+                source_chat_id=resolved_source.chat_id,
+                source_topic_id=resolved_source.topic_id,
+                source_title=str(resolved_source.title or source.chat),
+                source_index=source_index,
+                source_total=source_total,
+            )
+            return
+
         configured_start = source.start_id if source.start_id is not None else 1
         latest_message_id: int | None = None
         if source.end_id is None:
@@ -353,6 +414,19 @@ class Scanner:
                     source_total=source_total,
                 )
                 return
+            if self._history_clear_arrived(
+                history_clear_pending_at_start,
+                resolved_source.chat_id,
+                resolved_source.topic_id,
+            ):
+                self._finish_history_clear(
+                    source_chat_id=resolved_source.chat_id,
+                    source_topic_id=resolved_source.topic_id,
+                    source_title=str(resolved_source.title or source.chat),
+                    source_index=source_index,
+                    source_total=source_total,
+                )
+                return
             chunk_end = min(chunk_start + chunk_size - 1, plan.end_id)
             scanned = chunk_end - plan.start_id + 1
             write_status(
@@ -403,6 +477,19 @@ class Scanner:
                 self._discard_removed_source(
                     source=source,
                     source_chat_id=resolved_source.chat_id,
+                    source_title=str(resolved_source.title or source.chat),
+                    source_index=source_index,
+                    source_total=source_total,
+                )
+                return
+            if self._history_clear_arrived(
+                history_clear_pending_at_start,
+                resolved_source.chat_id,
+                resolved_source.topic_id,
+            ):
+                self._finish_history_clear(
+                    source_chat_id=resolved_source.chat_id,
+                    source_topic_id=resolved_source.topic_id,
                     source_title=str(resolved_source.title or source.chat),
                     source_index=source_index,
                     source_total=source_total,
@@ -472,12 +559,25 @@ class Scanner:
             )
             return
 
-        # Catch a delete request that arrived while the final group was being
-        # added, before a checkpoint can make the old source look complete.
+        # Catch a delete or history-clear request that arrived while the final
+        # group was being added, before a checkpoint can make old work return.
         if self._source_was_removed(source, resolved_source.chat_id):
             self._discard_removed_source(
                 source=source,
                 source_chat_id=resolved_source.chat_id,
+                source_title=str(resolved_source.title or source.chat),
+                source_index=source_index,
+                source_total=source_total,
+            )
+            return
+        if self._history_clear_arrived(
+            history_clear_pending_at_start,
+            resolved_source.chat_id,
+            resolved_source.topic_id,
+        ):
+            self._finish_history_clear(
+                source_chat_id=resolved_source.chat_id,
+                source_topic_id=resolved_source.topic_id,
                 source_title=str(resolved_source.title or source.chat),
                 source_index=source_index,
                 source_total=source_total,
