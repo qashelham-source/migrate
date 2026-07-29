@@ -182,46 +182,46 @@ def _source_outcome(
     if terminal_issues:
         return CycleOutcome(
             "blocked",
-            message="Ada job gagal atau verification gagal yang perlu semakan manual.",
+            message="A job failed or verification failed and needs manual review.",
             **common,
         )
     if int(state["paused_jobs"]):
         return CycleOutcome(
             "blocked",
-            message="Destination untuk source ini dipause dan perlu dibetulkan dahulu.",
+            message="A destination for this source is paused and must be fixed first.",
             **common,
         )
     if int(state["active_jobs"]):
         return CycleOutcome(
             "blocked",
-            message="Ada job lama masih bertanda sedang diproses. Ia ditahan untuk elak upload berganda.",
+            message="An older job is still marked as in progress. It is held to prevent a duplicate upload.",
             **common,
         )
     if int(state["delayed_jobs"]):
         return CycleOutcome(
             "retry",
             next_retry_at=state.get("next_retry_at"),
-            message="Retry automatik telah dijadualkan untuk source ini.",
+            message="An automatic retry has been scheduled for this source.",
             **common,
         )
     if int(state["verification_pending_jobs"]):
         return CycleOutcome(
             "retry",
             retry_after_seconds=60,
-            message="Menunggu verification semula sebelum source seterusnya.",
+            message="Waiting to retry verification before moving to the next source.",
             **common,
         )
     if int(state["verification_repairing_jobs"]):
         return CycleOutcome(
             "blocked",
-            message="Repair verification masih belum lengkap. Semak Issue Center sebelum sambung.",
+            message="Repair verification is not complete yet. Check Issue Center before continuing.",
             **common,
         )
     if int(state["runnable_jobs"]):
         return CycleOutcome(
             "retry",
             retry_after_seconds=2,
-            message="Masih ada job sah untuk diproses; worker akan sambung sendiri.",
+            message="Runnable work remains; the worker will continue automatically.",
             **common,
         )
     return CycleOutcome("complete", **common)
@@ -258,7 +258,7 @@ async def warm_dialog_cache(
     write_status(
         config,
         "starting",
-        message="Memuatkan cache dialog dan channel Telegram...",
+        message="Loading Telegram dialog and channel cache...",
         target_peers=len(targets),
     )
     if logger:
@@ -295,7 +295,7 @@ async def warm_dialog_cache(
     write_status(
         config,
         "starting",
-        message="Cache dialog Telegram selesai dimuatkan.",
+        message="Telegram dialog cache loaded.",
         dialogs_loaded=loaded,
         matched_peers=len(found),
         missing_peers=len(missing),
@@ -394,7 +394,7 @@ async def _write_initial_wait_status(
         write_status(
             config,
             "waiting",
-            message="Tetapkan sekurang-kurangnya satu source dan satu destination dahulu.",
+            message="Set at least one source and one destination first.",
             source="set" if sources else "missing",
             destination="set" if destinations else "missing",
         )
@@ -407,7 +407,7 @@ async def _write_initial_wait_status(
             write_status(
                 config,
                 "blocked",
-                message="Source tidak dapat diakses. Queue tidak dijalankan secara automatik.",
+                message="The source cannot be accessed. The queue will not run automatically.",
                 source=source.chat,
                 source_index=source_index,
                 source_total=len(sources),
@@ -438,8 +438,8 @@ async def _write_initial_wait_status(
                 config,
                 "blocked",
                 message=(
-                    "Source queue mempunyai isu yang perlu perhatian. "
-                    "Source seterusnya kekal dalam waiting list."
+                    "This source queue needs attention. "
+                    "Later sources remain in the waiting list."
                 ),
                 last_error=state.get("last_error"),
                 **details,
@@ -449,8 +449,8 @@ async def _write_initial_wait_status(
                 config,
                 "queued",
                 message=(
-                    "Source queue mempunyai kerja tertangguh. Tekan Start Queue untuk sambung; "
-                    "tiada migration dimulakan secara automatik selepas restart."
+                    "This source queue has pending work. Tap Start Queue to continue; "
+                    "migration does not start automatically after a restart."
                 ),
                 retry_at=outcome.next_retry_at,
                 last_error=state.get("last_error"),
@@ -461,7 +461,7 @@ async def _write_initial_wait_status(
     write_status(
         config,
         "watching",
-        message="Live Watcher aktif. Menunggu post baharu atau arahan admin sebelum migration dijalankan.",
+        message="Live Watcher is active. Waiting for a new post or an admin command before migration starts.",
         live_watcher=True,
         watched_sources=watched_sources,
         reconciliation_seconds=reconciliation_seconds,
@@ -502,7 +502,7 @@ async def _execute_cycle(
     write_status(
         config,
         "starting",
-        message="Telegram connected. Menyediakan migration cycle.",
+        message="Telegram connected. Preparing migration cycle.",
         reader_id=reader_me.id,
         writer="user" if writer is reader else "bot",
         cycle_mode=cycle_mode,
@@ -529,24 +529,24 @@ async def _execute_cycle(
         write_status(
             config,
             "waiting",
-            message="Tetapkan sekurang-kurangnya satu source dan satu destination dahulu.",
+            message="Set at least one source and one destination first.",
             source="set" if sources else "missing",
             destination="set" if destinations else "missing",
         )
         return CycleOutcome(
             "blocked",
-            message="Source atau destination belum lengkap.",
+            message="The source or destination is not configured.",
         )
     if not destinations_ready:
         write_status(
             config,
             "blocked",
-            message="Destination tidak dapat diakses. Source queue ditahan dengan selamat.",
+            message="The destination cannot be accessed. The source queue is safely paused.",
             destination_count=len(destinations),
         )
         return CycleOutcome(
             "blocked",
-            message="Destination belum sedia untuk upload.",
+            message="The destination is not ready for upload.",
         )
 
     source_total = len(sources)
@@ -560,7 +560,7 @@ async def _execute_cycle(
             write_status(
                 config,
                 "blocked",
-                message="Source tidak dapat diakses. Source seterusnya kekal dalam waiting list.",
+                message="The source cannot be accessed. Later sources remain in the waiting list.",
                 source=source.chat,
                 source_index=source_index,
                 source_total=source_total,
@@ -570,7 +570,7 @@ async def _execute_cycle(
                 "blocked",
                 source_index=source_index,
                 source_total=source_total,
-                message="Source tidak dapat diakses.",
+                message="The source cannot be accessed.",
             )
 
         source_chat_id = int(resolved_source.chat_id)
@@ -599,7 +599,7 @@ async def _execute_cycle(
                 write_status(
                     config,
                     "queued",
-                    message="Scan selesai. Queue source ini menunggu arahan process/run.",
+                    message="Scan complete. This source queue is waiting for a Process/Run command.",
                     **_source_status_details(
                         state,
                         source=source_title,
@@ -613,7 +613,7 @@ async def _execute_cycle(
                     source_chat_id=source_chat_id,
                     source_index=source_index,
                     source_total=source_total,
-                    message="Scan membina queue tetapi tidak memulakan worker.",
+                    message="Scan built the queue but did not start the worker.",
                 )
             continue
 
@@ -666,7 +666,7 @@ async def _execute_cycle(
                 write_status(
                     config,
                     "source_complete",
-                    message="Source siap. Meneruskan ke source seterusnya dalam queue.",
+                    message="Source complete. Moving to the next source in the queue.",
                     **_source_status_details(
                         state,
                         source=source_title,
@@ -704,12 +704,12 @@ async def _execute_cycle(
         return outcome
 
     if stop_event.is_set():
-        return CycleOutcome("blocked", message="Migration dihentikan.")
+        return CycleOutcome("blocked", message="Migration was stopped.")
 
     write_status(
         config,
         "source_complete",
-        message="Semua source dalam queue telah siap untuk cycle ini.",
+        message="All sources in the queue are complete for this cycle.",
         source_total=source_total,
         cycle_mode=cycle_mode,
     )
@@ -767,7 +767,7 @@ async def _run_live_service(
             write_status(
                 config,
                 "starting",
-                message="Live Watcher aktif. Menjalankan cycle migration.",
+                message="Live Watcher is active. Running migration cycle.",
                 live_watcher=True,
                 watched_sources=len(trigger.source_ids),
                 reconciliation_seconds=trigger.settings.reconcile_interval_seconds,
@@ -816,7 +816,7 @@ async def _run_live_service(
             write_status(
                 config,
                 "watching",
-                message="Live Watcher menunggu post baharu; semua source aktif telah selesai.",
+                message="Live Watcher is waiting for new posts; all active sources are complete.",
                 live_watcher=True,
                 watched_sources=len(trigger.source_ids),
                 reconciliation_seconds=trigger.settings.reconcile_interval_seconds,
@@ -867,7 +867,7 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
         write_status(
             config,
             "starting",
-            message="Menyambung ke Telegram...",
+            message="Connecting to Telegram...",
             cycle_mode="service" if command == "serve" else command,
         )
         stop_watcher = asyncio.create_task(watch_stop_request(config, stop_event))
@@ -921,14 +921,14 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
                 write_status(
                     config,
                     "stopped",
-                    message="Migration dihentikan dengan selamat.",
+                    message="Migration stopped safely.",
                     **queue.counts_by_status(),
                 )
     except Exception as exc:
         write_status(
             config,
             "error",
-            message="Migration cycle berhenti kerana ralat.",
+            message="Migration cycle stopped because of an error.",
             error=f"{exc.__class__.__name__}: {exc}"[:1000],
             **queue.counts_by_status(),
         )
