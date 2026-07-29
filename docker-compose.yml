@@ -2,14 +2,26 @@ services:
   migration-manager:
     build:
       context: .
+      args:
+        APP_UID: "${APP_UID:-10001}"
+        APP_GID: "${APP_GID:-10001}"
     container_name: migration-manager
     restart: unless-stopped
     init: true
+    user: "${APP_UID:-10001}:${APP_GID:-10001}"
     working_dir: /app
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=256m,mode=1777
     environment:
       API_ID: "${API_ID:-}"
       API_HASH: "${API_HASH:-}"
       BOT_TOKEN: "${BOT_TOKEN:-}"
+      ADMIN_USER_ID: "${ADMIN_USER_ID:-}"
       RUN_INTERVAL_SECONDS: "${RUN_INTERVAL_SECONDS:-300}"
       LIVE_RECONCILE_SECONDS: "${LIVE_RECONCILE_SECONDS:-300}"
       LIVE_EVENT_DEBOUNCE_SECONDS: "${LIVE_EVENT_DEBOUNCE_SECONDS:-2}"
