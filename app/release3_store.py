@@ -197,6 +197,82 @@ class Release3Store:
         )
         return [dict(row) for row in rows]
 
+    def purge_source_jobs(self, source_chat_id: int | str) -> dict[str, int]:
+        """Permanently remove one source's queue state without touching media cache.
+
+        The admin flow also blacklists the source. Removing its checkpoints as
+        well as its jobs is important: a future queue run must not revive old
+        work from the deleted source.
+        """
+        requested_id = str(source_chat_id)
+        source_ids = {requested_id}
+        username = requested_id.lstrip("@").lower()
+        if requested_id.startswith("@") and username:
+            try:
+                rows = self.db.query(
+                    """
+                    SELECT source_chat_id
+                    FROM source_registry
+                    WHERE LOWER(COALESCE(username, '')) IN (?, ?)
+                    """,
+                    (username, f"@{username}"),
+                )
+            except Exception:
+                rows = []
+            source_ids.update(str(row["source_chat_id"]) for row in rows)
+
+        ids = sorted(source_ids)
+        placeholders = ", ".join("?" for _ in ids)
+        source_filter = f"source_chat_id IN ({placeholders})"
+        job_subquery = f"SELECT id FROM messages WHERE {source_filter}"
+        conn = self.db.conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            job_row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM messages WHERE {source_filter}",
+                ids,
+            ).fetchone()
+            checkpoint_row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM scan_checkpoints WHERE {source_filter}",
+                ids,
+            ).fetchone()
+            jobs = int(job_row["count"] if job_row else 0)
+            checkpoints = int(checkpoint_row["count"] if checkpoint_row else 0)
+
+            conn.execute(
+                f"""
+                DELETE FROM repair_links
+                WHERE parent_job_id IN ({job_subquery})
+                   OR repair_job_id IN ({job_subquery})
+                """,
+                (*ids, *ids),
+            )
+            conn.execute(
+                f"DELETE FROM verification_results WHERE job_id IN ({job_subquery})",
+                ids,
+            )
+            conn.execute(
+                f"DELETE FROM job_telemetry WHERE job_id IN ({job_subquery})",
+                ids,
+            )
+            conn.execute(
+                f"""
+                DELETE FROM repair_actions
+                WHERE source_chat_id IN ({placeholders})
+                   OR job_id IN ({job_subquery})
+                """,
+                (*ids, *ids),
+            )
+            conn.execute(f"DELETE FROM messages WHERE {source_filter}", ids)
+            conn.execute(f"DELETE FROM scan_checkpoints WHERE {source_filter}", ids)
+            conn.execute(f"DELETE FROM source_registry WHERE {source_filter}", ids)
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+        return {"jobs": jobs, "checkpoints": checkpoints, "sources": len(ids)}
+
     def recompute_source_state(self, source_chat_id: int | str) -> dict[str, Any]:
         source_id = str(source_chat_id)
         row = self.db.query_one(
