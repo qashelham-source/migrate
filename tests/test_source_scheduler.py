@@ -220,6 +220,42 @@ def test_purging_a_blacklisted_source_deletes_its_jobs_and_checkpoints(tmp_path:
         db.close()
 
 
+def test_clearing_old_source_history_keeps_future_posts_enabled(tmp_path: Path) -> None:
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, _config(tmp_path))  # type: ignore[arg-type]
+        queue.register_source(
+            source_chat_id=-100001,
+            title="Keep watching",
+            username="keep_watching",
+            chat_type="channel",
+            latest_seen_message_id=500,
+        )
+        _enqueue(queue, source_chat_id=-100001, source_message_id=1)
+        _enqueue(queue, source_chat_id=-100002, source_message_id=1)
+        queue.set_scan_checkpoint(-100001, 77, 10, "full")
+
+        cleared = queue.clear_source_history(-100001, 500)
+
+        assert cleared["jobs"] == 1
+        assert cleared["checkpoint"] == 500
+        assert db.query_one("SELECT 1 FROM messages WHERE source_chat_id = ?", ("-100001",)) is None
+        assert db.query_one("SELECT 1 FROM messages WHERE source_chat_id = ?", ("-100002",)) is not None
+        checkpoint = db.get_scan_checkpoint(-100001)
+        assert checkpoint is not None
+        assert int(checkpoint["last_scanned_message_id"]) == 500
+        assert checkpoint["last_scan_mode"] == "skip_history"
+        assert queue.history_clear_is_pending(-100001)
+        assert db.query_one("SELECT 1 FROM source_registry WHERE source_chat_id = ?", ("-100001",)) is not None
+
+        queue.set_scan_checkpoint(-100001, None, 501, "incremental")
+
+        assert not queue.history_clear_is_pending(-100001)
+    finally:
+        db.close()
+
+
 def test_config_save_falls_back_when_bind_mounted_file_is_busy(tmp_path: Path) -> None:
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
