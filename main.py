@@ -336,36 +336,45 @@ async def choose_writer_for_destinations(
     limiter: TelegramLimiter,
     logger: Any | None = None,
 ) -> tuple[Client, bool]:
-    """Use the bot when it knows every destination; otherwise safely use the user session."""
+    """Use one writer only when it can resolve every configured destination."""
     destinations = _configured_destinations(config)
     if writer is reader or not destinations:
         return writer, True
 
-    for spec in destinations:
-        try:
-            await resolve_chat(writer, limiter, spec)
-            continue
-        except Exception as bot_error:
+    async def first_unresolved(client: Client) -> tuple[Any, Exception] | None:
+        for spec in destinations:
             try:
-                await resolve_chat(reader, limiter, spec)
-            except Exception as reader_error:
-                if logger:
-                    logger.warning(
-                        "Destination %s cannot be resolved by writer or reader: writer=%s reader=%s",
-                        spec.chat,
-                        bot_error,
-                        reader_error,
-                    )
-                return writer, False
+                await resolve_chat(client, limiter, spec)
+            except Exception as exc:
+                return spec, exc
+        return None
 
-            if logger:
-                logger.warning(
-                    "Writer bot cannot resolve private destination %s; using user session for this cycle",
-                    spec.chat,
-                )
-            return reader, True
+    writer_failure = await first_unresolved(writer)
+    if writer_failure is None:
+        return writer, True
 
-    return writer, True
+    reader_failure = await first_unresolved(reader)
+    if reader_failure is None:
+        if logger:
+            spec, error = writer_failure
+            logger.warning(
+                "Writer bot cannot resolve destination %s (%s); using the user session for every destination this cycle",
+                spec.chat,
+                error,
+            )
+        return reader, True
+
+    if logger:
+        writer_spec, writer_error = writer_failure
+        reader_spec, reader_error = reader_failure
+        logger.warning(
+            "No single writer can resolve every destination: writer failed %s (%s); reader failed %s (%s)",
+            writer_spec.chat,
+            writer_error,
+            reader_spec.chat,
+            reader_error,
+        )
+    return writer, False
 
 
 async def _resume_healthy_destinations(
