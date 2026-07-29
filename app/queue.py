@@ -102,25 +102,44 @@ class MessageQueue:
             last_error=last_error,
         )
 
-    def fetch_due(self, limit: int) -> list[MessageJob]:
+    def fetch_due(
+        self,
+        limit: int,
+        source_chat_id: int | str | None = None,
+    ) -> list[MessageJob]:
+        source_clause = ""
+        source_params: tuple[Any, ...] = ()
+        if source_chat_id is not None:
+            source_clause = " AND m.source_chat_id = ?"
+            source_params = (str(source_chat_id),)
         rows = self.db.query(
-            """
+            f"""
             SELECT m.*
             FROM messages m
             LEFT JOIN destination_health dh ON dh.dest_chat_id = m.dest_chat_id
             WHERE m.status = 'pending'
               AND (m.next_retry_at IS NULL OR m.next_retry_at <= ?)
               AND COALESCE(dh.paused, 0) = 0
+              {source_clause}
             ORDER BY m.updated_at ASC, m.id ASC
             LIMIT ?
             """,
-            (utc_now(), max(1, int(limit))),
+            (utc_now(), *source_params, max(1, int(limit))),
         )
         return [MessageJob.from_row(row) for row in rows]
 
-    def fetch_for_verification(self, limit: int) -> list[MessageJob]:
+    def fetch_for_verification(
+        self,
+        limit: int,
+        source_chat_id: int | str | None = None,
+    ) -> list[MessageJob]:
+        source_clause = ""
+        source_params: tuple[Any, ...] = ()
+        if source_chat_id is not None:
+            source_clause = " AND m.source_chat_id = ?"
+            source_params = (str(source_chat_id),)
         rows = self.db.query(
-            """
+            f"""
             SELECT m.*
             FROM messages m
             LEFT JOIN verification_results vr ON vr.job_id = m.id
@@ -128,16 +147,24 @@ class MessageQueue:
               AND m.dest_message_ids IS NOT NULL
               AND m.verified_at IS NULL
               AND (vr.status IS NULL OR vr.status NOT IN ('verified', 'verified_repaired', 'failed', 'repairing'))
+              {source_clause}
             ORDER BY m.updated_at ASC, m.id ASC
             LIMIT ?
             """,
-            (max(1, int(limit)),),
+            (*source_params, max(1, int(limit))),
         )
         return [MessageJob.from_row(row) for row in rows]
 
-    def claim_due(self, limit: int) -> list[MessageJob]:
+    def claim_due(
+        self,
+        limit: int,
+        source_chat_id: int | str | None = None,
+    ) -> list[MessageJob]:
         """Claim work before processing so a second worker cannot send the same job."""
-        jobs = [MessageJob.from_row(row) for row in self.db.claim_due_messages(limit)]
+        jobs = [
+            MessageJob.from_row(row)
+            for row in self.db.claim_due_messages(limit, source_chat_id=source_chat_id)
+        ]
         for job in jobs:
             self.release3.start_telemetry(job.id, job.file_size)
         return jobs
@@ -310,8 +337,11 @@ class MessageQueue:
     def requeue_peer_id_errors(self) -> int:
         return self.db.requeue_peer_id_errors()
 
-    def counts_by_status(self) -> dict[str, int]:
-        return self.db.counts_by_status()
+    def counts_by_status(self, source_chat_id: int | str | None = None) -> dict[str, int]:
+        return self.db.counts_by_status(source_chat_id)
+
+    def source_work_state(self, source_chat_id: int | str) -> dict[str, Any]:
+        return self.db.source_work_state(source_chat_id)
 
     def get_scan_checkpoint(
         self,
