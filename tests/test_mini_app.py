@@ -8,6 +8,7 @@ from urllib.parse import urlencode
 
 import pytest
 
+from app.admin_bot import _menu
 from app.config import load_config
 from app.db import Database
 from app.destination_manager import get_sources
@@ -84,6 +85,21 @@ mini_app:
 
     with pytest.raises(ValueError, match="HTTPS"):
         load_config(path)
+
+
+def test_admin_menu_shows_mini_app_only_for_enabled_config(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path,
+        mini_app="""
+mini_app:
+  enabled: true
+  public_url: "https://migration.example.test"
+""",
+    )
+
+    button = _menu(load_config(path)).inline_keyboard[0][0]
+    assert button.web_app is not None
+    assert button.web_app.url == "https://migration.example.test"
 
 
 def test_dashboard_hides_raw_source_ids_and_moves_queue(tmp_path: Path) -> None:
