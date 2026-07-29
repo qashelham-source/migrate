@@ -512,3 +512,65 @@ def test_expected_skip_allows_source_state_to_finish(tmp_path: Path) -> None:
         assert source["migration_state"] == "verified"
     finally:
         db.close()
+
+
+
+def test_source_queue_uses_saved_channel_titles_after_bot_restart(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path / "config.yaml",
+        migration={
+            "sources": ["-1002843617976", "-1001678732307"],
+            "destinations": ["-100999"],
+        },
+    )
+    config = load_config(path)
+    user_id = 991
+
+    admin_bot._CHANNEL_CACHE.pop(user_id, None)
+    admin_bot._SELECTIONS.pop(user_id, None)
+    admin_bot._SOURCE_TITLE_CACHE.pop(path.resolve(), None)
+    admin_bot._persist_scanned_source_titles(
+        config,
+        path,
+        [
+            {
+                "chat": "-1002843617976",
+                "title": "Awek Bigo Mango",
+                "username": None,
+                "kind": "Channel",
+            },
+            {
+                "chat": "-1001678732307",
+                "title": "Channel Kedua",
+                "username": "channel_kedua",
+                "kind": "Channel",
+            },
+        ],
+    )
+
+    try:
+        text = admin_bot._source_text(user_id, path)
+        assert "Awek Bigo Mango" in text
+        assert "Channel Kedua" in text
+        assert "-1002843617976" not in text
+        assert "Showing your saved queue." in text
+
+        root_labels = [
+            button.text
+            for row in admin_bot._source_menu(user_id, path).inline_keyboard
+            for button in row
+        ]
+        assert "🛠 Manage Queue" in root_labels
+        assert not any("New Posts" in label or "Remove Source" in label for label in root_labels)
+
+        manage_labels = [
+            button.text
+            for row in admin_bot._source_queue_menu(user_id, path).inline_keyboard
+            for button in row
+        ]
+        assert "🧹 New Posts Only" in manage_labels
+        assert "🗑 Remove Source" in manage_labels
+    finally:
+        admin_bot._CHANNEL_CACHE.pop(user_id, None)
+        admin_bot._SELECTIONS.pop(user_id, None)
+        admin_bot._SOURCE_TITLE_CACHE.pop(path.resolve(), None)
