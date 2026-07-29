@@ -19,6 +19,7 @@ REPAIR_CATEGORIES = (
     "temporary",
     "source_missing",
     "unsupported",
+    "needs_review",
     "other",
 )
 
@@ -81,6 +82,16 @@ def classify_repair_error(row: Row | dict[str, Any]) -> str:
     media_type = str(row["media_type"] or "").lower()
     error = str(row["last_error"] or "").lower()
 
+    if any(
+        marker in error
+        for marker in (
+            "destination result is unknown",
+            "verify destination before retrying manually",
+            "upload connection interrupted",
+            "interrupted during upload",
+        )
+    ):
+        return "needs_review"
     if media_type == "unsupported" or "filtered out by config" in error:
         return "unsupported"
     if "media_empty" in error or "mediaempty" in error:
@@ -203,7 +214,8 @@ def requeue_repair_category(db: Database, category: str) -> int:
 
 
 def requeue_retryable_repairs(db: Database) -> int:
+    """Return only errors that are safe to retry without risking duplicate uploads."""
     total = 0
-    for category in ("media_empty", "peer_id", "temporary", "other"):
+    for category in ("media_empty", "peer_id", "temporary"):
         total += requeue_repair_category(db, category)
     return total
