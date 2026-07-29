@@ -180,6 +180,10 @@ class MessageQueue:
     def mark_skipped(self, job_id: int, reason: str) -> None:
         self.db.set_status(job_id, "skipped", last_error=reason)
         self.release3.finish_telemetry(job_id, stage="skipped")
+        parent_job_id = self.release3.fail_repair_job(job_id, reason)
+        row = self.db.query_one("SELECT source_chat_id FROM messages WHERE id = ?", (parent_job_id or job_id,))
+        if row:
+            self.release3.recompute_source_state(row["source_chat_id"])
 
     def mark_verified(self, job_id: int) -> None:
         self.db.set_status(job_id, "copied", verified_at=utc_now())
@@ -192,7 +196,13 @@ class MessageQueue:
         if attempts >= self.config.queue.max_attempts:
             self.db.set_status(job.id, "failed", last_error=error)
             self.release3.finish_telemetry(job.id, stage="failed")
-            self.release3.recompute_source_state(job.source_chat_id)
+            parent_job_id = self.release3.fail_repair_job(job.id, error)
+            row = self.db.query_one(
+                "SELECT source_chat_id FROM messages WHERE id = ?",
+                (parent_job_id or job.id,),
+            )
+            if row:
+                self.release3.recompute_source_state(row["source_chat_id"])
             return "failed"
         backoff = self._backoff_for_attempt(attempts)
         next_retry = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat(timespec="seconds")
@@ -222,7 +232,13 @@ class MessageQueue:
         )
         self.db.set_status(job.id, "failed", last_error=reason)
         self.release3.finish_telemetry(job.id, stage="failed")
-        self.release3.recompute_source_state(job.source_chat_id)
+        parent_job_id = self.release3.fail_repair_job(job.id, reason)
+        row = self.db.query_one(
+            "SELECT source_chat_id FROM messages WHERE id = ?",
+            (parent_job_id or job.id,),
+        )
+        if row:
+            self.release3.recompute_source_state(row["source_chat_id"])
         return reason
 
     def enqueue_repair_item(self, parent: MessageJob, source_message_id: int) -> int | None:
