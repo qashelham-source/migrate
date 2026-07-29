@@ -85,11 +85,19 @@ wait_for_health() {
 rollback() {
   echo "Deployment failed health validation. Rolling back to $PREVIOUS_SHA." >&2
   docker compose -p "$PROJECT_NAME" logs --no-color --tail=200 migration-manager >&2 || true
+  docker compose -p "$PROJECT_NAME" down --remove-orphans || true
   git reset --hard "$PREVIOUS_SHA"
   restore_local_files
+  if [ -f "$BACKUP_DIR/migration.sqlite3" ]; then
+    cp -a "$BACKUP_DIR/migration.sqlite3" data/migration.sqlite3
+    rm -f data/migration.sqlite3-wal data/migration.sqlite3-shm
+    if [ "$(id -u)" -eq 0 ]; then
+      chown "$APP_UID:$APP_GID" data/migration.sqlite3
+    fi
+  fi
   docker compose -p "$PROJECT_NAME" config >/dev/null
   docker compose -p "$PROJECT_NAME" up -d --build --remove-orphans
-  echo "Rollback deployment started from $PREVIOUS_SHA." >&2
+  echo "Rollback deployment started from $PREVIOUS_SHA with its database snapshot." >&2
 }
 
 git fetch origin main
