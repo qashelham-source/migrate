@@ -617,6 +617,7 @@ async def _execute_cycle(
                 scan_mode="incremental" if command == "sync" else "full",
                 source_index_offset=source_index - 1,
                 source_total_override=source_total,
+                config_path=config_path,
             )
             await scanner.scan(stop_event)
 
