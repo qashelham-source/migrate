@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.db import Database
+from app.destination_manager import get_sources, set_sources
 from app.queue import MessageQueue
 
 
@@ -112,3 +113,19 @@ def test_source_work_state_ignores_filtered_items_but_holds_terminal_failure(tmp
         assert state["last_error"] == "Interrupted during upload; destination result is unknown."
     finally:
         db.close()
+
+
+def test_source_queue_order_is_preserved_when_saved(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "migration:\n  sources: []\n  destinations:\n    - chat: '@destination'\n",
+        encoding="utf-8",
+    )
+
+    set_sources(["@source-first", "@source-second", "@source-third"], config_path)
+
+    assert [item["chat"] for item in get_sources(config_path)] == [
+        "@source-first",
+        "@source-second",
+        "@source-third",
+    ]
