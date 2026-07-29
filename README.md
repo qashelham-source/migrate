@@ -12,10 +12,10 @@ Use this project only for content you own or have permission to access, copy, an
 - sequential multi-source processing
 - incremental checkpoints and live source watching
 - native Telegram copy/forward with download-and-upload fallback
-- album/media-group handling
+- filter-consistent album/media-group handling
 - reusable bot `file_id` cache
 - strong destination verification and item-level repair
-- destination pause controls and Issue Center reporting
+- fail-safe destination readiness checks and Issue Center reporting
 - Telegram admin control panel
 - FloodWait-aware operation pacing
 - storage pressure protection and progress telemetry
@@ -87,7 +87,7 @@ batch:
   pause_between_batches_seconds: 120
 ```
 
-Sources and destinations can be managed from the Telegram control panel. A destination may include a forum topic ID; queue deduplication treats different topics as different delivery targets.
+Sources and destinations can be managed from the Telegram control panel. A destination may include a forum topic ID; queue deduplication treats different topics as different delivery targets. Source forum-topic filtering is intentionally rejected at startup rather than risk scanning an entire forum when only one topic was intended.
 
 ## First login
 
@@ -126,6 +126,7 @@ Queue states are `pending`, `downloading`, `uploading`, `copied`, `failed`, and 
 - pending work is claimed atomically to prevent duplicate sends by multiple workers;
 - destination permission failures pause that destination;
 - verification mismatches are recorded for review or item-level repair;
+- a terminal repair failure changes the parent verification to `failed` for review instead of leaving it stuck in `repairing`;
 - schema initialization never changes job states.
 
 Legacy `SendMultiMedia MEDIA_EMPTY` failures are not silently requeued during startup. Retry them through the repair controls after reviewing the destination.
@@ -138,7 +139,7 @@ Start it with:
 python main.py admin
 ```
 
-Only IDs from `telegram.admin_ids`, `ADMIN_USER_ID`, or the cached owner session are accepted. The panel supports source and destination management, live status, stop requests, health checks, repair queue controls, checkpoint reset, full scans, and incremental sync.
+Only explicit IDs from `telegram.admin_ids` and `ADMIN_USER_ID` are accepted. On a first-run setup with no explicit admin ID, only the configured active user session may bootstrap access; unrelated entries in the cached account list never become admins. The panel supports source and destination management, live status, stop requests, health checks, repair queue controls, checkpoint reset, full scans, and incremental sync.
 
 ## Docker
 
@@ -157,7 +158,7 @@ docker compose config
 docker compose up -d --build
 ```
 
-The image uses a multi-stage build and runs as a non-root user. Compose drops Linux capabilities, enables `no-new-privileges`, uses a read-only root filesystem, and mounts only the required writable runtime paths.
+The image uses a multi-stage build and runs as a non-root user. Compose drops Linux capabilities, enables `no-new-privileges`, uses a read-only root filesystem, and mounts only the required writable runtime paths. The control panel can still update the writable `config.yaml` bind mount: it stages the replacement in the container's `/tmp` tmpfs and copies it back safely when an atomic rename is unavailable.
 
 Set `APP_UID` and `APP_GID` when the host directories belong to a different service account:
 
@@ -186,7 +187,7 @@ cd /opt/migration-manager
 APP_DIR=/opt/migration-manager APP_UID=10001 APP_GID=10001 bash ./deploy.sh
 ```
 
-The script requires Git, Python 3, Docker, and Docker Compose v2. Run it as root, or set `APP_UID` and `APP_GID` to the numeric IDs of the deployment user. `config.yaml` is kept at mode `600` and owned by the same UID/GID used by the container so the non-root process can read and update it.
+The script requires Git, Python 3, Docker, and Docker Compose v2. Run it as root, or set `APP_UID` and `APP_GID` to the numeric IDs of the deployment user. `config.yaml` is kept at mode `600` and owned by the same UID/GID used by the container so the non-root process can read and update it. Before updating, take a backup: the deployment script preserves the file and rollback restores the matching revision.
 
 Backups are stored under `backups/`; the ten newest are retained.
 
@@ -251,7 +252,7 @@ Dependabot monitors Python, Docker, and GitHub Actions dependencies.
 
 Immediately rotate `API_HASH`, `BOT_TOKEN`, affected Telegram sessions, and any exposed credentials if a secret enters Git history or an artifact. Deleting the file in a later commit does not remove it from history.
 
-History rewriting is intentionally not automated by `deploy.sh`. Follow `SECURITY.md`, coordinate a maintenance window, use `git filter-repo`, force-push all affected refs, and require every clone to re-clone afterward.
+This repository's legacy ZIP was deleted from the current tree but must still be treated as present in reachable history until the documented rewrite and verification are complete. History rewriting is intentionally not automated by `deploy.sh`: follow `SECURITY.md`, coordinate a maintenance window, use `git filter-repo`, force-push all affected refs only after explicit owner approval, and require every clone to re-clone afterward.
 
 ## Project layout
 
