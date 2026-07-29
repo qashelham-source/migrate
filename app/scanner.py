@@ -91,6 +91,8 @@ class Scanner:
         writer: Client | None = None,
         logger: Any | None = None,
         scan_mode: str = "full",
+        source_index_offset: int = 0,
+        source_total_override: int | None = None,
     ) -> None:
         normalized_mode = str(scan_mode).strip().lower()
         if normalized_mode not in SCAN_MODES:
@@ -102,6 +104,12 @@ class Scanner:
         self.limiter = limiter
         self.logger = logger
         self.scan_mode = normalized_mode
+        self.source_index_offset = max(0, int(source_index_offset))
+        self.source_total_override = (
+            max(1, int(source_total_override))
+            if source_total_override is not None
+            else None
+        )
 
     async def scan(self, stop_event: asyncio.Event) -> None:
         destinations = await self._resolve_destinations()
@@ -124,15 +132,17 @@ class Scanner:
             )
             return
 
-        for source_index, source in enumerate(sources, start=1):
+        source_total = self.source_total_override or len(sources)
+        for local_index, source in enumerate(sources, start=1):
             if stop_event.is_set():
                 break
+            source_index = self.source_index_offset + local_index
             await self._scan_source(
                 source,
                 destinations,
                 stop_event,
                 source_index=source_index,
-                source_total=len(sources),
+                source_total=source_total,
             )
 
     async def _resolve_destinations(self) -> list[ResolvedChat]:
@@ -256,6 +266,8 @@ class Scanner:
                 "scan_complete",
                 message="Tiada post baru untuk disync.",
                 source=resolved_source.title,
+                source_index=source_index,
+                source_total=source_total,
                 scan_mode=self.scan_mode,
                 checkpoint=checkpoint_target or plan.baseline,
                 latest_source_id=plan.end_id,
@@ -316,6 +328,8 @@ class Scanner:
                 "stopping",
                 message="Scan dihentikan dengan selamat. Checkpoint tidak digerakkan.",
                 source=resolved_source.title,
+                source_index=source_index,
+                source_total=source_total,
                 scan_mode=self.scan_mode,
                 checkpoint=plan.baseline,
             )
@@ -384,6 +398,8 @@ class Scanner:
                 "stopping",
                 message="Queue building dihentikan. Checkpoint tidak digerakkan.",
                 source=resolved_source.title,
+                source_index=source_index,
+                source_total=source_total,
                 scan_mode=self.scan_mode,
                 checkpoint=plan.baseline,
             )
@@ -413,6 +429,8 @@ class Scanner:
                 else "Full scan selesai. Memulakan pemindahan queue."
             ),
             source=resolved_source.title,
+            source_index=source_index,
+            source_total=source_total,
             added=added,
             skipped=skipped,
             existing=existing,
