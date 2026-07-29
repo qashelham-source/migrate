@@ -49,7 +49,7 @@ jobs:
 
       - name: Upload pytest log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pytest-log
           path: pytest.log
@@ -126,7 +126,7 @@ jobs:
                '*.zip.zip'
 
       - name: Upload ZIP artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: telegram-migration-fileid-final
           path: telegram-migration-fileid-final.zip
