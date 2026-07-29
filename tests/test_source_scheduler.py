@@ -5,7 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from app.db import Database
-from app.destination_manager import get_sources, set_sources
+from app.destination_manager import blacklist_source, get_source_blacklist, get_sources, set_sources
 from app.queue import MessageQueue
 
 
@@ -128,4 +128,22 @@ def test_source_queue_order_is_preserved_when_saved(tmp_path: Path) -> None:
         "@source-first",
         "@source-second",
         "@source-third",
+    ]
+
+
+def test_blacklisting_source_removes_it_from_queue_and_keeps_it_hidden(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "migration:\n  sources: []\n  destinations:\n    - chat: '@destination'\n",
+        encoding="utf-8",
+    )
+    set_sources(["@source-first", "@source-second"], config_path)
+
+    blacklisted = blacklist_source("@source-second", config_path)
+
+    assert blacklisted == "@source-second"
+    assert get_source_blacklist(config_path) == ["@source-second"]
+    assert [item["chat"] for item in get_sources(config_path)] == ["@source-first"]
+    assert [item["chat"] for item in set_sources(["@source-first", "@source-second"], config_path)] == [
+        "@source-first"
     ]
