@@ -211,17 +211,22 @@ def _source_outcome(
             message="Waiting to retry verification before moving to the next source.",
             **common,
         )
-    if int(state["verification_repairing_jobs"]):
-        return CycleOutcome(
-            "blocked",
-            message="Repair verification is not complete yet. Check Issue Center before continuing.",
-            **common,
-        )
     if int(state["runnable_jobs"]):
         return CycleOutcome(
             "retry",
             retry_after_seconds=2,
-            message="Runnable work remains; the worker will continue automatically.",
+            message=(
+                "Queued repair work will continue automatically before moving to the next source."
+                if int(state["verification_repairing_jobs"])
+                else "Runnable work remains; the worker will continue automatically."
+            ),
+            **common,
+        )
+    if int(state["verification_repairing_jobs"]):
+        return CycleOutcome(
+            "retry",
+            retry_after_seconds=5,
+            message="Repair verification is still running and will continue automatically.",
             **common,
         )
     return CycleOutcome("complete", **common)
