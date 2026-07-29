@@ -128,6 +128,22 @@ def get_source_blacklist(config_path: str | Path = "config.yaml") -> list[str]:
         return _normalised_chats(migration.get("source_blacklist") or [])
 
 
+def is_source_blacklisted(chat: str | int, config_path: str | Path = "config.yaml") -> bool:
+    """Return whether a source was explicitly removed from migration.
+
+    This is intentionally separate from the current source queue.  A source can
+    be moved out of the queue and kept for later, while a blacklisted source must
+    stop being scanned immediately.
+    """
+    try:
+        candidate = normalize_chat(chat).lower()
+        return candidate in {item.lower() for item in get_source_blacklist(config_path)}
+    except (OSError, ValueError, yaml.YAMLError):
+        # A failed config read must not interrupt an in-flight migration.  The
+        # next loop will re-check once the atomic config update is visible.
+        return False
+
+
 def get_sources(config_path: str | Path = "config.yaml") -> list[dict[str, Any]]:
     with _CONFIG_LOCK:
         _, data = _load_yaml(config_path)
