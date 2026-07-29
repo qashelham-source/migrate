@@ -338,7 +338,7 @@ async def choose_writer_for_destinations(
 ) -> tuple[Client, bool]:
     """Use one writer only when it can resolve every configured destination."""
     destinations = _configured_destinations(config)
-    if writer is reader or not destinations:
+    if not destinations:
         return writer, True
 
     async def first_unresolved(client: Client) -> tuple[Any, Exception] | None:
@@ -352,6 +352,11 @@ async def choose_writer_for_destinations(
     writer_failure = await first_unresolved(writer)
     if writer_failure is None:
         return writer, True
+    if writer is reader:
+        if logger:
+            spec, error = writer_failure
+            logger.warning("Destination %s cannot be resolved by the active user writer: %s", spec.chat, error)
+        return writer, False
 
     reader_failure = await first_unresolved(reader)
     if reader_failure is None:
