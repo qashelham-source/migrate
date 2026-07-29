@@ -5,6 +5,8 @@ import sqlite3
 from pathlib import Path
 
 from app.config import load_config
+from app.db import Database
+from app.release3_store import Release3Store
 
 
 INDEXES = (
@@ -23,7 +25,18 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def initialize_schema(path: Path) -> None:
+    """Create every table required by the optimizer on a fresh installation."""
+    database = Database(path)
+    try:
+        database.initialize()
+        Release3Store(database).initialize()
+    finally:
+        database.close()
+
+
 def optimize(path: Path) -> None:
+    initialize_schema(path)
     connection = sqlite3.connect(path, timeout=30.0)
     try:
         connection.execute("PRAGMA busy_timeout=30000")
