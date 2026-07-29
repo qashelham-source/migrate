@@ -84,6 +84,13 @@ class Database:
                 ON messages(status, next_retry_at, updated_at);
             CREATE INDEX IF NOT EXISTS idx_messages_source
                 ON messages(source_chat_id, source_message_id);
+            CREATE INDEX IF NOT EXISTS idx_messages_delivery_fingerprint
+                ON messages(
+                    dest_chat_id,
+                    COALESCE(dest_topic_id, 0),
+                    file_unique_key,
+                    status
+                );
 
             CREATE TABLE IF NOT EXISTS media_cache (
                 file_unique_key TEXT PRIMARY KEY,
@@ -166,6 +173,49 @@ class Database:
         )
         self.conn.commit()
         return cursor.rowcount > 0
+
+    def find_duplicate_media_delivery(
+        self,
+        *,
+        source_chat_id: str,
+        source_message_id: int,
+        dest_chat_id: str,
+        dest_topic_id: int | None,
+        file_unique_key: str,
+    ) -> sqlite3.Row | None:
+        """Find a matching active or copied media fingerprint for one destination.
+
+        Text fallback keys and repair jobs are deliberately excluded: this fast
+        detector is only for Telegram media fingerprints and complete albums.
+        """
+        fingerprint = str(file_unique_key)
+        if (
+            not fingerprint
+            or fingerprint.startswith("messages:")
+            or fingerprint.startswith("repair:")
+        ):
+            return None
+        return self.query_one(
+            """
+            SELECT id, source_chat_id, source_message_id, status
+            FROM messages
+            WHERE dest_chat_id = ?
+              AND COALESCE(dest_topic_id, 0) = ?
+              AND file_unique_key = ?
+              AND file_unique_key NOT LIKE 'repair:%'
+              AND status IN ('pending', 'downloading', 'uploading', 'copied')
+              AND (source_chat_id != ? OR source_message_id != ?)
+            ORDER BY CASE status WHEN 'copied' THEN 0 ELSE 1 END, id ASC
+            LIMIT 1
+            """,
+            (
+                str(dest_chat_id),
+                _topic_key(dest_topic_id),
+                fingerprint,
+                str(source_chat_id),
+                int(source_message_id),
+            ),
+        )
 
     def set_status(
         self,
