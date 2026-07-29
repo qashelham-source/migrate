@@ -435,10 +435,32 @@ class Database:
                     AS active_jobs,
                 SUM(CASE WHEN m.status = 'failed' THEN 1 ELSE 0 END) AS failed_jobs,
                 SUM(CASE
+                    WHEN m.status = 'failed'
+                     AND m.file_unique_key NOT LIKE 'repair:%'
+                    THEN 1 ELSE 0
+                END) AS primary_failed_jobs,
+                SUM(CASE
+                    WHEN m.status = 'failed'
+                     AND m.file_unique_key LIKE 'repair:%'
+                    THEN 1 ELSE 0
+                END) AS repair_failed_jobs,
+                SUM(CASE
                     WHEN m.status = 'skipped'
                      AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%'
                     THEN 1 ELSE 0
                 END) AS skipped_issue_jobs,
+                SUM(CASE
+                    WHEN m.status = 'skipped'
+                     AND m.file_unique_key NOT LIKE 'repair:%'
+                     AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%'
+                    THEN 1 ELSE 0
+                END) AS primary_skipped_issue_jobs,
+                SUM(CASE
+                    WHEN m.status = 'skipped'
+                     AND m.file_unique_key LIKE 'repair:%'
+                     AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%'
+                    THEN 1 ELSE 0
+                END) AS repair_skipped_issue_jobs,
                 SUM(CASE
                     WHEN m.status = 'copied'
                      AND m.verified_at IS NULL
@@ -470,18 +492,34 @@ class Database:
             "paused_jobs",
             "active_jobs",
             "failed_jobs",
+            "primary_failed_jobs",
+            "repair_failed_jobs",
             "skipped_issue_jobs",
+            "primary_skipped_issue_jobs",
+            "repair_skipped_issue_jobs",
             "verification_pending_jobs",
             "verification_failed_jobs",
             "verification_repairing_jobs",
         )
         result = {field: int(row[field] or 0) if row else 0 for field in fields}
+        result["review_items"] = (
+            result["repair_failed_jobs"]
+            + result["repair_skipped_issue_jobs"]
+            + result["verification_failed_jobs"]
+        )
         result["source_chat_id"] = source_id
         result["next_retry_at"] = str(row["next_retry_at"]) if row and row["next_retry_at"] else None
 
         issue = self.query_one(
             """
-            SELECT m.last_error
+            SELECT m.id, m.last_error,
+                   CASE
+                       WHEN vr.status = 'failed' THEN 'verification'
+                       WHEN m.file_unique_key LIKE 'repair:%' THEN 'repair'
+                       ELSE 'migration'
+                   END AS kind,
+                   vr.expected_count, vr.present_count,
+                   vr.media_match, vr.caption_match, vr.size_match
             FROM messages m
             LEFT JOIN verification_results vr ON vr.job_id = m.id
             WHERE m.source_chat_id = ?
@@ -492,13 +530,40 @@ class Database:
                      AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%')
                  OR vr.status = 'failed'
               )
-              AND COALESCE(m.last_error, '') != ''
-            ORDER BY m.updated_at DESC, m.id DESC
+              AND (vr.status = 'failed' OR COALESCE(m.last_error, '') != '')
+            ORDER BY
+                CASE
+                    WHEN m.status = 'failed' AND m.file_unique_key NOT LIKE 'repair:%' THEN 0
+                    WHEN m.status = 'skipped'
+                         AND m.file_unique_key NOT LIKE 'repair:%'
+                         AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%'
+                    THEN 1
+                    WHEN vr.status = 'failed' THEN 2
+                    WHEN m.file_unique_key LIKE 'repair:%' THEN 3
+                    ELSE 4
+                END,
+                m.updated_at DESC, m.id DESC
             LIMIT 1
             """,
             (source_id,),
         )
-        result["last_error"] = str(issue["last_error"]) if issue and issue["last_error"] else None
+        result["review_job_id"] = int(issue["id"]) if issue else None
+        result["review_kind"] = str(issue["kind"]) if issue and issue["kind"] else None
+        if issue and str(issue["kind"] or "") == "verification":
+            mismatch: list[str] = []
+            expected = int(issue["expected_count"] or 0)
+            present = int(issue["present_count"] or 0)
+            if expected != present:
+                mismatch.append(f"destination has {present}/{expected} item(s)")
+            if issue["media_match"] == 0:
+                mismatch.append("media type mismatch")
+            if issue["caption_match"] == 0:
+                mismatch.append("caption mismatch")
+            if issue["size_match"] == 0:
+                mismatch.append("file size mismatch")
+            result["last_error"] = "; ".join(mismatch) or "Destination media failed strict verification"
+        else:
+            result["last_error"] = str(issue["last_error"]) if issue and issue["last_error"] else None
         return result
 
     def get_scan_checkpoint(
