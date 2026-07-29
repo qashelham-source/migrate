@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from app.dashboard_v2 import dashboard_snapshot, source_migration_progress
+from app.dashboard_v2 import active_source_progress, dashboard_snapshot, source_migration_progress
 from app.db import Database
 
 
@@ -128,3 +128,37 @@ def test_source_migration_percentage_uses_registered_channel_title(tmp_path: Pat
         assert source_migration_progress(db)[0]["title"] == "Channel Utama"
     finally:
         db.close()
+
+
+def test_active_source_progress_uses_live_source_and_hides_completed_history() -> None:
+    progress = [
+        {
+            "source_chat_id": "-100001",
+            "title": "VVIP 02",
+            "eligible_items": 1674,
+            "copied_items": 1582,
+            "active_items": 92,
+            "blocked_items": 0,
+            "remaining_items": 92,
+            "percent": 95,
+        },
+        {
+            "source_chat_id": "-100002",
+            "title": "Tudung Media 69",
+            "eligible_items": 179,
+            "copied_items": 179,
+            "active_items": 0,
+            "blocked_items": 0,
+            "remaining_items": 0,
+            "percent": 100,
+        },
+    ]
+
+    active = active_source_progress(
+        {"phase": "downloading", "source_chat": -100001, "source": "VVIP 02"},
+        progress,
+    )
+
+    assert active is not None
+    assert active["title"] == "VVIP 02"
+    assert active_source_progress({"phase": "watching"}, progress) is None
