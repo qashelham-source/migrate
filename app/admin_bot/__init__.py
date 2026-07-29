@@ -23,6 +23,7 @@ from app.advanced import (
     requeue_repair_category,
     requeue_retryable_repairs,
     reset_all_checkpoints,
+    resolve_uncertain_upload,
 )
 from app.config import AppConfig
 from app.control import clear_stop, is_active_phase, read_status, request_stop, write_status
@@ -470,6 +471,46 @@ def _repair_text(config: AppConfig, details: bool = False) -> str:
     lines = ["🤖 AI Error Doctor", "", f"Jobs requiring attention: {sum(summary.values())}", ""]
     lines += [f"• {CATEGORY_LABELS[key]}: {summary.get(key, 0)}" for key in REPAIR_CATEGORIES]
     return "\n".join(lines)
+
+
+def _review_upload_page(config: AppConfig) -> tuple[str, InlineKeyboardMarkup]:
+    db = _database(config)
+    try:
+        items = repair_samples(db, "needs_review", limit=1)
+    finally:
+        db.close()
+    if not items:
+        return (
+            "🧭 Verify Before Retry\n\n✅ No uncertain uploads need review.",
+            _back("advanced:repair", "⬅️ AI Error Doctor"),
+        )
+
+    item = items[0]
+    job_id = int(item["id"])
+    text = "\n".join(
+        [
+            "🧭 Verify Before Retry",
+            "",
+            f"Job #{job_id} · {str(item['media_type']).title()}",
+            f"Destination: {item['dest_chat_id']}",
+            "",
+            "Check the destination once before choosing an action.",
+            "• Found once: mark it delivered and continue.",
+            "• Not found: retry it safely.",
+            "",
+            f"⚠️ {str(item['last_error']).replace(chr(10), ' ')[:260]}",
+        ]
+    )
+    return (
+        text[:3900],
+        _buttons(
+            [
+                [("✅ Found — continue", f"repair:confirm:{job_id}")],
+                [("↻ Not found — retry", f"repair:missing:{job_id}")],
+                [("⬅️ AI Error Doctor", "advanced:repair")],
+            ]
+        ),
+    )
 
 
 def _advanced_text(config: AppConfig) -> str:
@@ -1025,7 +1066,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             "capacity:view": (_capacity_text, _back("smart:menu", "⬅️ Smart Center")),
             "advanced:menu": (_advanced_text, _advanced_menu()),
             "advanced:health": (_health_text, _buttons([[("▶️ Run Check", "health:run"), ("🔄 Refresh", "advanced:health")], [("⬅️ Smart Center", "smart:menu")]])),
-            "advanced:repair": (_repair_text, _buttons([[("🔄 Retry safe jobs", "repair:retry:all")], [("📋 Details", "repair:details")], [("⬅️ Smart Center", "smart:menu")]])),
+            "advanced:repair": (_repair_text, _buttons([[("🔄 Retry safe jobs", "repair:retry:all")], [("🧭 Review uploads", "repair:review")], [("📋 Details", "repair:details")], [("⬅️ Smart Center", "smart:menu")]])),
             "checkpoint:view": (_checkpoint_text, _buttons([[("♻️ Reset + Full Scan", "checkpoint:reset:confirm")], [("⬅️ Recovery Tools", "advanced:menu")]])),
         }
         if data == "finder:view":
@@ -1062,6 +1103,10 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await edit(query, fn(config), markup)
             await query.answer()
             return
+        if data == "repair:review":
+            await edit(query, *_review_upload_page(config))
+            await query.answer()
+            return
         if data == "repair:details":
             await edit(query, _repair_text(config, True), _back("advanced:repair", "⬅️ AI Error Doctor"))
             await query.answer()
@@ -1086,6 +1131,32 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 f"{revived} safe job(s) returned to pending. Unknown upload results remain held.",
                 show_alert=True,
             )
+            return
+        if data.startswith(("repair:confirm:", "repair:missing:")):
+            if is_active_phase(read_status(config).get("phase")):
+                await query.answer("Migration is still active.", show_alert=True)
+                return
+            try:
+                job_id = int(data.rsplit(":", 1)[1])
+            except (TypeError, ValueError):
+                await query.answer("This review action has expired.", show_alert=True)
+                return
+            delivered = data.startswith("repair:confirm:")
+            db = _database(config)
+            try:
+                resolved = resolve_uncertain_upload(db, job_id, delivered=delivered)
+            finally:
+                db.close()
+            if not resolved:
+                await query.answer("This job is no longer waiting for review.", show_alert=True)
+                await edit(query, *_review_upload_page(config))
+                return
+            _request_mode(config, "process")
+            await query.answer(
+                "Marked as delivered. The queue will continue." if delivered else "Returned to pending. The queue will retry it.",
+                show_alert=True,
+            )
+            await edit(query, *_review_upload_page(config))
             return
         if data == "checkpoint:reset:confirm":
             await edit(query, "♻️ Reset all checkpoints?\n\nThe existing queue will not be deleted.", _buttons([[("✅ Reset", "checkpoint:reset:all")], [("❌ Cancel", "checkpoint:view")]]))
