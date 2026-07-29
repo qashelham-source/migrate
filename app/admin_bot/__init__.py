@@ -738,6 +738,7 @@ def _stored_source_titles(path: Path) -> dict[str, str]:
         config = load_config(cache_key)
         db = _database(config)
         try:
+            MessageQueue(db, config)
             rows = db.query("SELECT source_chat_id, title FROM source_registry")
         finally:
             db.close()
