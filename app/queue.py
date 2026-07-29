@@ -200,6 +200,31 @@ class MessageQueue:
         self.release3.update_telemetry(job.id, stage="pending")
         return "pending"
 
+    def defer_download_transport_failure(self, job: MessageJob, error: str, attempts: int) -> str:
+        """Retry a connection loss that happened before any destination upload.
+
+        A download can safely be repeated, so transport interruptions here stay in
+        the automatic retry loop even after the normal job-attempt limit.  The
+        backoff remains bounded by the configured retry schedule.
+        """
+        backoff = self._backoff_for_attempt(attempts)
+        next_retry = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat(timespec="seconds")
+        reason = f"Download connection interrupted; retrying automatically. {error}"
+        self.db.set_status(job.id, "pending", last_error=reason, next_retry_at=next_retry)
+        self.release3.update_telemetry(job.id, stage="pending")
+        return reason
+
+    def hold_uncertain_upload(self, job: MessageJob, error: str) -> str:
+        """Hold an upload whose destination result cannot be proven safely."""
+        reason = (
+            "Upload connection interrupted; destination result is unknown. "
+            f"Verify destination before retrying manually. {error}"
+        )
+        self.db.set_status(job.id, "failed", last_error=reason)
+        self.release3.finish_telemetry(job.id, stage="failed")
+        self.release3.recompute_source_state(job.source_chat_id)
+        return reason
+
     def enqueue_repair_item(self, parent: MessageJob, source_message_id: int) -> int | None:
         unique_key = f"repair:{parent.id}:{int(source_message_id)}"
         inserted = self.enqueue(
