@@ -79,8 +79,9 @@ def reset_all_checkpoints(db: Database) -> int:
 
 
 def classify_repair_error(row: Row | dict[str, Any]) -> str:
-    media_type = str(row["media_type"] or "").lower()
-    error = str(row["last_error"] or "").lower()
+    values = dict(row)
+    media_type = str(values.get("media_type") or "").lower()
+    error = str(values.get("last_error") or "").lower()
 
     if any(
         marker in error
