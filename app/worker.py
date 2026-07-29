@@ -89,7 +89,7 @@ class Worker:
                 write_status(
                     self.config,
                     "idle",
-                    message="Tiada job pending yang boleh dijalankan. Migration sedang idle.",
+                    message="No runnable pending jobs. Migration is idle.",
                     **self._status_details(),
                 )
                 return
@@ -111,7 +111,7 @@ class Worker:
                     write_status(
                         self.config,
                         "idle",
-                        message="Semua job yang boleh dijalankan untuk source ini selesai.",
+                        message="All runnable jobs for this source are complete.",
                         **self._status_details(),
                     )
                     return
@@ -121,7 +121,7 @@ class Worker:
                 write_status(
                     self.config,
                     "batch_pause",
-                    message=f"Batch selesai. Rehat {pause} saat sebelum sambung.",
+                    message=f"Batch complete. Pausing for {pause} seconds before continuing.",
                     pause_seconds=pause,
                     **self._status_details(),
                 )
@@ -130,7 +130,7 @@ class Worker:
                 write_status(
                     self.config,
                     "idle",
-                    message="Semua job untuk cycle ini selesai.",
+                    message="All jobs for this cycle are complete.",
                     **self._status_details(),
                 )
                 return
@@ -140,7 +140,7 @@ class Worker:
         write_status(
             self.config,
             "stopped",
-            message="Migration dihentikan dengan selamat. Job belum selesai kekal dalam queue.",
+            message="Migration stopped safely. Unfinished jobs remain in the queue.",
             **self._status_details(),
         )
 
@@ -164,16 +164,16 @@ class Worker:
         write_status(
             self.config,
             "processing",
-            message="Menyediakan job migration.",
+            message="Preparing migration job.",
             **self._status_details(job, **common),
         )
 
         async def set_phase(status: str) -> None:
             self.queue.set_phase(job.id, status)
             message = {
-                "downloading": "Sedang download media restricted.",
-                "uploading": "Sedang hantar ke destination.",
-            }.get(status, "Sedang proses job.")
+                "downloading": "Downloading restricted media.",
+                "uploading": "Uploading to the destination.",
+            }.get(status, "Processing job.")
             write_status(
                 self.config,
                 status,
@@ -190,7 +190,7 @@ class Worker:
                 write_status(
                     self.config,
                     "processing",
-                    message=f"Job #{job.id} selesai dan menunggu verification.",
+                    message=f"Job #{job.id} is complete and awaiting verification.",
                     last_result="copied",
                     **self._status_details(job, **common),
                 )
@@ -201,7 +201,7 @@ class Worker:
                 write_status(
                     self.config,
                     "processing",
-                    message=f"Job #{job.id} diskip.",
+                    message=f"Job #{job.id} was skipped.",
                     last_result="skipped",
                     last_error=result.reason,
                     **self._status_details(job, **common),
@@ -221,7 +221,7 @@ class Worker:
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} diskip kerana ralat kekal.",
+                message=f"Job #{job.id} was skipped because of a permanent error.",
                 last_result="skipped",
                 last_error=compact_error(exc),
                 **self._status_details(job, **common),
@@ -230,10 +230,10 @@ class Worker:
             if stop_event.is_set():
                 self.queue.set_phase(job.id, "pending")
                 status = "pending"
-                message = f"Job #{job.id} dikembalikan ke pending."
+                message = f"Job #{job.id} was returned to pending."
             else:
                 status = self.queue.mark_failure(job, compact_error(exc), attempts)
-                message = f"Job #{job.id} akan dicuba semula."
+                message = f"Job #{job.id} will be retried."
             self.queue.log_repair(
                 action="retry_with_backoff",
                 job=job,
@@ -266,7 +266,7 @@ class Worker:
             write_status(
                 self.config,
                 "processing",
-                message="Destination bermasalah dipause; destination lain akan diteruskan.",
+                message="This destination is paused; other destinations will continue.",
                 last_result="destination_paused",
                 last_error=error,
                 paused_destination=job.dest_chat_id,
@@ -287,7 +287,7 @@ class Worker:
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} mengalami ralat media dan akan melalui recovery.",
+                message=f"Job #{job.id} had a media error and will go through recovery.",
                 last_result=status,
                 last_error=error,
                 **self._status_details(job, **common),
@@ -307,7 +307,7 @@ class Worker:
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} gagal dan recovery direkodkan.",
+                message=f"Job #{job.id} failed and recovery was recorded.",
                 last_result=status,
                 last_error=error,
                 **self._status_details(job, **common),
