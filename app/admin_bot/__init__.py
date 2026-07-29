@@ -28,7 +28,14 @@ from app.config import AppConfig
 from app.control import clear_stop, is_active_phase, read_status, request_stop, write_status
 from app.dashboard_v2 import active_source_progress, dashboard_snapshot, format_bytes, format_eta, issue_center
 from app.db import Database
-from app.destination_manager import get_sources, list_destinations, set_destinations, set_sources
+from app.destination_manager import (
+    blacklist_source,
+    get_source_blacklist,
+    get_sources,
+    list_destinations,
+    set_destinations,
+    set_sources,
+)
 from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
 from app.queue import MessageQueue
 from app.telegram_client import load_accounts
@@ -504,8 +511,12 @@ def _selection_for(user_id: int, path: Path) -> dict[str, list[str]]:
             "destinations": _ordered_chats([str(item["chat"]) for item in list_destinations(path)]),
         }
     selection = _SELECTIONS[user_id]
+    blacklisted = {chat.lower() for chat in get_source_blacklist(path)}
     for key in ("sources", "destinations"):
         selection[key] = _ordered_chats(selection.get(key, []))
+    selection["sources"] = [
+        chat for chat in selection["sources"] if str(chat).lower() not in blacklisted
+    ]
     return selection
 
 
@@ -606,6 +617,21 @@ def _channel_title(user_id: int, chat: str) -> str:
     return str(chat)
 
 
+def _source_channels(user_id: int, path: Path) -> list[dict[str, Any]]:
+    blacklisted = {chat.lower() for chat in get_source_blacklist(path)}
+    return [
+        item
+        for item in _CHANNEL_CACHE.get(user_id, [])
+        if str(item["chat"]).lower() not in blacklisted
+    ]
+
+
+def _source_page(channels: list[dict[str, Any]], page: int) -> int:
+    if not channels:
+        return 0
+    return max(0, min(page, (len(channels) - 1) // _PAGE_SIZE))
+
+
 def _source_queue_lines(user_id: int, selected: list[str]) -> list[str]:
     if not selected:
         return ["No sources in the queue."]
@@ -619,9 +645,10 @@ def _source_queue_lines(user_id: int, selected: list[str]) -> list[str]:
 
 
 def _source_text(user_id: int, path: Path, page: int = 0) -> str:
-    channels = _CHANNEL_CACHE.get(user_id, [])
+    scanned_channels = _CHANNEL_CACHE.get(user_id, [])
+    channels = _source_channels(user_id, path)
     selected = _selection_for(user_id, path)
-    if not channels:
+    if not scanned_channels:
         return "\n".join([
             "📚 Source Queue",
             "",
@@ -629,6 +656,15 @@ def _source_text(user_id: int, path: Path, page: int = 0) -> str:
             "",
             "Telegram has not been scanned. Tap Scan / Refresh to add sources.",
         ])
+    if not channels:
+        return "\n".join([
+            "📚 Source Queue",
+            "",
+            * _source_queue_lines(user_id, selected["sources"]),
+            "",
+            "All scanned sources are blacklisted.",
+        ])
+    page = _source_page(channels, page)
     start = page * _PAGE_SIZE
     end = min(len(channels), start + _PAGE_SIZE)
     return "\n".join([
@@ -643,15 +679,19 @@ def _source_text(user_id: int, path: Path, page: int = 0) -> str:
 
 
 def _source_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarkup:
-    channels = _CHANNEL_CACHE.get(user_id, [])
+    channels = _source_channels(user_id, path)
     selected = _selection_for(user_id, path)
+    page = _source_page(channels, page)
     rows: list[list[tuple[str, str]]] = []
     start = page * _PAGE_SIZE
     for index, item in enumerate(channels[start:start + _PAGE_SIZE], start=start):
         chat = str(item["chat"])
         source_icon = "☑️" if chat in selected["sources"] else "☐"
-        title = str(item["title"])[:34]
-        rows.append([(f"{source_icon} {item['access']} {title}"[:48], f"sources:toggle:{index}")])
+        title = str(item["title"])[:32]
+        rows.append([
+            (f"{source_icon} {title}"[:38], f"sources:toggle:{index}"),
+            ("🚫 Blacklist", f"sources:blacklist:{chat}"),
+        ])
     nav: list[tuple[str, str]] = []
     if page > 0:
         nav.append(("⬅️", f"sources:page:{page - 1}"))
@@ -861,7 +901,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             return
         if data.startswith("sources:toggle:"):
             index = int(data.rsplit(":", 1)[1])
-            channels = _CHANNEL_CACHE.get(user_id, [])
+            channels = _source_channels(user_id, path)
             if index >= len(channels):
                 await query.answer("Channel cache expired. Scan again.", show_alert=True)
                 return
@@ -874,6 +914,24 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             page = index // _PAGE_SIZE
             await edit(query, _source_text(user_id, path, page), _source_menu(user_id, path, page))
             await query.answer()
+            return
+        if data.startswith("sources:blacklist:"):
+            chat = data.rsplit(":", 1)[1]
+            channels = _source_channels(user_id, path)
+            item = next((candidate for candidate in channels if str(candidate["chat"]) == chat), None)
+            if item is None:
+                await query.answer("Source is no longer available. Scan again.", show_alert=True)
+                return
+            source_index = channels.index(item)
+            title = str(item["title"])[:40]
+            blacklisted = blacklist_source(chat, path)
+            selected = _selection_for(user_id, path)
+            selected["sources"] = [
+                value for value in selected["sources"] if str(value).lower() != blacklisted.lower()
+            ]
+            page = _source_page(_source_channels(user_id, path), source_index // _PAGE_SIZE)
+            await edit(query, _source_text(user_id, path, page), _source_menu(user_id, path, page))
+            await query.answer(f"Blacklisted and removed: {title}", show_alert=True)
             return
         if data.startswith("destinations:toggle:"):
             index = int(data.rsplit(":", 1)[1])
