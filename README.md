@@ -171,18 +171,22 @@ APP_GID=10001
 `deploy.sh` performs a health-gated deployment:
 
 1. acquires a deployment lock;
-2. preserves `config.yaml` and `.env`;
-3. creates a consistent SQLite online backup;
-4. fetches and builds the new revision while the old container is still running;
-5. replaces the service;
-6. waits for a healthy state;
-7. restores the previous Git revision automatically if health validation fails.
+2. fetches `origin/main`, resets the checkout, and re-executes the newly fetched script so stale deployment logic cannot continue in memory;
+3. preserves `config.yaml` and `.env`;
+4. validates and fixes runtime ownership for the configured non-root UID/GID;
+5. creates a consistent SQLite online backup with `python3`;
+6. builds the new revision while the old container is still running;
+7. replaces the service and waits for a healthy state;
+8. restores the previous Git revision and matching database snapshot automatically if health validation fails.
 
-Run as the deployment user:
+Always invoke the deployment entrypoint through Bash. This works even when an older checkout has lost the executable mode bit:
 
 ```bash
-APP_DIR=/opt/migration-manager ./deploy.sh
+cd /opt/migration-manager
+APP_DIR=/opt/migration-manager APP_UID=10001 APP_GID=10001 bash ./deploy.sh
 ```
+
+The script requires Git, Python 3, Docker, and Docker Compose v2. Run it as root, or set `APP_UID` and `APP_GID` to the numeric IDs of the deployment user. `config.yaml` is kept at mode `600` and owned by the same UID/GID used by the container so the non-root process can read and update it.
 
 Backups are stored under `backups/`; the ten newest are retained.
 
@@ -209,7 +213,7 @@ Stop the service before a manual restore. Restore the database together with its
 Example manual backup using Python's SQLite online backup API:
 
 ```bash
-python - <<'PY'
+python3 - <<'PY'
 import sqlite3
 source = sqlite3.connect('data/migration.sqlite3')
 destination = sqlite3.connect('migration-backup.sqlite3')
@@ -225,6 +229,7 @@ Do not copy only the main SQLite file while the service is writing unless you us
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
+bash -n deploy.sh
 python -m ruff check --select E9,F63,F7,F82 app tests main.py bot.py
 python -m pytest -q
 python -m pip_audit --requirement requirements.txt
@@ -232,6 +237,7 @@ python -m pip_audit --requirement requirements.txt
 
 CI also performs:
 
+- deployment script syntax and executable-mode validation
 - Python compilation and the complete test suite
 - secret scanning
 - Docker Compose validation
@@ -260,5 +266,5 @@ config.example.yaml          validated example configuration
 docker-compose.yml           hardened service definition
 optimize_database.py         schema bootstrap and performance tuning
 reliability_check.py         lightweight/deep health checks
-deploy.sh                    backup, health validation, and rollback
+deploy.sh                    self-refreshing backup/deploy/rollback entrypoint
 ```
