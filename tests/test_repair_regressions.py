@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import importlib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,12 +11,12 @@ import pytest
 import yaml
 
 import app.destination_manager as destination_manager
-from app.admin_bot import _authorized_ids
+import app.admin_bot as admin_bot
 from app.config import ChatSpec, load_config
 from app.db import Database
 from app.queue import MessageJob, MessageQueue
 from app.scanner import Scanner
-from app.telegram_client import load_accounts, save_accounts
+from app.telegram_client import save_accounts
 from app.upload import Uploader
 from main import choose_writer_for_destinations
 
@@ -89,13 +90,10 @@ def test_admin_fallback_never_authorizes_an_unrelated_cached_account(
     config.ensure_directories()
     save_accounts(config, {"operator": {"id": 111}, "stale-session": {"id": 999}})
 
-    authorized = _authorized_ids(config)
-    assert authorized == {111}, {
-        "admins": config.telegram.admin_ids,
-        "active_session": config.telegram.user_session,
-        "accounts": load_accounts(config),
-        "function_names": _authorized_ids.__code__.co_names,
-    }
+    # Reload to model a fresh control-panel process rather than a module instance
+    # that another test may have imported before this regression scenario.
+    reloaded_admin_bot = importlib.reload(admin_bot)
+    assert reloaded_admin_bot._authorized_ids(config) == {111}
 
 
 def test_source_topic_configuration_is_rejected_before_any_scan(tmp_path: Path) -> None:
