@@ -7,6 +7,7 @@ from sqlite3 import Row
 from typing import Any
 
 from app.db import Database, utc_now
+from app.skip_policy import expected_skip_reason_sql
 
 
 TERMINAL_VERIFICATION_STATES = {"verified", "verified_repaired", "failed", "repairing"}
@@ -338,8 +339,9 @@ class Release3Store:
 
     def recompute_source_state(self, source_chat_id: int | str) -> dict[str, Any]:
         source_id = str(source_chat_id)
+        expected_skip = expected_skip_reason_sql("m.last_error")
         row = self.db.query_one(
-            """
+            f"""
             SELECT
                 MAX(CASE
                     WHEN m.file_unique_key NOT LIKE 'repair:%' THEN m.source_message_id
@@ -349,7 +351,7 @@ class Release3Store:
                 SUM(CASE
                     WHEN m.status = 'failed'
                      OR (m.status = 'skipped'
-                         AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%')
+                         AND NOT {expected_skip})
                      OR vr.status = 'failed'
                     THEN 1 ELSE 0
                 END) AS issue_jobs,
