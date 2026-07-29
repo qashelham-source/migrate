@@ -79,7 +79,7 @@ def test_media_empty_album_falls_back_to_individual_uploads(tmp_path: Path) -> N
     assert result.dest_message_ids == [501, 502]
 
 
-def test_initialize_requeues_only_legacy_send_multi_media_errors(tmp_path: Path) -> None:
+def test_legacy_send_multi_media_requeue_is_explicit(tmp_path: Path) -> None:
     db_path = tmp_path / "migration.sqlite3"
     db = Database(db_path)
     db.initialize()
@@ -123,6 +123,15 @@ def test_initialize_requeues_only_legacy_send_multi_media_errors(tmp_path: Path)
     reopened = Database(db_path)
     reopened.initialize()
     try:
+        album = reopened.query_one(
+            "SELECT status, attempts, last_error FROM messages WHERE file_unique_key = ?",
+            ("album-error",),
+        )
+        assert album is not None
+        assert album["status"] == "skipped"
+        assert "SendMultiMedia" in album["last_error"]
+
+        assert reopened.requeue_send_multi_media_errors() == 1
         album = reopened.query_one(
             "SELECT status, attempts, last_error FROM messages WHERE file_unique_key = ?",
             ("album-error",),
