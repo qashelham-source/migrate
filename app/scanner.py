@@ -125,7 +125,7 @@ class Scanner:
             write_status(
                 self.config,
                 "waiting",
-                message="Tetapkan source dan destination dalam bot.",
+                message="Set a source and destination in the bot first.",
                 source="set" if sources else "missing",
                 destination="set" if destinations else "missing",
                 scan_mode=self.scan_mode,
@@ -170,11 +170,11 @@ class Scanner:
             write_status(
                 self.config,
                 "error",
-                message="Destination tidak dapat dikenal oleh bot uploader.",
+                message="The destination cannot be recognised by the upload bot.",
                 destination_chat=spec.chat,
                 error=(
-                    "Pastikan bot MANAGER sudah menjadi admin destination dan cuba "
-                    "tambah destination semula melalui forward post atau -100 ID."
+                    "Make sure the MANAGER bot is an admin in the destination, then add it again "
+                    "by forwarding a post or sending the -100 ID."
                 ),
                 scan_mode=self.scan_mode,
             )
@@ -237,7 +237,7 @@ class Scanner:
             write_status(
                 self.config,
                 "scan_complete",
-                message="Source tiada mesej.",
+                message="This source has no messages.",
                 source=resolved_source.title,
                 source_index=source_index,
                 source_total=source_total,
@@ -264,7 +264,7 @@ class Scanner:
             write_status(
                 self.config,
                 "scan_complete",
-                message="Tiada post baru untuk disync.",
+                message="No new posts to sync.",
                 source=resolved_source.title,
                 source_index=source_index,
                 source_total=source_total,
@@ -301,9 +301,9 @@ class Scanner:
                 self.config,
                 "scanning",
                 message=(
-                    "Sedang sync post baru."
+                    "Syncing new posts."
                     if self.scan_mode == "incremental"
-                    else "Sedang full scan mesej source."
+                    else "Running a full scan of source messages."
                 ),
                 source=resolved_source.title,
                 current=scanned,
@@ -326,7 +326,7 @@ class Scanner:
             write_status(
                 self.config,
                 "stopping",
-                message="Scan dihentikan dengan selamat. Checkpoint tidak digerakkan.",
+                message="Scan stopped safely. The checkpoint was not moved.",
                 source=resolved_source.title,
                 source_index=source_index,
                 source_total=source_total,
@@ -345,7 +345,7 @@ class Scanner:
                 write_status(
                     self.config,
                     "scanning",
-                    message="Menyusun queue migration.",
+                    message="Building migration queue.",
                     source=resolved_source.title,
                     current=group_index,
                     total=len(grouped),
@@ -396,7 +396,7 @@ class Scanner:
             write_status(
                 self.config,
                 "stopping",
-                message="Queue building dihentikan. Checkpoint tidak digerakkan.",
+                message="Queue build stopped. The checkpoint was not moved.",
                 source=resolved_source.title,
                 source_index=source_index,
                 source_total=source_total,
@@ -424,9 +424,9 @@ class Scanner:
             self.config,
             "scan_complete",
             message=(
-                "Sync post baru selesai. Memulakan pemindahan queue."
+                "New-post sync complete. Starting the migration queue."
                 if self.scan_mode == "incremental"
-                else "Full scan selesai. Memulakan pemindahan queue."
+                else "Full scan complete. Starting the migration queue."
             ),
             source=resolved_source.title,
             source_index=source_index,
