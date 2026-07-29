@@ -25,5 +25,5 @@ def test_snapshot_copies_session_without_changing_live_database(tmp_path: Path) 
 
 
 def test_snapshot_requires_existing_session(tmp_path: Path) -> None:
-    with pytest.raises(RuntimeError, match="Session Telegram tidak ditemui"):
+    with pytest.raises(RuntimeError, match="Telegram session was not found"):
         _snapshot_session_database(tmp_path / "missing.session", tmp_path / "temporary.session")
