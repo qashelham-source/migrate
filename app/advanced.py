@@ -89,6 +89,7 @@ def classify_repair_error(row: Row | dict[str, Any]) -> str:
             "verify destination before retrying manually",
             "upload connection interrupted",
             "interrupted during upload",
+            "broken pipe",
         )
     ):
         return "needs_review"
@@ -219,3 +220,40 @@ def requeue_retryable_repairs(db: Database) -> int:
     for category in ("media_empty", "peer_id", "temporary"):
         total += requeue_repair_category(db, category)
     return total
+
+
+def resolve_uncertain_upload(db: Database, job_id: int, *, delivered: bool) -> bool:
+    """Record the operator's destination check for one ambiguous legacy upload."""
+    row = db.query_one(
+        """
+        SELECT id, source_chat_id, status, media_type, last_error
+        FROM messages
+        WHERE id = ? AND status IN ('failed', 'skipped')
+        """,
+        (int(job_id),),
+    )
+    if not row or classify_repair_error(row) != "needs_review":
+        return False
+
+    if delivered:
+        db.set_status(
+            int(row["id"]),
+            "copied",
+            last_error="Manually confirmed in destination after an uncertain upload.",
+            verified_at=utc_now(),
+        )
+    else:
+        db.execute(
+            """
+            UPDATE messages
+            SET status = 'pending', attempts = 0, last_error = NULL,
+                next_retry_at = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (utc_now(), int(row["id"])),
+        )
+
+    store = Release3Store(db)
+    store.initialize()
+    store.recompute_source_state(row["source_chat_id"])
+    return True
