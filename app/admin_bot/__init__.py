@@ -142,6 +142,7 @@ def _dashboard_text(config: AppConfig) -> str:
     q, s, d, v, t, storage = (
         data["queue"], data["sources"], data["destinations"], data["verification"], data["telemetry"], data["storage"]
     )
+    source_progress = data["source_progress"]
     phase = str(status.get("phase") or "idle").lower()
     active = q["downloading"] + q["uploading"]
     issue_total = q["failed"] + q["skipped"] + d["paused"] + v["failed"]
@@ -167,10 +168,36 @@ def _dashboard_text(config: AppConfig) -> str:
         f"ETA: {format_eta(t['eta_seconds'])}",
         f"Sources: {s['total']} · Destinations: {d['total']}",
     ]
+    if source_progress:
+        lines += ["", "Source Migration:"]
+        for item in source_progress[:3]:
+            title = str(item["title"])[:44]
+            eligible = int(item["eligible_items"])
+            if eligible <= 0:
+                lines.append(f"• {title}: tiada item ikut filter")
+                continue
+            copied = int(item["copied_items"])
+            remaining = int(item["remaining_items"])
+            percent = int(item["percent"])
+            lines.append(f"• {title}: {percent}% siap — {copied}/{eligible} post/album")
+            lines.append(
+                f"  Baki: {remaining} ({100 - percent}%) · Jalan: {item['active_items']} · Isu: {item['blocked_items']}"
+            )
+            if item["filtered_items"]:
+                lines.append(f"  Tidak ikut filter: {item['filtered_items']}")
     if status.get("job_id") is not None:
         lines += ["", f"Current job: #{status['job_id']}", f"Media: {status.get('media_type') or '-'}"]
     if status.get("current") is not None and status.get("total") is not None:
-        lines.append(f"Progress: {status['current']}/{status['total']}")
+        try:
+            current_count = max(0, int(status["current"]))
+            total_count = max(0, int(status["total"]))
+            label = "Scan source" if phase == "scanning" else "Progress"
+            if total_count:
+                lines.append(f"{label}: {current_count}/{total_count} ({round(current_count / total_count * 100)}%)")
+            else:
+                lines.append(f"{label}: {current_count}/{total_count}")
+        except (TypeError, ValueError):
+            lines.append(f"Progress: {status['current']}/{status['total']}")
     error = status.get("last_error") or status.get("error")
     if error:
         lines += ["", f"Last error: {str(error).replace(chr(10), ' ')[:300]}"]
