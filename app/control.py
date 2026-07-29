@@ -66,7 +66,7 @@ def read_status(config: AppConfig) -> dict[str, Any]:
             return data
     except (OSError, ValueError, json.JSONDecodeError):
         pass
-    return {"phase": "idle", "updated_at": None, "message": "Belum ada cycle aktif"}
+    return {"phase": "idle", "updated_at": None, "message": "No active cycle yet."}
 
 
 def request_stop(config: AppConfig) -> None:
@@ -96,7 +96,7 @@ async def watch_stop_request(
             write_status(
                 config,
                 "stopping",
-                message="Arahan stop diterima. Menunggu operasi Telegram semasa selesai.",
+                message="Stop request received. Waiting for the current Telegram operation to finish.",
             )
             stop_event.set()
             return
