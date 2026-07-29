@@ -9,6 +9,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
+import app.config as app_config
 import app.destination_manager as destination_manager
 from app.admin_bot import _authorized_ids
 from app.config import ChatSpec, load_config
@@ -82,6 +83,7 @@ def test_admin_fallback_never_authorizes_an_unrelated_cached_account(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("ADMIN_USER_ID", raising=False)
+    monkeypatch.setattr(app_config, "load_dotenv", lambda: None)
     config = load_config(_write_config(tmp_path / "config.yaml", admin_ids=[]))
     config.ensure_directories()
     save_accounts(config, {"operator": {"id": 111}, "stale-session": {"id": 999}})
