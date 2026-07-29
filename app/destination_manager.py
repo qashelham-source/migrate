@@ -92,32 +92,100 @@ def _normalised_items(values: Iterable[str | int | dict[str, Any]]) -> list[dict
     return result
 
 
+def _normalised_chats(values: Iterable[str | int | dict[str, Any]]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in values:
+        value = raw.get("chat", "") if isinstance(raw, dict) else raw
+        if value is None or not str(value).strip():
+            continue
+        chat = normalize_chat(value)
+        if _is_placeholder(chat):
+            continue
+        key = chat.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(chat)
+    return result
+
+
+def get_source_blacklist(config_path: str | Path = "config.yaml") -> list[str]:
+    with _CONFIG_LOCK:
+        _, data = _load_yaml(config_path)
+        migration = data.get("migration") or {}
+        return _normalised_chats(migration.get("source_blacklist") or [])
+
+
 def get_sources(config_path: str | Path = "config.yaml") -> list[dict[str, Any]]:
     with _CONFIG_LOCK:
         _, data = _load_yaml(config_path)
-        sources = (data.get("migration") or {}).get("sources") or []
+        migration = data.get("migration") or {}
+        blacklisted = {
+            chat.lower()
+            for chat in _normalised_chats(migration.get("source_blacklist") or [])
+        }
+        sources = migration.get("sources") or []
         result: list[dict[str, Any]] = []
         for source in sources:
             item = dict(source) if isinstance(source, dict) else {"chat": str(source)}
             item["chat"] = str(item.get("chat") or "")
-            if item["chat"] and not _is_placeholder(item["chat"]):
+            try:
+                source_key = normalize_chat(item["chat"]).lower()
+            except ValueError:
+                source_key = item["chat"].lower()
+            if (
+                item["chat"]
+                and not _is_placeholder(item["chat"])
+                and source_key not in blacklisted
+            ):
                 result.append(item)
         return result
 
 
 def set_sources(chats: Iterable[str | int | dict[str, Any]], config_path: str | Path = "config.yaml") -> list[dict[str, Any]]:
     items = _normalised_items(chats)
-    if not items:
-        raise ValueError("Choose at least one source")
     with _CONFIG_LOCK:
         path, data = _load_yaml(config_path)
-        data.setdefault("migration", {})["sources"] = items
+        migration = data.setdefault("migration", {})
+        blacklisted = {
+            chat.lower()
+            for chat in _normalised_chats(migration.get("source_blacklist") or [])
+        }
+        items = [item for item in items if str(item["chat"]).lower() not in blacklisted]
+        if not items:
+            raise ValueError("Choose at least one source that is not blacklisted")
+        migration["sources"] = items
         _save_yaml(path, data)
     return items
 
 
 def set_source(chat: str, config_path: str | Path = "config.yaml") -> dict[str, Any]:
     return set_sources([chat], config_path)[0]
+
+
+def blacklist_source(chat: str | int, config_path: str | Path = "config.yaml") -> str:
+    normalised = normalize_chat(chat)
+    with _CONFIG_LOCK:
+        path, data = _load_yaml(config_path)
+        migration = data.setdefault("migration", {})
+        blacklisted = _normalised_chats(migration.get("source_blacklist") or [])
+        if normalised.lower() not in {item.lower() for item in blacklisted}:
+            blacklisted.append(normalised)
+        migration["source_blacklist"] = blacklisted
+
+        retained_sources: list[Any] = []
+        for source in migration.get("sources") or []:
+            item = dict(source) if isinstance(source, dict) else {"chat": str(source)}
+            value = str(item.get("chat") or "")
+            try:
+                source_key = normalize_chat(value).lower()
+            except ValueError:
+                source_key = value.lower()
+            if source_key != normalised.lower():
+                retained_sources.append(source)
+        migration["sources"] = retained_sources
+        _save_yaml(path, data)
+    return normalised
 
 
 def list_destinations(config_path: str | Path = "config.yaml") -> list[dict[str, Any]]:
