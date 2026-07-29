@@ -45,9 +45,9 @@ Deleting a secret in a later commit is not sufficient because it remains in Git 
 
 ## Removing the legacy archive from Git history
 
-A legacy ZIP archive existed in early repository history. The current tree must not contain it, but a normal deletion cannot remove its historical blob.
+A legacy ZIP archive existed in early repository history. The current tree must not contain it, but a normal deletion cannot remove its historical blob. The later deletion commit is not evidence that clones, forks, caches, or reachable history no longer contain the archive.
 
-History rewriting is destructive and must be coordinated during a maintenance window. Create an out-of-band mirror backup first, confirm all open branches have been merged or preserved, and notify every collaborator.
+History rewriting is destructive and must be coordinated during a maintenance window. Create an out-of-band mirror backup first, confirm all open branches have been merged or preserved, rotate any credentials that may have been present, and notify every collaborator. Do not run the force-push steps from an automated deployment or without explicit repository-owner approval.
 
 ```bash
 # Work in a fresh mirror clone.
