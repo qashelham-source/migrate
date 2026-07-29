@@ -3,7 +3,7 @@ from __future__ import annotations
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from app.db import Database
 
@@ -165,6 +165,42 @@ def source_migration_progress(db: Database) -> list[dict[str, Any]]:
             }
         )
     return progress
+
+
+def active_source_progress(
+    status: Mapping[str, Any],
+    source_progress: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Return only the source named by the live runtime status.
+
+    Completed sources remain available to reports, but never leak back into the
+    live dashboard simply because they are in the historical queue.
+    """
+    phase = str(status.get("phase") or "").strip().lower()
+    if phase in {"", "idle", "watching", "stopped", "source_complete"}:
+        return None
+
+    source_chat = status.get("source_chat")
+    if source_chat is not None:
+        source_id = str(source_chat)
+        for item in source_progress:
+            if str(item.get("source_chat_id")) == source_id:
+                return item
+
+    source_name = str(status.get("source") or "").strip().casefold()
+    if source_name:
+        for item in source_progress:
+            if str(item.get("title") or "").strip().casefold() == source_name:
+                return item
+
+    unfinished = [
+        item
+        for item in source_progress
+        if int(item.get("active_items") or 0) > 0
+        or int(item.get("blocked_items") or 0) > 0
+        or int(item.get("remaining_items") or 0) > 0
+    ]
+    return unfinished[0] if len(unfinished) == 1 else None
 
 def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]:
     queue = {
