@@ -197,13 +197,7 @@ class Release3Store:
         )
         return [dict(row) for row in rows]
 
-    def purge_source_jobs(self, source_chat_id: int | str) -> dict[str, int]:
-        """Permanently remove one source's queue state without touching media cache.
-
-        The admin flow also blacklists the source. Removing its checkpoints as
-        well as its jobs is important: a future queue run must not revive old
-        work from the deleted source.
-        """
+    def _source_ids_for_cleanup(self, source_chat_id: int | str) -> list[str]:
         requested_id = str(source_chat_id)
         source_ids = {requested_id}
         username = requested_id.lstrip("@").lower()
@@ -220,50 +214,60 @@ class Release3Store:
             except Exception:
                 rows = []
             source_ids.update(str(row["source_chat_id"]) for row in rows)
+        return sorted(source_ids)
 
-        ids = sorted(source_ids)
+    def _delete_source_jobs_locked(self, ids: list[str]) -> int:
+        """Delete source jobs and their dependent records inside an open transaction."""
         placeholders = ", ".join("?" for _ in ids)
         source_filter = f"source_chat_id IN ({placeholders})"
         job_subquery = f"SELECT id FROM messages WHERE {source_filter}"
         conn = self.db.conn
+        job_row = conn.execute(
+            f"SELECT COUNT(*) AS count FROM messages WHERE {source_filter}",
+            ids,
+        ).fetchone()
+        jobs = int(job_row["count"] if job_row else 0)
+        conn.execute(
+            f"""
+            DELETE FROM repair_links
+            WHERE parent_job_id IN ({job_subquery})
+               OR repair_job_id IN ({job_subquery})
+            """,
+            (*ids, *ids),
+        )
+        conn.execute(
+            f"DELETE FROM verification_results WHERE job_id IN ({job_subquery})",
+            ids,
+        )
+        conn.execute(
+            f"DELETE FROM job_telemetry WHERE job_id IN ({job_subquery})",
+            ids,
+        )
+        conn.execute(
+            f"""
+            DELETE FROM repair_actions
+            WHERE source_chat_id IN ({placeholders})
+               OR job_id IN ({job_subquery})
+            """,
+            (*ids, *ids),
+        )
+        conn.execute(f"DELETE FROM messages WHERE {source_filter}", ids)
+        return jobs
+
+    def purge_source_jobs(self, source_chat_id: int | str) -> dict[str, int]:
+        """Permanently remove one source's queue state without touching media cache."""
+        ids = self._source_ids_for_cleanup(source_chat_id)
+        placeholders = ", ".join("?" for _ in ids)
+        source_filter = f"source_chat_id IN ({placeholders})"
+        conn = self.db.conn
         try:
             conn.execute("BEGIN IMMEDIATE")
-            job_row = conn.execute(
-                f"SELECT COUNT(*) AS count FROM messages WHERE {source_filter}",
-                ids,
-            ).fetchone()
             checkpoint_row = conn.execute(
                 f"SELECT COUNT(*) AS count FROM scan_checkpoints WHERE {source_filter}",
                 ids,
             ).fetchone()
-            jobs = int(job_row["count"] if job_row else 0)
             checkpoints = int(checkpoint_row["count"] if checkpoint_row else 0)
-
-            conn.execute(
-                f"""
-                DELETE FROM repair_links
-                WHERE parent_job_id IN ({job_subquery})
-                   OR repair_job_id IN ({job_subquery})
-                """,
-                (*ids, *ids),
-            )
-            conn.execute(
-                f"DELETE FROM verification_results WHERE job_id IN ({job_subquery})",
-                ids,
-            )
-            conn.execute(
-                f"DELETE FROM job_telemetry WHERE job_id IN ({job_subquery})",
-                ids,
-            )
-            conn.execute(
-                f"""
-                DELETE FROM repair_actions
-                WHERE source_chat_id IN ({placeholders})
-                   OR job_id IN ({job_subquery})
-                """,
-                (*ids, *ids),
-            )
-            conn.execute(f"DELETE FROM messages WHERE {source_filter}", ids)
+            jobs = self._delete_source_jobs_locked(ids)
             conn.execute(f"DELETE FROM scan_checkpoints WHERE {source_filter}", ids)
             conn.execute(f"DELETE FROM source_registry WHERE {source_filter}", ids)
             conn.commit()
@@ -272,6 +276,65 @@ class Release3Store:
             raise
 
         return {"jobs": jobs, "checkpoints": checkpoints, "sources": len(ids)}
+
+    def clear_source_history(
+        self,
+        source_chat_id: int | str,
+        latest_message_id: int,
+        *,
+        source_topic_id: int | None = None,
+    ) -> dict[str, int]:
+        """Drop existing work but keep the source active for posts added later.
+
+        The special checkpoint marker prevents an in-flight full scan from
+        rebuilding the old queue. A future incremental sync begins after the
+        source's current latest post.
+        """
+        source_id = str(source_chat_id)
+        ids = self._source_ids_for_cleanup(source_id)
+        placeholders = ", ".join("?" for _ in ids)
+        source_filter = f"source_chat_id IN ({placeholders})"
+        checkpoint = max(0, int(latest_message_id))
+        topic_key = int(source_topic_id or 0)
+        now = utc_now()
+        conn = self.db.conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            checkpoint_row = conn.execute(
+                f"SELECT COUNT(*) AS count FROM scan_checkpoints WHERE {source_filter}",
+                ids,
+            ).fetchone()
+            checkpoints = int(checkpoint_row["count"] if checkpoint_row else 0)
+            jobs = self._delete_source_jobs_locked(ids)
+            conn.execute(f"DELETE FROM scan_checkpoints WHERE {source_filter}", ids)
+            conn.execute(
+                """
+                INSERT INTO scan_checkpoints (
+                    source_chat_id, source_topic_key, last_scanned_message_id,
+                    last_scan_mode, created_at, updated_at
+                ) VALUES (?, ?, ?, 'skip_history', ?, ?)
+                ON CONFLICT(source_chat_id, source_topic_key) DO UPDATE SET
+                    last_scanned_message_id = excluded.last_scanned_message_id,
+                    last_scan_mode = excluded.last_scan_mode,
+                    updated_at = excluded.updated_at
+                """,
+                (source_id, topic_key, checkpoint, now, now),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+        return {"jobs": jobs, "checkpoints": checkpoints, "checkpoint": checkpoint}
+
+    def history_clear_is_pending(
+        self,
+        source_chat_id: int | str,
+        *,
+        source_topic_id: int | None = None,
+    ) -> bool:
+        row = self.db.get_scan_checkpoint(source_chat_id, source_topic_id)
+        return bool(row and str(row["last_scan_mode"]) == "skip_history")
 
     def recompute_source_state(self, source_chat_id: int | str) -> dict[str, Any]:
         source_id = str(source_chat_id)
