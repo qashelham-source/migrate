@@ -405,3 +405,64 @@ def test_waiting_repair_verification_never_blocks_source_progress_on_its_own() -
 
     assert outcome.state == "retry"
     assert outcome.retry_after_seconds == 5
+
+
+def test_failed_review_items_are_retained_but_do_not_hold_later_sources() -> None:
+    state = {
+        "failed_jobs": 1,
+        "primary_failed_jobs": 0,
+        "repair_failed_jobs": 1,
+        "skipped_issue_jobs": 0,
+        "primary_skipped_issue_jobs": 0,
+        "repair_skipped_issue_jobs": 0,
+        "verification_failed_jobs": 1,
+        "review_items": 2,
+        "review_job_id": 42,
+        "last_error": "Destination media failed strict verification",
+        "paused_jobs": 0,
+        "active_jobs": 0,
+        "delayed_jobs": 0,
+        "verification_pending_jobs": 0,
+        "verification_repairing_jobs": 0,
+        "runnable_jobs": 0,
+    }
+
+    outcome = migration_main._source_outcome(
+        state,
+        source_chat_id=-100111,
+        source_index=1,
+        source_total=4,
+    )
+
+    assert outcome.state == "complete"
+    assert outcome.review_items == 2
+    assert outcome.review_job_id == 42
+    assert "Issue Center" in str(outcome.message)
+
+
+def test_failed_primary_upload_still_holds_the_source_for_manual_review() -> None:
+    state = {
+        "failed_jobs": 1,
+        "primary_failed_jobs": 1,
+        "repair_failed_jobs": 0,
+        "skipped_issue_jobs": 0,
+        "primary_skipped_issue_jobs": 0,
+        "repair_skipped_issue_jobs": 0,
+        "verification_failed_jobs": 0,
+        "review_items": 0,
+        "paused_jobs": 0,
+        "active_jobs": 0,
+        "delayed_jobs": 0,
+        "verification_pending_jobs": 0,
+        "verification_repairing_jobs": 0,
+        "runnable_jobs": 0,
+    }
+
+    outcome = migration_main._source_outcome(
+        state,
+        source_chat_id=-100111,
+        source_index=1,
+        source_total=4,
+    )
+
+    assert outcome.state == "blocked"
