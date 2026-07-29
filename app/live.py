@@ -93,6 +93,34 @@ class LiveTrigger:
                 continue
         return None
 
+    async def wait_for_retry(
+        self,
+        config: AppConfig,
+        stop_event: asyncio.Event,
+        seconds: float,
+    ) -> tuple[str, str] | None:
+        """Wait for a safe retry deadline while still responding to admin and source events."""
+        deadline = time.monotonic() + max(0.1, float(seconds))
+        while not stop_event.is_set():
+            requested = consume_run_request(config)
+            if requested:
+                return requested, "admin"
+            if self.event.is_set():
+                await self._debounce(stop_event)
+                self.event.clear()
+                return "sync", "live_event"
+            if time.monotonic() >= deadline:
+                return "process", "scheduled_retry"
+            remaining = max(0.05, deadline - time.monotonic())
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=min(self.settings.poll_seconds, remaining),
+                )
+            except asyncio.TimeoutError:
+                continue
+        return None
+
     async def _debounce(self, stop_event: asyncio.Event) -> None:
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=self.settings.event_debounce_seconds)
