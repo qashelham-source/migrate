@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import yaml
 
 import main as migration_main
+from app.advanced import classify_repair_error, requeue_retryable_repairs
 from app.db import Database
 from app.destination_manager import set_destinations
 from app.queue import MessageQueue
+from app.worker import Worker
 
 
 def make_config(tmp_path: Path) -> object:
@@ -28,6 +32,8 @@ def enqueue(
     *,
     source_message_id: int,
     file_unique_key: str = "same-media",
+    status: str = "pending",
+    last_error: str | None = None,
 ) -> bool:
     return queue.enqueue(
         source_chat_id=-100111,
@@ -41,6 +47,19 @@ def enqueue(
         media_type="video",
         file_size=1024,
         caption="caption",
+        status=status,
+        last_error=last_error,
+    )
+
+
+def worker_config(tmp_path: Path) -> object:
+    return SimpleNamespace(
+        queue=SimpleNamespace(
+            db_path=tmp_path / "data" / "migration.sqlite3",
+            max_attempts=3,
+            retry_backoff_seconds=[1, 2, 3],
+        ),
+        downloads=SimpleNamespace(root=tmp_path / "downloads"),
     )
 
 
@@ -169,5 +188,62 @@ def test_live_service_waits_for_trigger_before_first_migration_cycle(
                 logger=None,
             )
         )
+    finally:
+        db.close()
+
+
+def test_download_broken_pipe_retries_automatically_after_the_normal_attempt_limit(tmp_path: Path) -> None:
+    config = worker_config(tmp_path)
+    db = Database(config.queue.db_path)
+    db.initialize()
+
+    class DownloadInterrupted:
+        async def process(self, job, stop_event, on_phase):
+            await on_phase("downloading")
+            raise OSError(errno.EPIPE, "Broken pipe")
+
+    try:
+        queue = MessageQueue(db, config)  # type: ignore[arg-type]
+        assert enqueue(queue, source_message_id=10)
+        job = queue.claim_due(1)[0]
+        db.execute("UPDATE messages SET attempts = ? WHERE id = ?", (9, job.id))
+        job = replace(job, attempts=9)
+
+        worker = Worker(config, queue, DownloadInterrupted())  # type: ignore[arg-type]
+        asyncio.run(worker._process_one(job, asyncio.Event(), batch_index=1, batch_total=1))
+
+        row = db.query_one("SELECT status, last_error, next_retry_at FROM messages WHERE id = ?", (job.id,))
+        assert row is not None
+        assert row["status"] == "pending"
+        assert "retrying automatically" in row["last_error"]
+        assert row["next_retry_at"]
+    finally:
+        db.close()
+
+
+def test_upload_broken_pipe_is_held_to_prevent_a_duplicate(tmp_path: Path) -> None:
+    config = worker_config(tmp_path)
+    db = Database(config.queue.db_path)
+    db.initialize()
+
+    class UploadInterrupted:
+        async def process(self, job, stop_event, on_phase):
+            await on_phase("uploading")
+            raise OSError(errno.EPIPE, "Broken pipe")
+
+    try:
+        queue = MessageQueue(db, config)  # type: ignore[arg-type]
+        assert enqueue(queue, source_message_id=10)
+        job = queue.claim_due(1)[0]
+
+        worker = Worker(config, queue, UploadInterrupted())  # type: ignore[arg-type]
+        asyncio.run(worker._process_one(job, asyncio.Event(), batch_index=1, batch_total=1))
+
+        row = db.query_one("SELECT status, last_error FROM messages WHERE id = ?", (job.id,))
+        assert row is not None
+        assert row["status"] == "failed"
+        assert "destination result is unknown" in row["last_error"]
+        assert classify_repair_error(row) == "needs_review"
+        assert requeue_retryable_repairs(db) == 0
     finally:
         db.close()
