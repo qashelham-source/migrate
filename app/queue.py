@@ -337,6 +337,10 @@ class MessageQueue:
     def list_registered_sources(self) -> list[dict[str, Any]]:
         return self.release3.list_sources()
 
+    def purge_source_jobs(self, source_chat_id: int | str) -> dict[str, int]:
+        """Delete all persisted work for a source that was removed by an admin."""
+        return self.release3.purge_source_jobs(source_chat_id)
+
     def set_source_scan_progress(
         self,
         source_chat_id: int | str,
