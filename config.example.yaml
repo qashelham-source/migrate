@@ -5,6 +5,10 @@ telegram:
   sessions_dir: "sessions"
   load_dialogs_on_start: true
 
+  # Telegram numeric user IDs allowed to use the private control panel.
+  # ADMIN_USER_ID may also be supplied as a comma-separated environment variable.
+  admin_ids: []
+
   bot:
     enabled: true
     token: "${BOT_TOKEN}"
