@@ -57,7 +57,7 @@ def format_bytes(value: int | float | None) -> str:
 
 def format_eta(seconds: int | float | None) -> str:
     if seconds is None:
-        return "belum cukup data"
+        return "not enough data"
     remaining = max(0, int(seconds))
     hours, remaining = divmod(remaining, 3600)
     minutes, secs = divmod(remaining, 60)
