@@ -68,6 +68,104 @@ def format_eta(seconds: int | float | None) -> str:
     return f"{secs}s"
 
 
+
+def source_migration_progress(db: Database) -> list[dict[str, Any]]:
+    """Summarize each source once per post/album, even with multiple destinations."""
+    has_registry = _table_exists(db, "source_registry")
+    title_select = (
+        "COALESCE(NULLIF(sr.title, ''), totals.source_chat_id) AS title"
+        if has_registry
+        else "totals.source_chat_id AS title"
+    )
+    registry_join = (
+        "LEFT JOIN source_registry sr ON sr.source_chat_id = totals.source_chat_id"
+        if has_registry
+        else ""
+    )
+    rows = db.query(
+        f"""
+        WITH source_items AS (
+            SELECT
+                m.source_chat_id,
+                m.file_unique_key,
+                COUNT(*) AS destination_count,
+                SUM(CASE WHEN m.status = 'copied' THEN 1 ELSE 0 END) AS copied_destinations,
+                SUM(CASE WHEN m.status IN ('pending', 'downloading', 'uploading') THEN 1 ELSE 0 END) AS active_destinations,
+                SUM(
+                    CASE
+                        WHEN m.status = 'skipped'
+                         AND LOWER(COALESCE(m.last_error, '')) LIKE '%filtered out by config%'
+                        THEN 1 ELSE 0
+                    END
+                ) AS filtered_destinations
+            FROM messages m
+            WHERE m.file_unique_key NOT LIKE 'repair:%'
+            GROUP BY m.source_chat_id, m.file_unique_key
+        ), totals AS (
+            SELECT
+                source_chat_id,
+                COUNT(*) AS total_items,
+                SUM(
+                    CASE WHEN filtered_destinations = destination_count THEN 1 ELSE 0 END
+                ) AS filtered_items,
+                SUM(
+                    CASE
+                        WHEN filtered_destinations != destination_count
+                         AND copied_destinations = destination_count
+                        THEN 1 ELSE 0
+                    END
+                ) AS copied_items,
+                SUM(
+                    CASE
+                        WHEN filtered_destinations != destination_count
+                         AND copied_destinations != destination_count
+                         AND active_destinations > 0
+                        THEN 1 ELSE 0
+                    END
+                ) AS active_items,
+                SUM(
+                    CASE
+                        WHEN filtered_destinations != destination_count
+                         AND copied_destinations != destination_count
+                         AND active_destinations = 0
+                        THEN 1 ELSE 0
+                    END
+                ) AS blocked_items
+            FROM source_items
+            GROUP BY source_chat_id
+        )
+        SELECT totals.*, {title_select}
+        FROM totals
+        {registry_join}
+        ORDER BY blocked_items DESC, active_items DESC, title COLLATE NOCASE
+        """
+    )
+
+    progress: list[dict[str, Any]] = []
+    for row in rows:
+        total_items = int(row["total_items"] or 0)
+        filtered_items = int(row["filtered_items"] or 0)
+        eligible_items = max(0, total_items - filtered_items)
+        copied_items = int(row["copied_items"] or 0)
+        active_items = int(row["active_items"] or 0)
+        blocked_items = int(row["blocked_items"] or 0)
+        percent = round((copied_items / eligible_items) * 100) if eligible_items else 0
+        progress.append(
+            {
+                "source_chat_id": str(row["source_chat_id"]),
+                "title": str(row["title"] or row["source_chat_id"]),
+                "total_items": total_items,
+                "filtered_items": filtered_items,
+                "eligible_items": eligible_items,
+                "copied_items": copied_items,
+                "active_items": active_items,
+                "blocked_items": blocked_items,
+                "remaining_items": active_items + blocked_items,
+                "percent": int(percent),
+            }
+        )
+    return progress
+
 def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]:
     queue = {
         status: _count(db, "SELECT COUNT(*) FROM messages WHERE status = ?", (status,))
@@ -130,6 +228,7 @@ def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]
     return {
         "queue": queue,
         "sources": sources,
+        "source_progress": source_migration_progress(db),
         "destinations": destinations,
         "verification": verification,
         "telemetry": telemetry,
