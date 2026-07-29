@@ -43,6 +43,7 @@ class Database:
         self.conn.close()
 
     def initialize(self) -> None:
+        """Create and migrate schema without changing queue state."""
         self.conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -70,8 +71,14 @@ class Database:
             );
 
             DROP INDEX IF EXISTS idx_messages_unique_job;
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique_delivery
-                ON messages(source_chat_id, source_message_id, dest_chat_id)
+            DROP INDEX IF EXISTS idx_messages_unique_delivery;
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_unique_delivery_topic
+                ON messages(
+                    source_chat_id,
+                    source_message_id,
+                    dest_chat_id,
+                    COALESCE(dest_topic_id, 0)
+                )
                 WHERE file_unique_key NOT LIKE 'repair:%';
             CREATE INDEX IF NOT EXISTS idx_messages_due
                 ON messages(status, next_retry_at, updated_at);
@@ -98,7 +105,6 @@ class Database:
             """
         )
         self.conn.commit()
-        self.requeue_send_multi_media_errors()
 
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         cursor = self.conn.execute(sql, tuple(params))
@@ -256,7 +262,7 @@ class Database:
         return cursor.rowcount
 
     def requeue_send_multi_media_errors(self) -> int:
-        """Retry legacy album jobs that were skipped before individual upload fallback existed."""
+        """Explicitly retry legacy album jobs skipped before individual fallback existed."""
         cursor = self.conn.execute(
             """
             UPDATE messages
