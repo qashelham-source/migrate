@@ -11,6 +11,8 @@ import yaml
 
 
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
 
 
 def _expand_env(value: Any) -> Any:
@@ -23,24 +25,49 @@ def _expand_env(value: Any) -> Any:
     return value
 
 
-def _as_bool(value: Any, default: bool = False) -> bool:
-    if value is None:
+def _as_bool(value: Any, default: bool = False, *, name: str = "value") -> bool:
+    if value is None or value == "":
         return default
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+    normalized = str(value).strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    raise ValueError(f"{name} must be a boolean value")
 
 
-def _as_int(value: Any, default: int | None = None) -> int | None:
+def _as_int(value: Any, default: int | None = None, *, name: str = "value") -> int | None:
     if value is None or value == "":
         return default
-    return int(value)
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be an integer") from exc
 
 
-def _as_float(value: Any, default: float) -> float:
+def _as_float(value: Any, default: float, *, name: str = "value") -> float:
     if value is None or value == "":
         return default
-    return float(value)
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{name} must be a number") from exc
+
+
+def _positive_int(value: Any, default: int, *, name: str) -> int:
+    parsed = int(_as_int(value, default, name=name) or 0)
+    if parsed <= 0:
+        raise ValueError(f"{name} must be greater than zero")
+    return parsed
+
+
+def _non_negative_float(value: Any, default: float, *, name: str) -> float:
+    parsed = _as_float(value, default, name=name)
+    if parsed < 0:
+        raise ValueError(f"{name} cannot be negative")
+    return parsed
 
 
 def _path(base_dir: Path, value: str) -> Path:
@@ -48,6 +75,35 @@ def _path(base_dir: Path, value: str) -> Path:
     if path.is_absolute():
         return path
     return (base_dir / path).resolve()
+
+
+def _admin_ids(value: Any) -> tuple[int, ...]:
+    values: list[Any]
+    if value is None or value == "":
+        values = []
+    elif isinstance(value, (list, tuple, set)):
+        values = list(value)
+    else:
+        values = str(value).split(",")
+
+    for raw in os.getenv("ADMIN_USER_ID", "").split(","):
+        if raw.strip():
+            values.append(raw)
+
+    result: list[int] = []
+    for item in values:
+        text = str(item).strip()
+        if not text:
+            continue
+        try:
+            parsed = int(text)
+        except ValueError as exc:
+            raise ValueError("telegram.admin_ids and ADMIN_USER_ID must contain numeric Telegram user IDs") from exc
+        if parsed <= 0:
+            raise ValueError("Telegram admin user IDs must be positive integers")
+        if parsed not in result:
+            result.append(parsed)
+    return tuple(result)
 
 
 @dataclass(frozen=True)
@@ -61,14 +117,27 @@ class ChatSpec:
     def from_config(cls, value: Any) -> "ChatSpec":
         if isinstance(value, dict):
             message_range = value.get("message_range") or {}
+            chat = str(value.get("chat") or "").strip()
+            if not chat:
+                raise ValueError("migration chat entries require a non-empty chat value")
+            start_id = _as_int(value.get("start_id", message_range.get("start")), name="message range start")
+            end_id = _as_int(value.get("end_id", message_range.get("end")), name="message range end")
+            if start_id is not None and start_id <= 0:
+                raise ValueError("message range start must be greater than zero")
+            if end_id is not None and end_id <= 0:
+                raise ValueError("message range end must be greater than zero")
+            if start_id is not None and end_id is not None and start_id > end_id:
+                raise ValueError("message range start cannot be greater than end")
             return cls(
-                chat=str(value["chat"]),
-                topic_id=_as_int(value.get("topic_id")),
-                start_id=_as_int(value.get("start_id", message_range.get("start"))),
-                end_id=_as_int(value.get("end_id", message_range.get("end"))),
+                chat=chat,
+                topic_id=_as_int(value.get("topic_id"), name="topic_id"),
+                start_id=start_id,
+                end_id=end_id,
             )
 
         raw = str(value).strip()
+        if not raw:
+            raise ValueError("migration chat entries cannot be empty")
         if ":" in raw and not raw.startswith("@"):
             chat, topic = raw.rsplit(":", 1)
             if topic.isdigit():
@@ -87,6 +156,7 @@ class TelegramConfig:
     bot_token: str
     bot_session_name: str
     use_bot_for_uploads: bool
+    admin_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -208,21 +278,37 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     include = transfer.get("include") or {}
     native_copy = transfer.get("native_copy") or {}
 
-    api_id = _as_int(telegram.get("api_id") or os.getenv("API_ID"), 0) or 0
-    api_hash = str(telegram.get("api_hash") or os.getenv("API_HASH") or "")
-    bot_token = str(bot.get("token") or os.getenv("BOT_TOKEN") or "")
-    bot_enabled = _as_bool(bot.get("enabled"), bool(bot_token))
+    api_id = int(_as_int(telegram.get("api_id") or os.getenv("API_ID"), 0, name="telegram.api_id") or 0)
+    api_hash = str(telegram.get("api_hash") or os.getenv("API_HASH") or "").strip()
+    bot_token = str(bot.get("token") or os.getenv("BOT_TOKEN") or "").strip()
+    bot_enabled = _as_bool(bot.get("enabled"), bool(bot_token), name="telegram.bot.enabled")
 
     if api_id <= 0:
-        raise ValueError("telegram.api_id is required in config.yaml or API_ID environment variable")
+        raise ValueError("telegram.api_id is required and must be greater than zero")
     if not api_hash:
         raise ValueError("telegram.api_hash is required in config.yaml or API_HASH environment variable")
+    if bot_enabled and not bot_token:
+        raise ValueError("telegram.bot.token is required when telegram.bot.enabled is true")
 
     root = _path(base_dir, str(downloads.get("root", "downloads")))
     active_dir = _path(base_dir, str(downloads.get("active_dir", root / "active")))
     failed_dir = _path(base_dir, str(downloads.get("failed_dir", root / "failed")))
     completed_dir = _path(base_dir, str(downloads.get("completed_dir", root / "completed")))
     log_file = logging_cfg.get("file")
+
+    max_attempts = _positive_int(queue.get("max_attempts"), 4, name="queue.max_attempts")
+    retry_backoff_seconds = [int(value) for value in queue.get("retry_backoff_seconds", [300, 600, 1800])]
+    if not retry_backoff_seconds or any(value < 0 for value in retry_backoff_seconds):
+        raise ValueError("queue.retry_backoff_seconds must contain one or more non-negative integers")
+
+    floodwait_min = int(_as_int(limits.get("floodwait_extra_min_seconds"), 5, name="limits.floodwait_extra_min_seconds") or 0)
+    floodwait_max = int(_as_int(limits.get("floodwait_extra_max_seconds"), 20, name="limits.floodwait_extra_max_seconds") or 0)
+    if floodwait_min < 0 or floodwait_max < 0 or floodwait_min > floodwait_max:
+        raise ValueError("FloodWait padding must be non-negative and min cannot exceed max")
+
+    logging_level = str(logging_cfg.get("level", "INFO")).upper()
+    if logging_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
+        raise ValueError("logging.level must be CRITICAL, ERROR, WARNING, INFO, or DEBUG")
 
     return AppConfig(
         base_dir=base_dir,
@@ -231,57 +317,92 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             api_hash=api_hash,
             user_session=str(telegram.get("user_session") or "user"),
             sessions_dir=_path(base_dir, str(telegram.get("sessions_dir", "sessions"))),
-            load_dialogs_on_start=_as_bool(telegram.get("load_dialogs_on_start"), True),
+            load_dialogs_on_start=_as_bool(
+                telegram.get("load_dialogs_on_start"), True, name="telegram.load_dialogs_on_start"
+            ),
             bot_enabled=bot_enabled,
             bot_token=bot_token,
             bot_session_name=str(bot.get("session_name") or "uploader_bot"),
-            use_bot_for_uploads=_as_bool(bot.get("use_for_uploads"), True),
+            use_bot_for_uploads=_as_bool(
+                bot.get("use_for_uploads"), True, name="telegram.bot.use_for_uploads"
+            ),
+            admin_ids=_admin_ids(telegram.get("admin_ids")),
         ),
         transfer=TransferConfig(
-            include_videos=_as_bool(include.get("videos"), True),
-            include_photos=_as_bool(include.get("photos"), True),
-            include_text=_as_bool(include.get("text"), True),
-            include_documents=_as_bool(include.get("documents"), False),
-            hide_sender=_as_bool(transfer.get("hide_sender"), True),
-            drop_caption=_as_bool(transfer.get("drop_caption"), False),
-            prefer_copy=_as_bool(native_copy.get("enabled"), True),
-            forwarding_only=_as_bool(native_copy.get("only"), False),
-            save_to_local=_as_bool(transfer.get("save_to_local"), False),
-            max_bot_upload_bytes=int(transfer.get("max_bot_upload_bytes", 2_000 * 1024 * 1024)),
+            include_videos=_as_bool(include.get("videos"), True, name="transfer.include.videos"),
+            include_photos=_as_bool(include.get("photos"), True, name="transfer.include.photos"),
+            include_text=_as_bool(include.get("text"), True, name="transfer.include.text"),
+            include_documents=_as_bool(
+                include.get("documents"), False, name="transfer.include.documents"
+            ),
+            hide_sender=_as_bool(transfer.get("hide_sender"), True, name="transfer.hide_sender"),
+            drop_caption=_as_bool(transfer.get("drop_caption"), False, name="transfer.drop_caption"),
+            prefer_copy=_as_bool(native_copy.get("enabled"), True, name="transfer.native_copy.enabled"),
+            forwarding_only=_as_bool(native_copy.get("only"), False, name="transfer.native_copy.only"),
+            save_to_local=_as_bool(transfer.get("save_to_local"), False, name="transfer.save_to_local"),
+            max_bot_upload_bytes=_positive_int(
+                transfer.get("max_bot_upload_bytes"), 2_000 * 1024 * 1024, name="transfer.max_bot_upload_bytes"
+            ),
         ),
         queue=QueueConfig(
             db_path=_path(base_dir, str(queue.get("db_path", "data/migration.sqlite3"))),
-            max_attempts=int(queue.get("max_attempts", 4)),
-            retry_backoff_seconds=[int(value) for value in queue.get("retry_backoff_seconds", [300, 600, 1800])],
-            record_skipped=_as_bool(queue.get("record_skipped"), True),
+            max_attempts=max_attempts,
+            retry_backoff_seconds=retry_backoff_seconds,
+            record_skipped=_as_bool(queue.get("record_skipped"), True, name="queue.record_skipped"),
         ),
         limits=LimitsConfig(
-            global_min_delay_seconds=_as_float(limits.get("global_min_delay_seconds"), 1.0),
-            resolve_delay_seconds=_as_float(limits.get("resolve_delay_seconds"), 2.0),
-            read_delay_seconds=_as_float(limits.get("read_delay_seconds"), 2.0),
-            download_delay_seconds=_as_float(limits.get("download_delay_seconds"), 5.0),
-            copy_delay_seconds=_as_float(limits.get("copy_delay_seconds"), 10.0),
-            upload_delay_seconds=_as_float(limits.get("upload_delay_seconds"), 30.0),
-            verify_delay_seconds=_as_float(limits.get("verify_delay_seconds"), 2.0),
-            get_messages_chunk_size=int(limits.get("get_messages_chunk_size", 100)),
-            floodwait_extra_min_seconds=int(limits.get("floodwait_extra_min_seconds", 5)),
-            floodwait_extra_max_seconds=int(limits.get("floodwait_extra_max_seconds", 20)),
+            global_min_delay_seconds=_non_negative_float(
+                limits.get("global_min_delay_seconds"), 1.0, name="limits.global_min_delay_seconds"
+            ),
+            resolve_delay_seconds=_non_negative_float(
+                limits.get("resolve_delay_seconds"), 2.0, name="limits.resolve_delay_seconds"
+            ),
+            read_delay_seconds=_non_negative_float(
+                limits.get("read_delay_seconds"), 2.0, name="limits.read_delay_seconds"
+            ),
+            download_delay_seconds=_non_negative_float(
+                limits.get("download_delay_seconds"), 5.0, name="limits.download_delay_seconds"
+            ),
+            copy_delay_seconds=_non_negative_float(
+                limits.get("copy_delay_seconds"), 10.0, name="limits.copy_delay_seconds"
+            ),
+            upload_delay_seconds=_non_negative_float(
+                limits.get("upload_delay_seconds"), 30.0, name="limits.upload_delay_seconds"
+            ),
+            verify_delay_seconds=_non_negative_float(
+                limits.get("verify_delay_seconds"), 2.0, name="limits.verify_delay_seconds"
+            ),
+            get_messages_chunk_size=_positive_int(
+                limits.get("get_messages_chunk_size"), 100, name="limits.get_messages_chunk_size"
+            ),
+            floodwait_extra_min_seconds=floodwait_min,
+            floodwait_extra_max_seconds=floodwait_max,
         ),
         batch=BatchConfig(
-            size=int(batch.get("size", 25)),
-            pause_between_batches_seconds=int(batch.get("pause_between_batches_seconds", 1800)),
-            idle_sleep_seconds=int(batch.get("idle_sleep_seconds", 30)),
+            size=_positive_int(batch.get("size"), 25, name="batch.size"),
+            pause_between_batches_seconds=int(
+                _non_negative_float(
+                    batch.get("pause_between_batches_seconds"),
+                    1800,
+                    name="batch.pause_between_batches_seconds",
+                )
+            ),
+            idle_sleep_seconds=int(
+                _non_negative_float(batch.get("idle_sleep_seconds"), 30, name="batch.idle_sleep_seconds")
+            ),
         ),
         downloads=DownloadsConfig(
             root=root,
             active_dir=active_dir,
             failed_dir=failed_dir,
             completed_dir=completed_dir,
-            keep_failed=_as_bool(downloads.get("keep_failed"), False),
-            keep_completed=_as_bool(downloads.get("keep_completed"), False),
+            keep_failed=_as_bool(downloads.get("keep_failed"), False, name="downloads.keep_failed"),
+            keep_completed=_as_bool(
+                downloads.get("keep_completed"), False, name="downloads.keep_completed"
+            ),
         ),
         logging=LoggingConfig(
-            level=str(logging_cfg.get("level", "INFO")).upper(),
+            level=logging_level,
             file=_path(base_dir, str(log_file)) if log_file else None,
         ),
         sources=[ChatSpec.from_config(item) for item in migration.get("sources", [])],
