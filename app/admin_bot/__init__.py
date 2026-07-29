@@ -25,7 +25,7 @@ from app.advanced import (
     reset_all_checkpoints,
     resolve_uncertain_upload,
 )
-from app.config import AppConfig
+from app.config import AppConfig, load_config
 from app.control import clear_stop, is_active_phase, read_status, request_stop, write_status
 from app.dashboard_v2 import active_source_progress, dashboard_snapshot, format_bytes, format_eta, issue_center
 from app.db import Database
@@ -197,8 +197,13 @@ def _dashboard_text(config: AppConfig) -> str:
     finally:
         db.close()
     status = read_status(config)
-    q, s, d, t, storage = (
-        data["queue"], data["sources"], data["destinations"], data["telemetry"], data["storage"]
+    q, s, d, t, review, storage = (
+        data["queue"],
+        data["sources"],
+        data["destinations"],
+        data["telemetry"],
+        data["review"],
+        data["storage"],
     )
     phase = str(status.get("phase") or "idle").lower()
     current_source = active_source_progress(status, data["source_progress"])
@@ -272,6 +277,14 @@ def _dashboard_text(config: AppConfig) -> str:
     error = status.get("last_error") or status.get("error")
     if error and phase in {"blocked", "waiting_retry", "error"}:
         lines += ["", f"⚠️ {str(error).replace(chr(10), ' ')[:220]}"]
+    if phase == "blocked" and status.get("review_job_id") is not None:
+        lines.append(f"🔒 Blocking job: #{status['review_job_id']}")
+    if int(review["total"]):
+        lines += [
+            "",
+            f"⚠️ {int(review['total'])} item(s) saved in Issue Center.",
+            "The source queue continues automatically while they wait for review.",
+        ]
     if storage.percent_used >= 80:
         level = "🚨 Critical storage" if storage.percent_used >= 90 else "⚠️ Low storage"
         lines += ["", level, f"Free: {format_bytes(storage.free_bytes)}"]
@@ -306,8 +319,20 @@ def _issues_text(config: AppConfig) -> str:
     for item in rows:
         if item["kind"] == "destination":
             lines += [f"⏸ Destination {item['id']} paused", str(item["error"])[:180], ""]
+        elif item["kind"] == "verification":
+            lines += [
+                f"⚠️ Verification · Job #{item['id']}",
+                f"Source {item['source_chat_id']} · post {item['source_message_id']}",
+                str(item["error"]).replace("\n", " ")[:180],
+                "",
+            ]
         else:
-            lines += [f"❌ Job #{item['id']} · {item['status']}", str(item["error"]).replace("\n", " ")[:180], ""]
+            lines += [
+                f"❌ Job #{item['id']} · {item['status']}",
+                f"Source {item['source_chat_id']} · post {item['source_message_id']}",
+                str(item["error"]).replace("\n", " ")[:180],
+                "",
+            ]
     return "\n".join(lines)[:3900]
 
 
@@ -715,12 +740,33 @@ def _source_page(channels: list[dict[str, Any]], page: int) -> int:
     return max(0, min(page, (len(channels) - 1) // _PAGE_SIZE))
 
 
-def _source_queue_lines(user_id: int, selected: list[str]) -> list[str]:
+def _active_queue_source(path: Path) -> str | None:
+    try:
+        status = read_status(load_config(path))
+    except Exception:
+        return None
+    phase = str(status.get("phase") or "").lower()
+    if phase in {"idle", "watching", "stopped", "source_complete", ""}:
+        return None
+    source_chat = status.get("source_chat")
+    return str(source_chat) if source_chat is not None else None
+
+
+def _source_queue_lines(
+    user_id: int,
+    selected: list[str],
+    active_source_chat: str | None = None,
+) -> list[str]:
     if not selected:
         return ["No sources in the queue."]
     lines = ["Queue order:"]
     for index, chat in enumerate(selected[:8], start=1):
-        state = "🟢 Current" if index == 1 else "⏳ Waiting"
+        if active_source_chat is not None and str(chat) == active_source_chat:
+            state = "🟢 Running"
+        elif index == 1 and active_source_chat is None:
+            state = "▶️ First in queue"
+        else:
+            state = "⏳ Waiting"
         lines.append(f"{index}. {state} · {_channel_title(user_id, chat)[:54]}")
     if len(selected) > 8:
         lines.append(f"… and {len(selected) - 8} more source(s).")
@@ -731,11 +777,12 @@ def _source_text(user_id: int, path: Path, page: int = 0) -> str:
     scanned_channels = _CHANNEL_CACHE.get(user_id, [])
     channels = _source_channels(user_id, path)
     selected = _selection_for(user_id, path)
+    active_source_chat = _active_queue_source(path)
     if not scanned_channels:
         return "\n".join([
             "📚 Source Queue",
             "",
-            * _source_queue_lines(user_id, selected["sources"]),
+            * _source_queue_lines(user_id, selected["sources"], active_source_chat),
             "",
             "Telegram has not been scanned. Tap Scan / Refresh to add sources.",
         ])
@@ -743,7 +790,7 @@ def _source_text(user_id: int, path: Path, page: int = 0) -> str:
         return "\n".join([
             "📚 Source Queue",
             "",
-            * _source_queue_lines(user_id, selected["sources"]),
+            * _source_queue_lines(user_id, selected["sources"], active_source_chat),
             "",
             "All scanned sources are blacklisted.",
         ])
@@ -754,7 +801,7 @@ def _source_text(user_id: int, path: Path, page: int = 0) -> str:
         "📚 Source Queue",
         "",
         f"Selected sources: {len(selected['sources'])}",
-        * _source_queue_lines(user_id, selected["sources"]),
+        * _source_queue_lines(user_id, selected["sources"], active_source_chat),
         "",
         f"Available channels: {start + 1}-{end} of {len(channels)}",
         "Select sources in the order they should run. The next source stays in the waiting list until the first one is complete.",
@@ -796,12 +843,13 @@ def _source_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarku
 
 def _source_queue_text(user_id: int, path: Path) -> str:
     selected = _selection_for(user_id, path)
+    active_source_chat = _active_queue_source(path)
     return "\n".join([
         "📋 Arrange Source Queue",
         "",
-        * _source_queue_lines(user_id, selected["sources"]),
+        * _source_queue_lines(user_id, selected["sources"], active_source_chat),
         "",
-        "Use ▲ or ▼ to change the order. Only the first source will run.",
+        "Use ▲ or ▼ to change the order. The dashboard shows the source running now.",
         "Clear Old keeps the source active and starts again only from future posts.",
         "Delete Jobs permanently removes the source, its saved jobs, and its checkpoints. The next source starts automatically.",
     ])
