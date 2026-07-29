@@ -1,5 +1,8 @@
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
 config.yaml
 config.yaml.*
@@ -19,3 +22,9 @@ sessions/*.session-journal
 sessions/*.session-wal
 sessions/*.session-shm
 sessions/accounts.json
+sessions/accounts.json.*
+
+backups/
+.deploy.lock/
+*.zip
+*.zip.zip
