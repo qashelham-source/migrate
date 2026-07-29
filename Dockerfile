@@ -26,7 +26,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PATH="/opt/venv/bin:$PATH"
 
-RUN groupadd --gid "$APP_GID" migration \
+# Packaging tools are unnecessary at runtime. Removing both the global copies
+# inherited from the base image and the virtualenv copies reduces attack surface.
+RUN python -m pip uninstall --yes setuptools wheel jaraco.context \
+    && python -m pip uninstall --yes pip \
+    && groupadd --gid "$APP_GID" migration \
     && useradd --uid "$APP_UID" --gid "$APP_GID" --create-home --shell /usr/sbin/nologin migration
 
 WORKDIR /app
