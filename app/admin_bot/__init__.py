@@ -652,6 +652,47 @@ async def _scan_channels(config: AppConfig, user_id: int) -> list[dict[str, Any]
     return channels
 
 
+async def _latest_source_position(
+    config: AppConfig,
+    user_id: int,
+    chat: str | int,
+) -> tuple[int, int]:
+    """Read the current source tip from an isolated user-session snapshot."""
+    sessions_dir = config.telegram.sessions_dir
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    source_session = sessions_dir / f"{config.telegram.user_session}.session"
+
+    with tempfile.TemporaryDirectory(prefix="source-tip-", dir=str(sessions_dir)) as temp_dir:
+        workdir = Path(temp_dir)
+        session_name = f"source-tip-{user_id}"
+        await asyncio.to_thread(
+            _snapshot_session_database,
+            source_session,
+            workdir / f"{session_name}.session",
+        )
+        client = Client(
+            name=session_name,
+            api_id=config.telegram.api_id,
+            api_hash=config.telegram.api_hash,
+            workdir=str(workdir),
+            no_updates=True,
+            max_concurrent_transmissions=1,
+        )
+        started = False
+        try:
+            await client.start()
+            started = True
+            source = await client.get_chat(chat)
+            latest = 0
+            async for message in client.get_chat_history(source.id, limit=1):
+                latest = int(getattr(message, "id", 0) or 0)
+                break
+            return int(source.id), latest
+        finally:
+            if started:
+                await client.stop()
+
+
 def _channel_title(user_id: int, chat: str) -> str:
     for item in _CHANNEL_CACHE.get(user_id, []):
         if str(item["chat"]) == str(chat):
@@ -743,6 +784,7 @@ def _source_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarku
         rows.append(nav)
     if selected["sources"]:
         current = _channel_title(user_id, selected["sources"][0])[:26]
+        rows.append([(f"🧹 Clear Old · Keep New: {current}"[:48], "sources:clear:0")])
         rows.append([(f"🗑 Delete Current: {current}"[:48], "sources:delete:0")])
     rows += [
         [("📋 Arrange Queue", "sources:queue"), ("🔄 Scan / Refresh", "sources:scan")],
@@ -760,6 +802,7 @@ def _source_queue_text(user_id: int, path: Path) -> str:
         * _source_queue_lines(user_id, selected["sources"]),
         "",
         "Use ▲ or ▼ to change the order. Only the first source will run.",
+        "Clear Old keeps the source active and starts again only from future posts.",
         "Delete Jobs permanently removes the source, its saved jobs, and its checkpoints. The next source starts automatically.",
     ])
 
@@ -773,7 +816,10 @@ def _source_queue_menu(user_id: int, path: Path) -> InlineKeyboardMarkup:
         rows.append([
             ("▲ Up", f"sources:move:{index}:up"),
             ("▼ Down", f"sources:move:{index}:down"),
-            ("🗑 Delete Jobs", f"sources:delete:{index}"),
+        ])
+        rows.append([
+            ("🧹 Keep New Only", f"sources:clear:{index}"),
+            ("🗑 Delete Forever", f"sources:delete:{index}"),
         ])
     rows += [
         [("⬅️ Source Queue", "sources:view")],
@@ -1016,6 +1062,77 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 selected[index], selected[target] = selected[target], selected[index]
             await edit(query, _source_queue_text(user_id, path), _source_queue_menu(user_id, path))
             await query.answer()
+            return
+        if data.startswith("sources:clear:"):
+            index = int(data.rsplit(":", 1)[1])
+            selected = _selection_for(user_id, path)["sources"]
+            if not 0 <= index < len(selected):
+                await query.answer("Source queue changed. Open Arrange Queue again.", show_alert=True)
+                return
+            chat = selected[index]
+            title = _channel_title(user_id, chat)[:60]
+            await edit(
+                query,
+                "\n".join([
+                    "🧹 Clear Old Jobs?",
+                    "",
+                    title,
+                    "",
+                    "This deletes existing jobs, retries, and repair records for this source.",
+                    "",
+                    "The source stays active. Its current latest post becomes the checkpoint, so only posts added after this will migrate automatically.",
+                ]),
+                _buttons([
+                    [("🧹 Clear & Keep Watching", f"sources:clearok:{index}")],
+                    [("⬅️ Cancel", "sources:queue")],
+                ]),
+            )
+            await query.answer()
+            return
+        if data.startswith("sources:clearok:"):
+            index = int(data.rsplit(":", 1)[1])
+            selected = _selection_for(user_id, path)["sources"]
+            if not 0 <= index < len(selected):
+                await query.answer("Source queue changed. Nothing was cleared.", show_alert=True)
+                return
+            chat = selected[index]
+            title = _channel_title(user_id, chat)[:60]
+            await edit(
+                query,
+                "🧹 Clear Old Jobs\n\nReading the latest source post and clearing existing work…",
+                _back("sources:view", "⬅️ Source Queue"),
+            )
+            try:
+                source_id, latest_message_id = await _latest_source_position(config, user_id, chat)
+                db = _database(config)
+                try:
+                    cleared = MessageQueue(db, config).clear_source_history(
+                        source_id,
+                        latest_message_id,
+                    )
+                finally:
+                    db.close()
+            except Exception as exc:
+                await query.answer("Could not clear old jobs. The source was not changed.", show_alert=True)
+                await edit(
+                    query,
+                    "\n".join([
+                        "🧹 Clear Old Jobs",
+                        "",
+                        f"❌ Could not clear {title}: {exc.__class__.__name__}: {exc}"[:700],
+                        "",
+                        "The source remains unchanged. Try again once Telegram is available.",
+                    ]),
+                    _back("sources:view", "⬅️ Source Queue"),
+                )
+                return
+            _request_mode(config, "sync")
+            await query.answer(
+                f"Cleared {cleared['jobs']} old job(s). This source will now migrate new posts only.",
+                show_alert=True,
+            )
+            await edit(query, _dashboard_text(config), _menu())
+            start_live(user_id, query.message)
             return
         if data.startswith("sources:delete:"):
             index = int(data.rsplit(":", 1)[1])
