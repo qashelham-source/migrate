@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from pyrogram import Client
@@ -10,6 +11,7 @@ from pyrogram.types import Message
 
 from app.config import AppConfig, ChatSpec
 from app.control import write_status
+from app.destination_manager import is_source_blacklisted
 from app.queue import MessageQueue
 from app.telegram_client import (
     ResolvedChat,
@@ -93,6 +95,7 @@ class Scanner:
         scan_mode: str = "full",
         source_index_offset: int = 0,
         source_total_override: int | None = None,
+        config_path: str | Path | None = None,
     ) -> None:
         normalized_mode = str(scan_mode).strip().lower()
         if normalized_mode not in SCAN_MODES:
@@ -109,6 +112,42 @@ class Scanner:
             max(1, int(source_total_override))
             if source_total_override is not None
             else None
+        )
+        self.config_path = Path(config_path) if config_path is not None else None
+
+    def _source_was_removed(self, source: ChatSpec, source_chat_id: int | str) -> bool:
+        if self.config_path is None:
+            return False
+        return is_source_blacklisted(source.chat, self.config_path) or is_source_blacklisted(
+            source_chat_id,
+            self.config_path,
+        )
+
+    def _discard_removed_source(
+        self,
+        *,
+        source: ChatSpec,
+        source_chat_id: int | str,
+        source_title: str,
+        source_index: int,
+        source_total: int,
+    ) -> None:
+        summary = self.queue.purge_source_jobs(source_chat_id)
+        if self.logger:
+            self.logger.info(
+                "Source %s was deleted by an admin; removed %s saved job(s)",
+                source.chat,
+                summary["jobs"],
+            )
+        write_status(
+            self.config,
+            "source_complete",
+            message="Source was deleted. Moving to the next source in the queue.",
+            source=source_title,
+            source_chat=source_chat_id,
+            source_index=source_index,
+            source_total=source_total,
+            deleted_jobs=summary["jobs"],
         )
 
     async def scan(self, stop_event: asyncio.Event) -> None:
@@ -207,6 +246,16 @@ class Scanner:
         )
         resolved_source = await resolve_chat(self.reader, self.limiter, source)
 
+        if self._source_was_removed(source, resolved_source.chat_id):
+            self._discard_removed_source(
+                source=source,
+                source_chat_id=resolved_source.chat_id,
+                source_title=str(resolved_source.title or source.chat),
+                source_index=source_index,
+                source_total=source_total,
+            )
+            return
+
         configured_start = source.start_id if source.start_id is not None else 1
         latest_message_id: int | None = None
         if source.end_id is None:
@@ -295,6 +344,15 @@ class Scanner:
         for chunk_start in range(plan.start_id, plan.end_id + 1, chunk_size):
             if stop_event.is_set():
                 break
+            if self._source_was_removed(source, resolved_source.chat_id):
+                self._discard_removed_source(
+                    source=source,
+                    source_chat_id=resolved_source.chat_id,
+                    source_title=str(resolved_source.title or source.chat),
+                    source_index=source_index,
+                    source_total=source_total,
+                )
+                return
             chunk_end = min(chunk_start + chunk_size - 1, plan.end_id)
             scanned = chunk_end - plan.start_id + 1
             write_status(
@@ -341,6 +399,15 @@ class Scanner:
         for group_index, group in enumerate(grouped, start=1):
             if stop_event.is_set():
                 break
+            if self._source_was_removed(source, resolved_source.chat_id):
+                self._discard_removed_source(
+                    source=source,
+                    source_chat_id=resolved_source.chat_id,
+                    source_title=str(resolved_source.title or source.chat),
+                    source_index=source_index,
+                    source_total=source_total,
+                )
+                return
             if group_index == 1 or group_index % 100 == 0 or group_index == len(grouped):
                 write_status(
                     self.config,
@@ -402,6 +469,18 @@ class Scanner:
                 source_total=source_total,
                 scan_mode=self.scan_mode,
                 checkpoint=plan.baseline,
+            )
+            return
+
+        # Catch a delete request that arrived while the final group was being
+        # added, before a checkpoint can make the old source look complete.
+        if self._source_was_removed(source, resolved_source.chat_id):
+            self._discard_removed_source(
+                source=source,
+                source_chat_id=resolved_source.chat_id,
+                source_title=str(resolved_source.title or source.chat),
+                source_index=source_index,
+                source_total=source_total,
             )
             return
 
