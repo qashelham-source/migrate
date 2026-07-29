@@ -62,6 +62,9 @@ class CycleOutcome:
     source_total: int | None = None
     next_retry_at: str | None = None
     retry_after_seconds: float | None = None
+    review_items: int = 0
+    review_job_id: int | None = None
+    review_summary: str | None = None
     message: str | None = None
 
 
@@ -155,6 +158,10 @@ def _source_status_details(
         "source_paused": state["paused_jobs"],
         "source_failed": state["failed_jobs"],
         "source_skipped": state["skipped_issue_jobs"],
+        "source_review_items": state["review_items"],
+        "review_job_id": state.get("review_job_id"),
+        "review_kind": state.get("review_kind"),
+        "review_summary": state.get("last_error"),
         "source_verification_pending": state["verification_pending_jobs"],
         "source_verification_failed": state["verification_failed_jobs"],
         "source_verification_repairing": state["verification_repairing_jobs"],
@@ -174,15 +181,15 @@ def _source_outcome(
         "source_index": source_index,
         "source_total": source_total,
     }
-    terminal_issues = (
-        int(state["failed_jobs"])
-        + int(state["skipped_issue_jobs"])
-        + int(state["verification_failed_jobs"])
+    primary_failed_jobs = int(state.get("primary_failed_jobs", state["failed_jobs"]))
+    primary_skipped_issue_jobs = int(
+        state.get("primary_skipped_issue_jobs", state["skipped_issue_jobs"])
     )
+    terminal_issues = primary_failed_jobs + primary_skipped_issue_jobs
     if terminal_issues:
         return CycleOutcome(
             "blocked",
-            message="A job failed or verification failed and needs manual review.",
+            message="A source upload failed and needs manual review before it can be retried safely.",
             **common,
         )
     if int(state["paused_jobs"]):
@@ -227,6 +234,20 @@ def _source_outcome(
             "retry",
             retry_after_seconds=5,
             message="Repair verification is still running and will continue automatically.",
+            **common,
+        )
+    review_items = int(state.get("review_items", state["verification_failed_jobs"]))
+    if review_items:
+        review_job_id = state.get("review_job_id")
+        return CycleOutcome(
+            "complete",
+            review_items=review_items,
+            review_job_id=int(review_job_id) if review_job_id is not None else None,
+            review_summary=str(state.get("last_error") or "") or None,
+            message=(
+                f"{review_items} review item(s) were saved in Issue Center. "
+                "The next source can run safely."
+            ),
             **common,
         )
     return CycleOutcome("complete", **common)
@@ -692,10 +713,19 @@ async def _execute_cycle(
         )
         if outcome.state == "complete":
             if source_index < source_total:
+                completion_message = "Source complete. Moving to the next source in the queue."
+                if outcome.review_items:
+                    completion_message = (
+                        f"Source complete. {outcome.review_items} item(s) were saved in Issue Center; "
+                        "moving to the next source."
+                    )
                 write_status(
                     config,
                     "source_complete",
-                    message="Source complete. Moving to the next source in the queue.",
+                    message=completion_message,
+                    review_items=outcome.review_items,
+                    review_job_id=outcome.review_job_id,
+                    review_summary=outcome.review_summary,
                     **_source_status_details(
                         state,
                         source=source_title,
