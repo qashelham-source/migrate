@@ -286,3 +286,115 @@ def test_terminal_repair_failure_is_visible_and_can_be_requeued(tmp_path: Path) 
         assert link["status"] == "pending"
     finally:
         db.close()
+
+def test_fast_duplicate_detector_skips_only_same_destination(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, config)
+        first = {
+            "source_chat_id": "-1001",
+            "source_message_id": 7,
+            "dest_chat_id": "-1002",
+            "file_unique_key": "telegram-media-unique-id",
+            "source_message_ids": [7],
+            "source_topic_id": None,
+            "dest_topic_id": None,
+            "media_group_id": None,
+            "media_type": "video",
+            "file_size": 10,
+            "caption": None,
+        }
+        assert queue.enqueue(**first, status="copied")
+
+        inserted, duplicate = queue.enqueue_with_duplicate_detection(
+            **{**first, "source_chat_id": "-1009", "source_message_id": 8, "source_message_ids": [8]}
+        )
+
+        assert inserted
+        assert duplicate is not None
+        assert duplicate.source_message_id == 7
+        duplicate_row = db.query_one(
+            "SELECT status, last_error FROM messages WHERE source_chat_id = ? AND source_message_id = ?",
+            ("-1009", 8),
+        )
+        assert duplicate_row is not None
+        assert duplicate_row["status"] == "skipped"
+        assert "job #" in str(duplicate_row["last_error"])
+
+        inserted, duplicate = queue.enqueue_with_duplicate_detection(
+            **{
+                **first,
+                "source_chat_id": "-1010",
+                "source_message_id": 9,
+                "source_message_ids": [9],
+                "dest_chat_id": "-1003",
+            }
+        )
+        assert inserted
+        assert duplicate is None
+
+        inserted, duplicate = queue.enqueue_with_duplicate_detection(
+            **{
+                **first,
+                "source_chat_id": "-1011",
+                "source_message_id": 10,
+                "source_message_ids": [10],
+                "dest_topic_id": 42,
+            }
+        )
+        assert inserted
+        assert duplicate is None
+    finally:
+        db.close()
+
+
+def test_fast_duplicate_detector_ignores_text_fallback_and_failed_media(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, config)
+        text_job = {
+            "source_chat_id": "-1001",
+            "source_message_id": 11,
+            "dest_chat_id": "-1002",
+            "file_unique_key": "messages:-1001:11",
+            "source_message_ids": [11],
+            "source_topic_id": None,
+            "dest_topic_id": None,
+            "media_group_id": None,
+            "media_type": "text",
+            "file_size": None,
+            "caption": "same text",
+        }
+        assert queue.enqueue(**text_job, status="copied")
+        inserted, duplicate = queue.enqueue_with_duplicate_detection(
+            **{**text_job, "source_chat_id": "-1009", "source_message_id": 12, "source_message_ids": [12]}
+        )
+        assert inserted
+        assert duplicate is None
+
+        failed_media = {
+            **text_job,
+            "source_chat_id": "-1010",
+            "source_message_id": 13,
+            "source_message_ids": [13],
+            "file_unique_key": "failed-media-unique-id",
+            "media_type": "photo",
+        }
+        assert queue.enqueue(**failed_media, status="failed", last_error="upload failed")
+        inserted, duplicate = queue.enqueue_with_duplicate_detection(
+            **{
+                **failed_media,
+                "source_chat_id": "-1011",
+                "source_message_id": 14,
+                "source_message_ids": [14],
+            }
+        )
+        assert inserted
+        assert duplicate is None
+    finally:
+        db.close()
+

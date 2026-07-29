@@ -473,7 +473,7 @@ class Scanner:
             return
 
         grouped = self._group_messages(messages)
-        added = skipped = existing = 0
+        added = skipped = existing = duplicates = 0
 
         for group_index, group in enumerate(grouped, start=1):
             if stop_event.is_set():
@@ -537,22 +537,32 @@ class Scanner:
             media_group_id = first.media_group_id if processable and len(selected) == len(group) else None
 
             for dest in destinations:
-                inserted = self.queue.enqueue(
-                    source_chat_id=resolved_source.chat_id,
-                    source_message_id=first.id,
-                    dest_chat_id=dest.chat_id,
-                    file_unique_key=unique_key,
-                    source_message_ids=source_message_ids,
-                    source_topic_id=resolved_source.topic_id,
-                    dest_topic_id=dest.topic_id,
-                    media_group_id=media_group_id,
-                    media_type=media_type,
-                    file_size=file_size,
-                    caption=caption,
-                    status=status,
-                    last_error=None if processable else "Filtered out by config",
-                )
-                if inserted and status == "pending":
+                enqueue_kwargs = {
+                    "source_chat_id": resolved_source.chat_id,
+                    "source_message_id": first.id,
+                    "dest_chat_id": dest.chat_id,
+                    "file_unique_key": unique_key,
+                    "source_message_ids": source_message_ids,
+                    "source_topic_id": resolved_source.topic_id,
+                    "dest_topic_id": dest.topic_id,
+                    "media_group_id": media_group_id,
+                    "media_type": media_type,
+                    "file_size": file_size,
+                    "caption": caption,
+                }
+                duplicate = None
+                if processable:
+                    inserted, duplicate = self.queue.enqueue_with_duplicate_detection(**enqueue_kwargs)
+                else:
+                    inserted = self.queue.enqueue(
+                        **enqueue_kwargs,
+                        status=status,
+                        last_error="Filtered out by config",
+                    )
+                if inserted and duplicate is not None:
+                    skipped += 1
+                    duplicates += 1
+                elif inserted and status == "pending":
                     added += 1
                 elif inserted:
                     skipped += 1
@@ -605,10 +615,11 @@ class Scanner:
         )
         if self.logger:
             self.logger.info(
-                "Scan complete: mode=%s added=%s skipped=%s already_queued=%s checkpoint=%s",
+                "Scan complete: mode=%s added=%s skipped=%s duplicates=%s already_queued=%s checkpoint=%s",
                 self.scan_mode,
                 added,
                 skipped,
+                duplicates,
                 existing,
                 plan.end_id,
             )
@@ -625,6 +636,7 @@ class Scanner:
             source_total=source_total,
             added=added,
             skipped=skipped,
+            duplicates=duplicates,
             existing=existing,
             source_messages=len(messages),
             scan_mode=self.scan_mode,

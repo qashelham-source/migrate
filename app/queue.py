@@ -62,6 +62,14 @@ class MediaCacheEntry:
     media_types: list[str]
 
 
+@dataclass(frozen=True)
+class DuplicateMediaDelivery:
+    job_id: int
+    source_chat_id: int | str
+    source_message_id: int
+    status: str
+
+
 class MessageQueue:
     def __init__(self, db: Database, config: AppConfig) -> None:
         self.db = db
@@ -100,6 +108,94 @@ class MessageQueue:
             caption=caption,
             status=status,
             last_error=last_error,
+        )
+
+    def find_duplicate_media_delivery(
+        self,
+        *,
+        source_chat_id: int | str,
+        source_message_id: int,
+        dest_chat_id: int | str,
+        dest_topic_id: int | None,
+        file_unique_key: str,
+    ) -> DuplicateMediaDelivery | None:
+        row = self.db.find_duplicate_media_delivery(
+            source_chat_id=str(source_chat_id),
+            source_message_id=source_message_id,
+            dest_chat_id=str(dest_chat_id),
+            dest_topic_id=dest_topic_id,
+            file_unique_key=file_unique_key,
+        )
+        if not row:
+            return None
+        return DuplicateMediaDelivery(
+            job_id=int(row["id"]),
+            source_chat_id=telegram_peer(row["source_chat_id"]),
+            source_message_id=int(row["source_message_id"]),
+            status=str(row["status"]),
+        )
+
+    def enqueue_with_duplicate_detection(
+        self,
+        *,
+        source_chat_id: int | str,
+        source_message_id: int,
+        dest_chat_id: int | str,
+        file_unique_key: str,
+        source_message_ids: list[int],
+        source_topic_id: int | None,
+        dest_topic_id: int | None,
+        media_group_id: str | None,
+        media_type: str,
+        file_size: int | None,
+        caption: str | None,
+    ) -> tuple[bool, DuplicateMediaDelivery | None]:
+        """Queue a media delivery, recording a skip when its fingerprint already exists."""
+        duplicate = self.find_duplicate_media_delivery(
+            source_chat_id=source_chat_id,
+            source_message_id=source_message_id,
+            dest_chat_id=dest_chat_id,
+            dest_topic_id=dest_topic_id,
+            file_unique_key=file_unique_key,
+        )
+        if duplicate:
+            reason = (
+                "Skipped duplicate media fingerprint already queued or delivered "
+                f"for this destination (job #{duplicate.job_id}, "
+                f"source message #{duplicate.source_message_id})."
+            )
+            inserted = self.enqueue(
+                source_chat_id=source_chat_id,
+                source_message_id=source_message_id,
+                dest_chat_id=dest_chat_id,
+                file_unique_key=file_unique_key,
+                source_message_ids=source_message_ids,
+                source_topic_id=source_topic_id,
+                dest_topic_id=dest_topic_id,
+                media_group_id=media_group_id,
+                media_type=media_type,
+                file_size=file_size,
+                caption=caption,
+                status="skipped",
+                last_error=reason,
+            )
+            return inserted, duplicate
+
+        return (
+            self.enqueue(
+                source_chat_id=source_chat_id,
+                source_message_id=source_message_id,
+                dest_chat_id=dest_chat_id,
+                file_unique_key=file_unique_key,
+                source_message_ids=source_message_ids,
+                source_topic_id=source_topic_id,
+                dest_topic_id=dest_topic_id,
+                media_group_id=media_group_id,
+                media_type=media_type,
+                file_size=file_size,
+                caption=caption,
+            ),
+            None,
         )
 
     def fetch_due(

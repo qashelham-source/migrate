@@ -13,6 +13,7 @@ Use this project only for content you own or have permission to access, copy, an
 - incremental checkpoints and live source watching
 - native Telegram copy/forward with download-and-upload fallback
 - filter-consistent album/media-group handling
+- fast per-destination duplicate detection using Telegram media fingerprints
 - reusable bot `file_id` cache
 - strong destination verification and item-level repair
 - fail-safe destination readiness checks and Issue Center reporting
@@ -130,6 +131,12 @@ Queue states are `pending`, `downloading`, `uploading`, `copied`, `failed`, and 
 - schema initialization never changes job states.
 
 Legacy `SendMultiMedia MEDIA_EMPTY` failures are not silently requeued during startup. Retry them through the repair controls after reviewing the destination.
+
+## Fast media duplicate detector
+
+The fast detector compares Telegram's media fingerprint (`file_unique_id`) before a new job is queued. When the same single media item or complete album is already pending, in progress, or copied to the **same destination and topic**, the later source post is recorded as `skipped` with a reason that identifies the original job. This prevents a restart or repeated repost from producing another copy.
+
+Different destinations and topics remain independent. Text messages and repair jobs are not compared by this detector. It does not download every file or calculate a SHA-256 checksum, so it remains lightweight; a file re-uploaded to Telegram with a different fingerprint can still be copied.
 
 ## Telegram control panel
 
