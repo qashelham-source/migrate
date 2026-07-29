@@ -288,3 +288,52 @@ def test_legacy_broken_pipe_can_be_confirmed_or_retried_after_one_check(tmp_path
         assert confirmed["verified_at"]
     finally:
         db.close()
+
+
+def test_repair_work_retries_automatically_instead_of_blocking_the_next_source() -> None:
+    state = {
+        "failed_jobs": 0,
+        "skipped_issue_jobs": 0,
+        "verification_failed_jobs": 0,
+        "paused_jobs": 0,
+        "active_jobs": 0,
+        "delayed_jobs": 0,
+        "verification_pending_jobs": 0,
+        "verification_repairing_jobs": 1,
+        "runnable_jobs": 1,
+    }
+
+    outcome = migration_main._source_outcome(
+        state,
+        source_chat_id=-100111,
+        source_index=1,
+        source_total=4,
+    )
+
+    assert outcome.state == "retry"
+    assert outcome.retry_after_seconds == 2
+    assert "automatically" in str(outcome.message)
+
+
+def test_waiting_repair_verification_never_blocks_source_progress_on_its_own() -> None:
+    state = {
+        "failed_jobs": 0,
+        "skipped_issue_jobs": 0,
+        "verification_failed_jobs": 0,
+        "paused_jobs": 0,
+        "active_jobs": 0,
+        "delayed_jobs": 0,
+        "verification_pending_jobs": 0,
+        "verification_repairing_jobs": 1,
+        "runnable_jobs": 0,
+    }
+
+    outcome = migration_main._source_outcome(
+        state,
+        source_chat_id=-100111,
+        source_index=1,
+        source_total=4,
+    )
+
+    assert outcome.state == "retry"
+    assert outcome.retry_after_seconds == 5
