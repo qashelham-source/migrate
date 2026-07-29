@@ -456,7 +456,7 @@ def test_expected_skips_stay_out_of_dashboard_and_issue_center(tmp_path: Path) -
         progress = source_migration_progress(db)
         assert len(progress) == 1
         assert progress[0]["total_items"] == 5
-        assert progress[0]["excluded_items"] == 3
+        assert progress[0]["filtered_items"] == 3
         assert progress[0]["eligible_items"] == 2
         assert progress[0]["copied_items"] == 1
         assert progress[0]["blocked_items"] == 1
