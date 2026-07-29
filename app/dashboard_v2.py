@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -243,6 +244,23 @@ def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]
                 states,
             )
 
+    review = {
+        "repair_failed": _count(
+            db,
+            """
+            SELECT COUNT(*) FROM messages
+            WHERE file_unique_key LIKE 'repair:%'
+              AND (
+                    status = 'failed'
+                 OR (status = 'skipped'
+                     AND LOWER(COALESCE(last_error, '')) NOT LIKE '%filtered out by config%')
+              )
+            """,
+        ),
+        "verification_failed": int(verification["failed"]),
+    }
+    review["total"] = review["repair_failed"] + review["verification_failed"]
+
     telemetry = {"active": 0, "speed_bps": 0.0, "eta_seconds": None}
     if _table_exists(db, "job_telemetry"):
         row = db.query_one(
@@ -267,6 +285,7 @@ def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]
         "source_progress": source_migration_progress(db),
         "destinations": destinations,
         "verification": verification,
+        "review": review,
         "telemetry": telemetry,
         "storage": storage_snapshot(storage_path),
     }
@@ -274,6 +293,7 @@ def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]
 
 def issue_center(db: Database, limit: int = 20) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
+    issue_job_ids: set[int] = set()
 
     for row in db.query(
         """
@@ -287,6 +307,7 @@ def issue_center(db: Database, limit: int = 20) -> list[dict[str, Any]]:
         """,
         (max(1, int(limit)),),
     ):
+        issue_job_ids.add(int(row["id"]))
         issues.append(
             {
                 "kind": "job",
@@ -301,6 +322,55 @@ def issue_center(db: Database, limit: int = 20) -> list[dict[str, Any]]:
                 "updated_at": str(row["updated_at"] or ""),
             }
         )
+
+    if _table_exists(db, "verification_results"):
+        for row in db.query(
+            """
+            SELECT m.id, m.source_chat_id, m.dest_chat_id, m.source_message_id,
+                   m.media_type, vr.expected_count, vr.present_count,
+                   vr.media_match, vr.caption_match, vr.size_match,
+                   vr.missing_source_message_ids, vr.details, vr.checked_at
+            FROM verification_results vr
+            JOIN messages m ON m.id = vr.job_id
+            WHERE vr.status = 'failed'
+            ORDER BY vr.checked_at DESC, m.id DESC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ):
+            job_id = int(row["id"])
+            if job_id in issue_job_ids:
+                continue
+            expected = int(row["expected_count"] or 0)
+            present = int(row["present_count"] or 0)
+            reasons: list[str] = []
+            if expected != present:
+                reasons.append(f"destination has {present}/{expected} item(s)")
+            if row["media_match"] == 0:
+                reasons.append("media type mismatch")
+            if row["caption_match"] == 0:
+                reasons.append("caption mismatch")
+            if row["size_match"] == 0:
+                reasons.append("file size mismatch")
+            try:
+                missing_ids = json.loads(row["missing_source_message_ids"] or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                missing_ids = []
+            if isinstance(missing_ids, list) and missing_ids:
+                reasons.append(f"missing source item(s): {', '.join(str(value) for value in missing_ids[:5])}")
+            issues.append(
+                {
+                    "kind": "verification",
+                    "id": job_id,
+                    "source_chat_id": str(row["source_chat_id"]),
+                    "dest_chat_id": str(row["dest_chat_id"]),
+                    "source_message_id": int(row["source_message_id"]),
+                    "media_type": str(row["media_type"] or "unknown"),
+                    "status": "verification failed",
+                    "error": "; ".join(reasons) or "Destination media failed strict verification",
+                    "updated_at": str(row["checked_at"] or ""),
+                }
+            )
 
     if _table_exists(db, "destination_health"):
         for row in db.query(
