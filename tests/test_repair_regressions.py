@@ -15,7 +15,7 @@ from app.config import ChatSpec, load_config
 from app.db import Database
 from app.queue import MessageJob, MessageQueue
 from app.scanner import Scanner
-from app.telegram_client import save_accounts
+from app.telegram_client import load_accounts, save_accounts
 from app.upload import Uploader
 from main import choose_writer_for_destinations
 
@@ -89,7 +89,13 @@ def test_admin_fallback_never_authorizes_an_unrelated_cached_account(
     config.ensure_directories()
     save_accounts(config, {"operator": {"id": 111}, "stale-session": {"id": 999}})
 
-    assert _authorized_ids(config) == {111}
+    authorized = _authorized_ids(config)
+    assert authorized == {111}, {
+        "admins": config.telegram.admin_ids,
+        "active_session": config.telegram.user_session,
+        "accounts": load_accounts(config),
+        "function_names": _authorized_ids.__code__.co_names,
+    }
 
 
 def test_source_topic_configuration_is_rejected_before_any_scan(tmp_path: Path) -> None:
