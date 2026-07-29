@@ -570,7 +570,7 @@ class Database:
         result["next_retry_at"] = str(row["next_retry_at"]) if row and row["next_retry_at"] else None
 
         issue = self.query_one(
-            """
+            f"""
             SELECT m.id, m.last_error,
                    CASE
                        WHEN vr.status = 'failed' THEN 'verification'
