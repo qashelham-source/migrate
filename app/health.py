@@ -48,7 +48,7 @@ async def run_health_check(
     writer_me: Any,
     logger: Any | None = None,
 ) -> dict[str, Any]:
-    write_status(config, "health_check", message="Menjalankan pre-flight health check...")
+    write_status(config, "health_check", message="Running pre-flight health check...")
     checks: list[dict[str, Any]] = []
 
     def add(name: str, status: str, detail: str, **extra: Any) -> None:
@@ -62,17 +62,17 @@ async def run_health_check(
         "pass" if session_path.exists() else "fail",
         f"{reader_me.first_name or 'Telegram user'} ({reader_me.id})"
         if session_path.exists()
-        else f"Session file tidak dijumpai: {session_path.name}",
+        else f"Session file not found: {session_path.name}",
     )
 
     if writer is reader:
-        add("writer", "warn", "Upload menggunakan user session")
+        add("writer", "warn", "Uploads use the user session")
     else:
         add("writer", "pass", f"{writer_me.first_name or 'Uploader bot'} ({writer_me.id})")
 
     sources = [spec for spec in config.sources if str(spec.chat or "").strip()]
     if not sources:
-        add("source", "fail", "Source belum ditetapkan")
+        add("source", "fail", "No source configured")
     for index, spec in enumerate(sources, start=1):
         try:
             resolved = await resolve_chat(reader, limiter, spec)
@@ -80,7 +80,7 @@ async def run_health_check(
             add(
                 f"source_{index}",
                 "pass" if readable else "warn",
-                f"{resolved.title} ({resolved.chat_id})" + (" boleh dibaca" if readable else " tiada history yang boleh disahkan"),
+                f"{resolved.title} ({resolved.chat_id})" + (" is readable" if readable else " has no verifiable history"),
                 chat_id=resolved.chat_id,
             )
         except Exception as exc:
@@ -88,7 +88,7 @@ async def run_health_check(
 
     destinations = [spec for spec in config.destinations if str(spec.chat or "").strip()]
     if not destinations:
-        add("destination", "fail", "Destination belum ditetapkan")
+        add("destination", "fail", "No destination configured")
     for index, spec in enumerate(destinations, start=1):
         sending_client = writer
         sender = writer_me
@@ -125,7 +125,7 @@ async def run_health_check(
             )
             can_post, permission_detail = _member_can_post(member)
             status = "pass" if can_post is True else "fail" if can_post is False else "warn"
-            detail = f"{resolved.title} ({resolved.chat_id}) melalui {route}: {permission_detail}"
+            detail = f"{resolved.title} ({resolved.chat_id}) via {route}: {permission_detail}"
             add(
                 f"destination_{index}",
                 status,
@@ -137,7 +137,7 @@ async def run_health_check(
             add(
                 f"destination_{index}",
                 "warn",
-                f"{resolved.title} ({resolved.chat_id}) boleh resolve melalui {route}, permission tidak dapat disahkan: {exc}",
+                f"{resolved.title} ({resolved.chat_id}) resolves via {route}, but permissions could not be verified: {exc}",
                 chat_id=resolved.chat_id,
                 route=route,
             )
@@ -149,7 +149,7 @@ async def run_health_check(
     add(
         "storage",
         "pass" if disk_ok else "fail",
-        f"{free_gb:.2f} GB kosong ({free_ratio * 100:.1f}%)",
+        f"{free_gb:.2f} GB free ({free_ratio * 100:.1f}%)",
         free_bytes=usage.free,
         total_bytes=usage.total,
     )
@@ -178,7 +178,7 @@ async def run_health_check(
     write_status(
         config,
         "health_complete",
-        message="Health check selesai.",
+        message="Health check complete.",
         health=overall,
         checks=len(checks),
         failed=sum(1 for item in checks if item["status"] == "fail"),
