@@ -28,15 +28,23 @@ class Worker:
         queue: MessageQueue,
         uploader: Uploader,
         logger: Any | None = None,
+        source_chat_id: int | str | None = None,
+        source_index: int | None = None,
+        source_total: int | None = None,
+        source_label: str | None = None,
     ) -> None:
         self.config = config
         self.queue = queue
         self.uploader = uploader
         self.logger = logger
+        self.source_chat_id = source_chat_id
+        self.source_index = source_index
+        self.source_total = source_total
+        self.source_label = source_label
         self.storage_policy = StoragePolicy.from_environment()
 
     def _status_details(self, job: MessageJob | None = None, **extra: Any) -> dict[str, Any]:
-        counts = self.queue.counts_by_status()
+        counts = self.queue.counts_by_status(self.source_chat_id)
         details: dict[str, Any] = {
             "pending": counts.get("pending", 0),
             "downloading": counts.get("downloading", 0),
@@ -49,6 +57,14 @@ class Worker:
             details.update(storage_snapshot(self.config.downloads.root, self.storage_policy).as_status())
         except OSError:
             pass
+        if self.source_index is not None and self.source_total is not None:
+            details.update(
+                {
+                    "source_index": self.source_index,
+                    "source_total": self.source_total,
+                    "source": self.source_label or self.source_chat_id,
+                }
+            )
         if job is not None:
             details.update(
                 {
@@ -66,7 +82,7 @@ class Worker:
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
-            jobs = self.queue.claim_due(self.config.batch.size)
+            jobs = self.queue.claim_due(self.config.batch.size, self.source_chat_id)
             if not jobs:
                 if self.logger:
                     self.logger.info("No due pending jobs")
@@ -91,6 +107,14 @@ class Worker:
             if stop_event.is_set():
                 break
             if len(jobs) >= self.config.batch.size:
+                if not self.queue.fetch_due(1, self.source_chat_id):
+                    write_status(
+                        self.config,
+                        "idle",
+                        message="Semua job yang boleh dijalankan untuk source ini selesai.",
+                        **self._status_details(),
+                    )
+                    return
                 pause = self.config.batch.pause_between_batches_seconds
                 if self.logger:
                     self.logger.info("Batch complete; pausing %ss before next batch", pause)
@@ -299,6 +323,7 @@ class Verifier:
         destination_client: Client,
         limiter: TelegramLimiter,
         logger: Any | None = None,
+        source_chat_id: int | str | None = None,
     ) -> None:
         self.config = config
         self.queue = queue
@@ -306,10 +331,14 @@ class Verifier:
         self.destination_client = destination_client
         self.limiter = limiter
         self.logger = logger
+        self.source_chat_id = source_chat_id
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
-            jobs = self.queue.fetch_for_verification(self.config.batch.size)
+            jobs = self.queue.fetch_for_verification(
+                self.config.batch.size,
+                self.source_chat_id,
+            )
             if not jobs:
                 if self.logger:
                     self.logger.info("No copied jobs need verification")
