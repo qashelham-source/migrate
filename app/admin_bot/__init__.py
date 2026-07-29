@@ -10,7 +10,13 @@ from typing import Any, Callable
 
 from pyrogram import Client, filters, idle
 from pyrogram.errors import MessageNotModified
-from pyrogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
+from pyrogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    WebAppInfo,
+)
 
 from app.advanced import (
     REPAIR_CATEGORIES,
@@ -24,6 +30,7 @@ from app.advanced import (
     reset_all_checkpoints,
     resolve_uncertain_upload,
 )
+from app.admin_auth import authorized_ids as _authorized_ids, is_authorized as _is_authorized
 from app.config import AppConfig, load_config
 from app.control import clear_stop, is_active_phase, read_status, request_stop, write_status
 from app.dashboard_v2 import active_source_progress, dashboard_snapshot, format_bytes, format_eta, issue_center
@@ -38,7 +45,6 @@ from app.destination_manager import (
 )
 from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
 from app.queue import MessageQueue
-from app.telegram_client import load_accounts
 
 _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
 _CHANNEL_CACHE: dict[int, list[dict[str, Any]]] = {}
@@ -65,15 +71,22 @@ def _buttons(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
     )
 
 
-def _menu() -> InlineKeyboardMarkup:
-    return _buttons(
-        [
-            [("📚 Source Queue", "sources:view"), ("🎯 Destinations", "destinations:view")],
-            [("🧠 Smart Center", "smart:menu"), ("⚙️ Settings", "settings:view")],
-            [("▶️ Start Queue", "run:now"), ("⏹ Stop", "stop:current")],
-            [("🔄 Refresh", "dashboard:view")],
-        ]
-    )
+def _menu(config: AppConfig | None = None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("📚 Source Queue", callback_data="sources:view"),
+         InlineKeyboardButton("🎯 Destinations", callback_data="destinations:view")],
+        [InlineKeyboardButton("🧠 Smart Center", callback_data="smart:menu"),
+         InlineKeyboardButton("⚙️ Settings", callback_data="settings:view")],
+        [InlineKeyboardButton("▶️ Start Queue", callback_data="run:now"),
+         InlineKeyboardButton("⏹ Stop", callback_data="stop:current")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="dashboard:view")],
+    ]
+    if config and config.mini_app.enabled:
+        rows.insert(
+            0,
+            [InlineKeyboardButton("✨ Open Mini Dashboard", web_app=WebAppInfo(url=config.mini_app.public_url))],
+        )
+    return InlineKeyboardMarkup(rows)
 
 
 def _back(target: str = "menu", label: str = "⬅️ Dashboard") -> InlineKeyboardMarkup:
@@ -103,29 +116,6 @@ def _advanced_menu() -> InlineKeyboardMarkup:
             [("⬅️ Smart Center", "smart:menu")],
         ]
     )
-
-
-def _authorized_ids(config: AppConfig) -> set[int]:
-    """Return explicit admin IDs, with a narrow first-run fallback for the active session."""
-    configured = {
-        int(user_id)
-        for user_id in config.telegram.admin_ids
-        if isinstance(user_id, int) or str(user_id).strip().isdigit()
-    }
-    if configured:
-        return configured
-
-    # A fresh install can bootstrap from the logged-in operator, but a stale
-    # account cache must never grant access to every session it happens to contain.
-    active_account = load_accounts(config).get(config.telegram.user_session)
-    try:
-        return {int(active_account["id"])}
-    except (KeyError, TypeError, ValueError):
-        return set()
-
-
-def _is_authorized(config: AppConfig, user_id: int | None) -> bool:
-    return user_id is not None and user_id in _authorized_ids(config)
 
 
 def _database(config: AppConfig) -> Database:
@@ -1036,7 +1026,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 text = _dashboard_text(config)
                 if text != last:
                     with suppress(MessageNotModified):
-                        await message.edit_text(text, reply_markup=_menu())
+                        await message.edit_text(text, reply_markup=_menu(config))
                     last = text
                 await asyncio.sleep(4)
         except (asyncio.CancelledError, Exception):
@@ -1056,7 +1046,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await reject(message=message)
             return
         assert user_id is not None
-        sent = await message.reply_text(_dashboard_text(config), reply_markup=_menu())
+        sent = await message.reply_text(_dashboard_text(config), reply_markup=_menu(config))
         start_live(user_id, sent)
 
     @app.on_callback_query()
@@ -1073,7 +1063,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             _FINDER_INPUTS.discard(user_id)
 
         if data in {"menu", "dashboard:view"}:
-            await edit(query, _dashboard_text(config), _menu())
+            await edit(query, _dashboard_text(config), _menu(config))
             start_live(user_id, query.message)
             await query.answer("Updated" if data == "dashboard:view" else None)
             return
@@ -1255,7 +1245,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 f"Removed {cleared['jobs']} old job(s). {title} will now migrate new posts only.",
                 show_alert=True,
             )
-            await edit(query, _dashboard_text(config), _menu())
+            await edit(query, _dashboard_text(config), _menu(config))
             start_live(user_id, query.message)
             return
         if data.startswith("sources:delete:"):
@@ -1313,7 +1303,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 f"Removed {deleted['jobs']} saved job(s) for {title}. Starting the next source.",
                 show_alert=True,
             )
-            await edit(query, _dashboard_text(config), _menu())
+            await edit(query, _dashboard_text(config), _menu(config))
             start_live(user_id, query.message)
             return
         if data.startswith("sources:remove:"):
@@ -1343,7 +1333,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             _persist_scanned_source_titles(config, path, _CHANNEL_CACHE.get(user_id, []))
             _request_mode(config, "run")
             await query.answer("Source queue saved and started in order.", show_alert=True)
-            await edit(query, _dashboard_text(config), _menu())
+            await edit(query, _dashboard_text(config), _menu(config))
             start_live(user_id, query.message)
             return
         if data == "destinations:save":
@@ -1495,7 +1485,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 await query.answer("Stop request sent.", show_alert=True)
             else:
                 await query.answer("No active migration.", show_alert=True)
-            await edit(query, _dashboard_text(config), _menu())
+            await edit(query, _dashboard_text(config), _menu(config))
             start_live(user_id, query.message)
             return
         await query.answer()
@@ -1517,7 +1507,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await message.reply_text(_finder_result_text(text, match), reply_markup=_finder_menu())
             return
         if not text.startswith("/start"):
-            sent = await message.reply_text(_dashboard_text(config), reply_markup=_menu())
+            sent = await message.reply_text(_dashboard_text(config), reply_markup=_menu(config))
             if user_id is not None:
                 start_live(user_id, sent)
 
