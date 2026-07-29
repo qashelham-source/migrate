@@ -32,7 +32,7 @@ async def refresh_source_registry(
     write_status(
         config,
         "starting",
-        message="Mengemaskini Source Registry daripada dialog Telegram...",
+        message="Updating Source Registry from Telegram dialogs...",
     )
     try:
         async for dialog in reader.get_dialogs():
@@ -61,7 +61,7 @@ async def refresh_source_registry(
         write_status(
             config,
             "starting",
-            message="Source Registry dikemaskini sebahagian; dialog Telegram berhenti awal.",
+            message="Source Registry was partially updated; Telegram dialog loading stopped early.",
             source_registry_count=discovered,
             source_registry_error=f"{exc.__class__.__name__}: {exc}"[:1000],
         )
@@ -72,7 +72,7 @@ async def refresh_source_registry(
     write_status(
         config,
         "starting",
-        message="Source Registry selesai dikemaskini.",
+        message="Source Registry update complete.",
         source_registry_count=discovered,
     )
     return discovered
