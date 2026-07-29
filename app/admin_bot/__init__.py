@@ -42,6 +42,7 @@ from app.telegram_client import load_accounts
 
 _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
 _CHANNEL_CACHE: dict[int, list[dict[str, Any]]] = {}
+_SOURCE_TITLE_CACHE: dict[Path, dict[str, str]] = {}
 _SELECTIONS: dict[int, dict[str, list[str]]] = {}
 _FINDER_INPUTS: set[int] = set()
 _PAGE_SIZE = 8
@@ -657,7 +658,8 @@ async def _scan_channels(config: AppConfig, user_id: int) -> list[dict[str, Any]
                 if not any(value in kind for value in ("channel", "group", "supergroup")):
                     continue
                 chat_id = str(chat.id)
-                title = str(chat.title or chat.username or chat.id)
+                username = str(chat.username or "").strip() or None
+                title = str(chat.title or username or chat.id)
                 can_destination = False
                 access = "🟢 Ready"
                 try:
@@ -669,6 +671,7 @@ async def _scan_channels(config: AppConfig, user_id: int) -> list[dict[str, Any]
                 channels.append({
                     "chat": chat_id,
                     "title": title,
+                    "username": username,
                     "kind": "Channel" if "channel" in kind else "Group",
                     "can_source": True,
                     "can_destination": can_destination,
@@ -723,11 +726,80 @@ async def _latest_source_position(
                 await client.stop()
 
 
-def _channel_title(user_id: int, chat: str) -> str:
+def _stored_source_titles(path: Path) -> dict[str, str]:
+    """Return durable titles for saved sources when Telegram has not been scanned this session."""
+    cache_key = path.resolve()
+    cached = _SOURCE_TITLE_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    titles: dict[str, str] = {}
+    try:
+        config = load_config(cache_key)
+        db = _database(config)
+        try:
+            rows = db.query("SELECT source_chat_id, title FROM source_registry")
+        finally:
+            db.close()
+    except (OSError, sqlite3.Error, ValueError):
+        rows = []
+
+    for row in rows:
+        chat_id = str(row["source_chat_id"])
+        title = str(row["title"] or "").strip()
+        if title and title != chat_id:
+            titles[chat_id] = title
+    _SOURCE_TITLE_CACHE[cache_key] = titles
+    return titles
+
+
+def _persist_scanned_source_titles(
+    config: AppConfig,
+    path: Path,
+    channels: list[dict[str, Any]],
+) -> None:
+    """Persist selected source titles so a later bot restart does not expose raw IDs."""
+    selected = {str(item["chat"]) for item in get_sources(path)}
+    if not selected:
+        return
+
+    db: Database | None = None
+    changed = False
+    try:
+        db = _database(config)
+        queue = MessageQueue(db, config)
+        for channel in channels:
+            chat = str(channel["chat"])
+            title = str(channel.get("title") or "").strip()
+            if chat not in selected or not title or title == chat:
+                continue
+            queue.register_source(
+                source_chat_id=chat,
+                title=title,
+                username=channel.get("username"),
+                chat_type=str(channel.get("kind") or "channel").lower(),
+                latest_seen_message_id=None,
+            )
+            changed = True
+    except (OSError, sqlite3.Error):
+        return
+    finally:
+        if db is not None:
+            db.close()
+
+    if changed:
+        _SOURCE_TITLE_CACHE.pop(path.resolve(), None)
+
+
+def _channel_title(user_id: int, chat: str, path: Path | None = None) -> str:
     for item in _CHANNEL_CACHE.get(user_id, []):
         if str(item["chat"]) == str(chat):
             return str(item["title"])
-    return str(chat)
+    if path is not None:
+        saved_title = _stored_source_titles(path).get(str(chat))
+        if saved_title:
+            return saved_title
+    return "Unnamed channel"
 
 
 def _source_channels(user_id: int, path: Path) -> list[dict[str, Any]]:
@@ -759,20 +831,21 @@ def _active_queue_source(path: Path) -> str | None:
 
 def _source_queue_lines(
     user_id: int,
+    path: Path,
     selected: list[str],
     active_source_chat: str | None = None,
 ) -> list[str]:
     if not selected:
         return ["No sources in the queue."]
-    lines = ["Queue order:"]
+    lines = [f"Queue order · {len(selected)} source(s):"]
     for index, chat in enumerate(selected[:8], start=1):
         if active_source_chat is not None and str(chat) == active_source_chat:
-            state = "🟢 Running"
+            state = "🟢 Running now"
         elif index == 1 and active_source_chat is None:
-            state = "▶️ First in queue"
+            state = "▶️ Next to run"
         else:
-            state = "⏳ Waiting"
-        lines.append(f"{index}. {state} · {_channel_title(user_id, chat)[:54]}")
+            state = "⏳ Waiting in queue"
+        lines.append(f"{index}. {state} · {_channel_title(user_id, chat, path)[:54]}")
     if len(selected) > 8:
         lines.append(f"… and {len(selected) - 8} more source(s).")
     return lines
@@ -787,15 +860,15 @@ def _source_text(user_id: int, path: Path, page: int = 0) -> str:
         return "\n".join([
             "📚 Source Queue",
             "",
-            * _source_queue_lines(user_id, selected["sources"], active_source_chat),
+            * _source_queue_lines(user_id, path, selected["sources"], active_source_chat),
             "",
-            "Telegram has not been scanned. Tap Scan / Refresh to add sources.",
+            "Showing your saved queue. Tap Scan / Refresh to discover accessible channels and refresh their names.",
         ])
     if not channels:
         return "\n".join([
             "📚 Source Queue",
             "",
-            * _source_queue_lines(user_id, selected["sources"], active_source_chat),
+            * _source_queue_lines(user_id, path, selected["sources"], active_source_chat),
             "",
             "All scanned sources are blacklisted.",
         ])
@@ -806,7 +879,7 @@ def _source_text(user_id: int, path: Path, page: int = 0) -> str:
         "📚 Source Queue",
         "",
         f"Selected sources: {len(selected['sources'])}",
-        * _source_queue_lines(user_id, selected["sources"], active_source_chat),
+        * _source_queue_lines(user_id, path, selected["sources"], active_source_chat),
         "",
         f"Available channels: {start + 1}-{end} of {len(channels)}",
         "Select sources in the order they should run. The next source stays in the waiting list until the first one is complete.",
@@ -834,12 +907,8 @@ def _source_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarku
         nav.append(("➡️", f"sources:page:{page + 1}"))
     if nav:
         rows.append(nav)
-    if selected["sources"]:
-        current = _channel_title(user_id, selected["sources"][0])[:26]
-        rows.append([(f"🧹 Clear Old · Keep New: {current}"[:48], "sources:clear:0")])
-        rows.append([(f"🗑 Delete Current: {current}"[:48], "sources:delete:0")])
     rows += [
-        [("📋 Arrange Queue", "sources:queue"), ("🔄 Scan / Refresh", "sources:scan")],
+        [("🛠 Manage Queue", "sources:queue"), ("🔄 Scan / Refresh", "sources:scan")],
         [("✅ Save & Start Queue", "sources:save")],
         [("🎯 Manage Destinations", "destinations:view"), ("⬅️ Dashboard", "menu")],
     ]
@@ -852,11 +921,11 @@ def _source_queue_text(user_id: int, path: Path) -> str:
     return "\n".join([
         "📋 Arrange Source Queue",
         "",
-        * _source_queue_lines(user_id, selected["sources"], active_source_chat),
+        * _source_queue_lines(user_id, path, selected["sources"], active_source_chat),
         "",
         "Use ▲ or ▼ to change the order. The dashboard shows the source running now.",
-        "Clear Old keeps the source active and starts again only from future posts.",
-        "Delete Jobs permanently removes the source, its saved jobs, and its checkpoints. The next source starts automatically.",
+        "New Posts Only removes old work but keeps the source active for future posts.",
+        "Remove Source permanently blacklists it and deletes its saved work and checkpoints.",
     ])
 
 
@@ -864,15 +933,15 @@ def _source_queue_menu(user_id: int, path: Path) -> InlineKeyboardMarkup:
     selected = _selection_for(user_id, path)
     rows: list[list[tuple[str, str]]] = []
     for index, chat in enumerate(selected["sources"]):
-        label = _channel_title(user_id, chat)[:28]
+        label = _channel_title(user_id, chat, path)[:28]
         rows.append([(f"{index + 1}. {label}", f"sources:noopq:{index}")])
         rows.append([
             ("▲ Up", f"sources:move:{index}:up"),
             ("▼ Down", f"sources:move:{index}:down"),
         ])
         rows.append([
-            ("🧹 Keep New Only", f"sources:clear:{index}"),
-            ("🗑 Delete Forever", f"sources:delete:{index}"),
+            ("🧹 New Posts Only", f"sources:clear:{index}"),
+            ("🗑 Remove Source", f"sources:delete:{index}"),
         ])
     rows += [
         [("⬅️ Source Queue", "sources:view")],
@@ -902,7 +971,7 @@ def _destination_text(user_id: int, path: Path, page: int = 0) -> str:
         "",
     ]
     if selected["destinations"]:
-        lines.append("Active: " + ", ".join(_channel_title(user_id, chat)[:24] for chat in selected["destinations"][:4]))
+        lines.append("Active: " + ", ".join(_channel_title(user_id, chat, path)[:24] for chat in selected["destinations"][:4]))
     if available:
         lines += [f"Available channels: {start + 1}-{end} of {len(available)}", "Choose destinations, then save."]
     else:
@@ -1022,6 +1091,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await edit(query, f"{title}\n\nScanning channels and groups…", _back(f"{target}:view", "⬅️ Cancel"))
             try:
                 _CHANNEL_CACHE[user_id] = await _scan_channels(config, user_id)
+                _persist_scanned_source_titles(config, path, _CHANNEL_CACHE[user_id])
                 _SELECTIONS.pop(user_id, None)
                 if target == "destinations":
                     await edit(query, _destination_text(user_id, path), _destination_menu(user_id, path))
@@ -1123,20 +1193,20 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 await query.answer("Source queue changed. Open Arrange Queue again.", show_alert=True)
                 return
             chat = selected[index]
-            title = _channel_title(user_id, chat)[:60]
+            title = _channel_title(user_id, chat, path)[:60]
             await edit(
                 query,
                 "\n".join([
-                    "🧹 Clear Old Jobs?",
+                    "🧹 Start From New Posts?",
                     "",
                     title,
                     "",
-                    "This deletes existing jobs, retries, and repair records for this source.",
+                    "This removes existing jobs, retries, and repair records for this source.",
                     "",
-                    "The source stays active. Its current latest post becomes the checkpoint, so only posts added after this will migrate automatically.",
+                    "The source stays active. The bot will migrate only posts added after now.",
                 ]),
                 _buttons([
-                    [("🧹 Clear & Keep Watching", f"sources:clearok:{index}")],
+                    [("🧹 Keep New Posts Only", f"sources:clearok:{index}")],
                     [("⬅️ Cancel", "sources:queue")],
                 ]),
             )
@@ -1149,10 +1219,10 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 await query.answer("Source queue changed. Nothing was cleared.", show_alert=True)
                 return
             chat = selected[index]
-            title = _channel_title(user_id, chat)[:60]
+            title = _channel_title(user_id, chat, path)[:60]
             await edit(
                 query,
-                "🧹 Clear Old Jobs\n\nReading the latest source post and clearing existing work…",
+                "🧹 New Posts Only\n\nReading the latest source post and clearing existing work…",
                 _back("sources:view", "⬅️ Source Queue"),
             )
             try:
@@ -1170,7 +1240,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 await edit(
                     query,
                     "\n".join([
-                        "🧹 Clear Old Jobs",
+                        "🧹 New Posts Only",
                         "",
                         f"❌ Could not clear {title}: {exc.__class__.__name__}: {exc}"[:700],
                         "",
@@ -1181,7 +1251,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 return
             _request_mode(config, "sync")
             await query.answer(
-                f"Cleared {cleared['jobs']} old job(s). This source will now migrate new posts only.",
+                f"Removed {cleared['jobs']} old job(s). {title} will now migrate new posts only.",
                 show_alert=True,
             )
             await edit(query, _dashboard_text(config), _menu())
@@ -1194,20 +1264,20 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 await query.answer("Source queue changed. Open Arrange Queue again.", show_alert=True)
                 return
             chat = selected[index]
-            title = _channel_title(user_id, chat)[:60]
+            title = _channel_title(user_id, chat, path)[:60]
             await edit(
                 query,
                 "\n".join([
-                    "🗑 Delete Source Jobs?",
+                    "🗑 Remove Source Permanently?",
                     "",
                     title,
                     "",
-                    "This permanently removes the source from the queue, adds it to the blacklist, and deletes all saved migration jobs and checkpoints.",
+                    "This removes the source from the queue, adds it to the blacklist, and deletes all saved migration jobs and checkpoints.",
                     "",
                     "It will not be scanned again. The next source will start automatically.",
                 ]),
                 _buttons([
-                    [("🗑 Delete Permanently", f"sources:purge:{index}")],
+                    [("🗑 Remove Permanently", f"sources:purge:{index}")],
                     [("⬅️ Cancel", "sources:queue")],
                 ]),
             )
@@ -1220,7 +1290,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 await query.answer("Source queue changed. Nothing was deleted.", show_alert=True)
                 return
             chat = selected[index]
-            title = _channel_title(user_id, chat)[:60]
+            title = _channel_title(user_id, chat, path)[:60]
             try:
                 db = _database(config)
                 try:
@@ -1239,7 +1309,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             ]
             _request_mode(config, "run")
             await query.answer(
-                f"Deleted {deleted['jobs']} saved job(s) for {title}. Starting the next source.",
+                f"Removed {deleted['jobs']} saved job(s) for {title}. Starting the next source.",
                 show_alert=True,
             )
             await edit(query, _dashboard_text(config), _menu())
@@ -1269,6 +1339,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 await query.answer("The source and destination cannot be the same channel.", show_alert=True)
                 return
             set_sources(selected["sources"], path)
+            _persist_scanned_source_titles(config, path, _CHANNEL_CACHE.get(user_id, []))
             _request_mode(config, "run")
             await query.answer("Source queue saved and started in order.", show_alert=True)
             await edit(query, _dashboard_text(config), _menu())
