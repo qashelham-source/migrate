@@ -82,9 +82,11 @@ def test_admin_fallback_never_authorizes_an_unrelated_cached_account(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv("ADMIN_USER_ID", raising=False)
-    monkeypatch.setattr(app_config, "load_dotenv", lambda: None)
+    # Keep an empty value present so python-dotenv cannot restore a value from
+    # another test's temporary .env file.
+    monkeypatch.setenv("ADMIN_USER_ID", "")
     config = load_config(_write_config(tmp_path / "config.yaml", admin_ids=[]))
+    assert config.telegram.admin_ids == ()
     config.ensure_directories()
     save_accounts(config, {"operator": {"id": 111}, "stale-session": {"id": 999}})
 
