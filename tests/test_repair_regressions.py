@@ -130,6 +130,13 @@ def test_writer_fallback_requires_the_same_client_to_resolve_every_destination(t
     assert selected is writer
     assert ready is False
 
+    unavailable_user = _ResolvableClient(set())
+    selected, ready = asyncio.run(
+        choose_writer_for_destinations(config, unavailable_user, unavailable_user, _DirectLimiter())
+    )
+    assert selected is unavailable_user
+    assert ready is False
+
 
 def test_filtered_album_uses_only_enabled_members_and_never_native_copies_whole_album(
     tmp_path: Path,
