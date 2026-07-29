@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import yaml
 
 import main as migration_main
-from app.advanced import classify_repair_error, requeue_retryable_repairs
+from app.advanced import classify_repair_error, requeue_retryable_repairs, resolve_uncertain_upload
 from app.db import Database
 from app.destination_manager import set_destinations
 from app.queue import MessageQueue
@@ -245,5 +245,46 @@ def test_upload_broken_pipe_is_held_to_prevent_a_duplicate(tmp_path: Path) -> No
         assert "destination result is unknown" in row["last_error"]
         assert classify_repair_error(row) == "needs_review"
         assert requeue_retryable_repairs(db) == 0
+    finally:
+        db.close()
+
+
+def test_legacy_broken_pipe_can_be_confirmed_or_retried_after_one_check(tmp_path: Path) -> None:
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, make_config(tmp_path))  # type: ignore[arg-type]
+        assert enqueue(
+            queue,
+            source_message_id=10,
+            status="failed",
+            last_error="OSError: [Errno 32] Broken pipe",
+        )
+        first = db.query_one("SELECT id, status, media_type, last_error FROM messages WHERE source_message_id = 10")
+        assert first is not None
+        assert classify_repair_error(first) == "needs_review"
+        assert resolve_uncertain_upload(db, int(first["id"]), delivered=False)
+
+        retried = db.query_one("SELECT status, attempts, last_error FROM messages WHERE id = ?", (first["id"],))
+        assert retried is not None
+        assert retried["status"] == "pending"
+        assert retried["attempts"] == 0
+        assert retried["last_error"] is None
+
+        assert enqueue(
+            queue,
+            source_message_id=11,
+            file_unique_key="second",
+            status="failed",
+            last_error="OSError: [Errno 32] Broken pipe",
+        )
+        second = db.query_one("SELECT id FROM messages WHERE source_message_id = 11")
+        assert second is not None
+        assert resolve_uncertain_upload(db, int(second["id"]), delivered=True)
+
+        confirmed = db.query_one("SELECT status, verified_at FROM messages WHERE id = ?", (second["id"],))
+        assert confirmed is not None
+        assert confirmed["status"] == "copied"
+        assert confirmed["verified_at"]
     finally:
         db.close()
