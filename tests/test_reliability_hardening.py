@@ -192,6 +192,74 @@ def test_live_service_waits_for_trigger_before_first_migration_cycle(
         db.close()
 
 
+def test_live_service_resumes_safe_pending_work_after_restart(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = make_config(tmp_path)
+    config.ensure_directories = lambda: None
+    db = Database(config.queue.db_path)
+    db.initialize()
+    queue = MessageQueue(db, config)  # type: ignore[arg-type]
+    calls: list[tuple[str, str | None]] = []
+
+    class Reader:
+        def add_handler(self, handler) -> None:
+            self.handler = handler
+
+        def remove_handler(self, handler) -> None:
+            assert handler is self.handler
+
+    class Trigger:
+        def __init__(self, source_ids) -> None:
+            self.source_ids = source_ids
+            self.handler = object()
+            self.settings = SimpleNamespace(reconcile_interval_seconds=300)
+
+        async def wait(self, *args, **kwargs):
+            raise AssertionError("Safe queued work should resume without waiting for Start Queue")
+
+    async def no_registry(*args, **kwargs) -> None:
+        return None
+
+    async def source_ids(*args, **kwargs) -> set[int]:
+        return set()
+
+    async def safe_pending(*args, **kwargs):
+        return migration_main.CycleOutcome("retry", retry_after_seconds=2)
+
+    async def run_once(*args, **kwargs):
+        calls.append((args[1], kwargs.get("trigger_reason")))
+        kwargs["stop_event"].set()
+        return migration_main.CycleOutcome("complete")
+
+    monkeypatch.setattr(migration_main, "load_config", lambda _: config)
+    monkeypatch.setattr(migration_main, "refresh_source_registry", no_registry)
+    monkeypatch.setattr(migration_main, "_resolved_source_ids", source_ids)
+    monkeypatch.setattr(migration_main, "_write_initial_wait_status", safe_pending)
+    monkeypatch.setattr(migration_main, "_execute_cycle", run_once)
+    monkeypatch.setattr(migration_main, "LiveTrigger", Trigger)
+
+    try:
+        asyncio.run(
+            migration_main._run_live_service(
+                config,
+                "unused.yaml",
+                reader=Reader(),
+                bot=None,
+                limiter=object(),
+                queue=queue,
+                stop_event=asyncio.Event(),
+                reader_me=object(),
+                writer_me=object(),
+                logger=None,
+            )
+        )
+        assert calls == [("process", "automatic_resume")]
+    finally:
+        db.close()
+
+
 def test_download_broken_pipe_retries_automatically_after_the_normal_attempt_limit(tmp_path: Path) -> None:
     config = worker_config(tmp_path)
     db = Database(config.queue.db_path)
