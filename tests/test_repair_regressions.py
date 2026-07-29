@@ -13,6 +13,7 @@ import yaml
 import app.destination_manager as destination_manager
 import app.admin_bot as admin_bot
 from app.config import ChatSpec, load_config
+from app.dashboard_v2 import issue_center, source_migration_progress
 from app.db import Database
 from app.queue import MessageJob, MessageQueue
 from app.scanner import Scanner
@@ -398,3 +399,116 @@ def test_fast_duplicate_detector_ignores_text_fallback_and_failed_media(tmp_path
     finally:
         db.close()
 
+
+
+def test_expected_skips_stay_out_of_dashboard_and_issue_center(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, config)
+        base = {
+            "source_chat_id": "-1001",
+            "dest_chat_id": "-1002",
+            "source_topic_id": None,
+            "dest_topic_id": None,
+            "media_group_id": None,
+            "media_type": "video",
+            "file_size": 10,
+            "caption": None,
+        }
+
+        assert queue.enqueue(
+            **{
+                **base,
+                "source_message_id": 1,
+                "source_message_ids": [1],
+                "file_unique_key": "copied:1",
+            },
+            status="copied",
+        )
+        for message_id, reason in (
+            (2, "PermanentJobError: File is 2579663297 bytes, above configured bot upload limit 2097152000"),
+            (3, "Filtered out by config"),
+            (4, "Skipped duplicate media fingerprint already queued or delivered for this destination"),
+        ):
+            assert queue.enqueue(
+                **{
+                    **base,
+                    "source_message_id": message_id,
+                    "source_message_ids": [message_id],
+                    "file_unique_key": f"skipped:{message_id}",
+                },
+                status="skipped",
+                last_error=reason,
+            )
+        assert queue.enqueue(
+            **{
+                **base,
+                "source_message_id": 5,
+                "source_message_ids": [5],
+                "file_unique_key": "failed:5",
+            },
+            status="failed",
+            last_error="destination denied",
+        )
+
+        progress = source_migration_progress(db)
+        assert len(progress) == 1
+        assert progress[0]["total_items"] == 5
+        assert progress[0]["excluded_items"] == 3
+        assert progress[0]["eligible_items"] == 2
+        assert progress[0]["copied_items"] == 1
+        assert progress[0]["blocked_items"] == 1
+        assert progress[0]["remaining_items"] == 1
+        assert progress[0]["percent"] == 50
+
+        issues = issue_center(db)
+        assert [(item["kind"], item["source_message_id"]) for item in issues] == [("job", 5)]
+        state = queue.source_work_state("-1001")
+        assert state["skipped_issue_jobs"] == 0
+        assert state["primary_skipped_issue_jobs"] == 0
+    finally:
+        db.close()
+
+
+def test_expected_skip_allows_source_state_to_finish(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, config)
+        queue.register_source(
+            source_chat_id="-1001",
+            title="Source",
+            username=None,
+            chat_type="channel",
+            latest_seen_message_id=1,
+        )
+        assert queue.enqueue(
+            source_chat_id="-1001",
+            source_message_id=1,
+            dest_chat_id="-1002",
+            file_unique_key="too-large:1",
+            source_message_ids=[1],
+            source_topic_id=None,
+            dest_topic_id=None,
+            media_group_id=None,
+            media_type="video",
+            file_size=2579663297,
+            caption=None,
+        )
+        row = db.query_one("SELECT id FROM messages WHERE file_unique_key = ?", ("too-large:1",))
+        assert row is not None
+        queue.mark_skipped(
+            int(row["id"]),
+            "PermanentJobError: File is 2579663297 bytes, above configured bot upload limit 2097152000",
+        )
+
+        state = queue.source_work_state("-1001")
+        assert state["primary_skipped_issue_jobs"] == 0
+        source = db.query_one("SELECT migration_state FROM source_registry WHERE source_chat_id = ?", ("-1001",))
+        assert source is not None
+        assert source["migration_state"] == "verified"
+    finally:
+        db.close()
