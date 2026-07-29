@@ -89,7 +89,7 @@ def test_source_library_and_eta_format(tmp_path: Path) -> None:
         )
         rows = source_library(db)
         assert rows[0]["title"] == "My Library"
-        assert format_eta(None) == "belum cukup data"
+        assert format_eta(None) == "not enough data"
         assert format_eta(65) == "1m 5s"
         assert format_eta(3661) == "1j 1m"
     finally:
