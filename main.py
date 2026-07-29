@@ -391,8 +391,8 @@ async def _write_initial_wait_status(
     watched_sources: int,
     reconciliation_seconds: float,
     logger: Any | None = None,
-) -> None:
-    """Report queued or blocked work truthfully without starting migration on boot."""
+) -> CycleOutcome:
+    """Report queued work and return whether a safe queue should resume on boot."""
     sources = _configured_sources(config)
     destinations = _configured_destinations(config)
     if not sources or not destinations:
@@ -403,7 +403,7 @@ async def _write_initial_wait_status(
             source="set" if sources else "missing",
             destination="set" if destinations else "missing",
         )
-        return
+        return CycleOutcome("blocked", message="The source or destination is not configured.")
 
     for source_index, source in enumerate(sources, start=1):
         try:
@@ -418,7 +418,12 @@ async def _write_initial_wait_status(
                 source_total=len(sources),
                 error=f"{exc.__class__.__name__}: {exc}"[:1000],
             )
-            return
+            return CycleOutcome(
+                "blocked",
+                source_index=source_index,
+                source_total=len(sources),
+                message="The source cannot be accessed.",
+            )
         source_chat_id = int(resolved.chat_id)
         state = queue.source_work_state(source_chat_id)
         queue.recompute_source_state(source_chat_id)
@@ -452,16 +457,16 @@ async def _write_initial_wait_status(
         else:
             write_status(
                 config,
-                "queued",
+                "waiting_retry",
                 message=(
-                    "This source queue has pending work. Tap Start Queue to continue; "
-                    "migration does not start automatically after a restart."
+                    "Safe queued work will resume automatically. "
+                    "Later sources remain in the waiting list until it is complete."
                 ),
                 retry_at=outcome.next_retry_at,
                 last_error=state.get("last_error"),
                 **details,
             )
-        return
+        return outcome
 
     write_status(
         config,
@@ -472,6 +477,7 @@ async def _write_initial_wait_status(
         reconciliation_seconds=reconciliation_seconds,
         **queue.counts_by_status(),
     )
+    return CycleOutcome("complete")
 
 
 async def _execute_cycle(
@@ -766,7 +772,7 @@ async def _run_live_service(
             trigger.source_ids = await _resolved_source_ids(config, queue, reader, limiter, logger)
 
             if command is None:
-                await _write_initial_wait_status(
+                initial_outcome = await _write_initial_wait_status(
                     config,
                     queue,
                     reader,
@@ -775,6 +781,9 @@ async def _run_live_service(
                     reconciliation_seconds=trigger.settings.reconcile_interval_seconds,
                     logger=logger,
                 )
+                if isinstance(initial_outcome, CycleOutcome) and initial_outcome.state == "retry":
+                    command, reason = "process", "automatic_resume"
+                    continue
                 next_trigger = await trigger.wait(
                     config,
                     stop_event,
