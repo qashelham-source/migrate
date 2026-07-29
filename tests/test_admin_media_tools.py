@@ -38,7 +38,7 @@ def test_finder_stats_and_result_are_operator_readable() -> None:
         indexed_now=3,
     )
     assert "Indexed media: 12" in text
-    assert "3 media queue item baru diindex" in text
+    assert "3 new media queue item(s) indexed" in text
 
     result = _finder_result_text(
         "https://t.me/c/123456/88",
@@ -50,7 +50,7 @@ def test_finder_stats_and_result_are_operator_readable() -> None:
             "file_name": "sample.mp4",
         },
     )
-    assert "Media asal dijumpai" in result
+    assert "Original media found" in result
     assert "Message ID: 88" in result
 
 
@@ -70,5 +70,5 @@ def test_duplicate_text_shows_groups() -> None:
             }
         ],
     )
-    assert "3 salinan" in text
+    assert "3 copies" in text
     assert "Original: -1001/9" in text

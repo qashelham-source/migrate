@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import random
 import signal
 import time
@@ -26,10 +27,9 @@ class ResolvedChat:
 class TelegramLimiter:
     """Rate-limit Telegram operations without blocking unrelated pipeline stages.
 
-    Release 8.2 keeps global pacing for normal calls, but FloodWait cooldowns are
-    tracked per operation. A throttled upload therefore no longer freezes reads,
-    verification, dialog resolution, or downloads unless Telegram throttles those
-    operations independently.
+    Global and per-operation timestamps are reserved while holding the scheduling
+    lock, but the actual sleep happens after releasing it. An upload cooldown can
+    therefore no longer prevent reads, downloads, or verification from scheduling.
     """
 
     def __init__(self, config: AppConfig, logger: Any | None = None) -> None:
@@ -44,20 +44,21 @@ class TelegramLimiter:
         self._floodwait_seconds_by_operation: dict[str, int] = {}
 
     async def wait(self, operation: str) -> None:
-        async with self._lock:
-            now = time.monotonic()
-            flood_wait = self._floodwait_until_by_operation.get(operation, 0.0) - now
-            global_wait = self.config.limits.global_min_delay_seconds - (now - self._last_global)
-            op_wait = self.config.limits.delay_for(operation) - (
-                now - self._last_by_operation.get(operation, 0.0)
-            )
-            delay = max(0.0, flood_wait, global_wait, op_wait)
-            if delay > 0:
-                await asyncio.sleep(delay)
-
-            finished = time.monotonic()
-            self._last_global = finished
-            self._last_by_operation[operation] = finished
+        while True:
+            async with self._lock:
+                now = time.monotonic()
+                ready_at = max(
+                    self._floodwait_until_by_operation.get(operation, 0.0),
+                    self._last_global + self.config.limits.global_min_delay_seconds,
+                    self._last_by_operation.get(operation, 0.0)
+                    + self.config.limits.delay_for(operation),
+                )
+                delay = ready_at - now
+                if delay <= 0:
+                    self._last_global = now
+                    self._last_by_operation[operation] = now
+                    return
+            await asyncio.sleep(delay)
 
     def floodwait_snapshot(self) -> dict[str, Any]:
         """Return lightweight limiter telemetry for status pages and diagnostics."""
@@ -99,16 +100,17 @@ class TelegramLimiter:
                 extra_min = self.config.limits.floodwait_extra_min_seconds
                 extra_max = self.config.limits.floodwait_extra_max_seconds
                 wait = max(1, int(exc.value)) + random.randint(extra_min, extra_max)
-                self._floodwait_until_by_operation[operation] = max(
-                    self._floodwait_until_by_operation.get(operation, 0.0),
-                    time.monotonic() + wait,
-                )
-                self._floodwait_events_by_operation[operation] = (
-                    self._floodwait_events_by_operation.get(operation, 0) + 1
-                )
-                self._floodwait_seconds_by_operation[operation] = (
-                    self._floodwait_seconds_by_operation.get(operation, 0) + wait
-                )
+                async with self._lock:
+                    self._floodwait_until_by_operation[operation] = max(
+                        self._floodwait_until_by_operation.get(operation, 0.0),
+                        time.monotonic() + wait,
+                    )
+                    self._floodwait_events_by_operation[operation] = (
+                        self._floodwait_events_by_operation.get(operation, 0) + 1
+                    )
+                    self._floodwait_seconds_by_operation[operation] = (
+                        self._floodwait_seconds_by_operation.get(operation, 0) + wait
+                    )
                 if self.logger:
                     self.logger.warning(
                         "FloodWait from Telegram during %s: pausing only %s operations for %ss",
@@ -116,7 +118,6 @@ class TelegramLimiter:
                         operation,
                         wait,
                     )
-                await asyncio.sleep(wait)
 
     async def call(
         self,
@@ -183,13 +184,38 @@ def load_accounts(config: AppConfig) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
+        decoded = json.loads(path.read_text(encoding="utf-8"))
+        return decoded if isinstance(decoded, dict) else {}
+    except (json.JSONDecodeError, OSError):
+        corrupt = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+        try:
+            path.replace(corrupt)
+        except OSError:
+            pass
         return {}
 
 
 def save_accounts(config: AppConfig, accounts: dict[str, Any]) -> None:
-    _accounts_path(config).write_text(json.dumps(accounts, indent=2), encoding="utf-8")
+    path = _accounts_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.unlink(missing_ok=True)
+    try:
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(accounts, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
 
 
 def update_account_cache(config: AppConfig, session_name: str, user: Any) -> None:

@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sqlite3
-import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -16,6 +14,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Migration Manager reliability health check")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="run SQLite quick_check; intended for maintenance, not the frequent container probe",
+    )
     return parser.parse_args()
 
 
@@ -29,26 +32,29 @@ def check_writable(path: Path) -> tuple[bool, str]:
         return False, f"not writable: {exc}"
 
 
-def check_database(path: Path) -> tuple[bool, str]:
+def check_database(path: Path, *, deep: bool = False) -> tuple[bool, str]:
     if not path.exists():
         return False, "database file missing"
     try:
         uri = f"file:{path.resolve()}?mode=ro"
         connection = sqlite3.connect(uri, uri=True, timeout=2.0)
         try:
-            row = connection.execute("PRAGMA quick_check").fetchone()
-            result = str(row[0]) if row else "no result"
-            if result.lower() != "ok":
-                return False, f"quick_check={result}"
+            connection.execute("SELECT 1").fetchone()
             connection.execute("SELECT COUNT(*) FROM messages").fetchone()
+            if deep:
+                row = connection.execute("PRAGMA quick_check").fetchone()
+                result = str(row[0]) if row else "no result"
+                if result.lower() != "ok":
+                    return False, f"quick_check={result}"
+                return True, "quick_check=ok"
         finally:
             connection.close()
-        return True, "quick_check=ok"
+        return True, "readable"
     except (sqlite3.Error, OSError) as exc:
         return False, f"database check failed: {exc}"
 
 
-def run(config_path: str) -> dict[str, Any]:
+def run(config_path: str, *, deep: bool = False) -> dict[str, Any]:
     checks: dict[str, dict[str, Any]] = {}
     try:
         config = load_config(config_path)
@@ -59,7 +65,7 @@ def run(config_path: str) -> dict[str, Any]:
         }
 
     checks["config"] = {"ok": True, "detail": "loaded"}
-    db_ok, db_detail = check_database(config.queue.db_path)
+    db_ok, db_detail = check_database(config.queue.db_path, deep=deep)
     checks["database"] = {"ok": db_ok, "detail": db_detail}
 
     for name, path in {
@@ -89,7 +95,7 @@ def run(config_path: str) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
-    result = run(args.config)
+    result = run(args.config, deep=args.deep)
     if args.json:
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     else:

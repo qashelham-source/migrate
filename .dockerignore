@@ -7,8 +7,14 @@ config.local.yaml
 sessions
 data
 downloads
+backups
+.deploy.lock
 __pycache__
 *.pyc
 *.pyo
 .pytest_cache
+.ruff_cache
+.mypy_cache
 tests
+*.zip
+*.zip.zip
