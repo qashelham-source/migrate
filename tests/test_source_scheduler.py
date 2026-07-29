@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import errno
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from app.db import Database
 from app.destination_manager import blacklist_source, get_source_blacklist, get_sources, set_sources
@@ -147,3 +149,23 @@ def test_blacklisting_source_removes_it_from_queue_and_keeps_it_hidden(tmp_path:
     assert [item["chat"] for item in set_sources(["@source-first", "@source-second"], config_path)] == [
         "@source-first"
     ]
+
+
+def test_config_save_falls_back_when_bind_mounted_file_is_busy(tmp_path: Path) -> None:
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "migration:\n  sources: []\n  destinations:\n    - chat: '@destination'\n",
+        encoding="utf-8",
+    )
+    original_replace = Path.replace
+
+    def busy_replace(self: Path, target: str | Path) -> Path:
+        if self == config_path.with_suffix(".yaml.tmp"):
+            raise OSError(errno.EBUSY, "Device or resource busy", str(self), str(target))
+        return original_replace(self, target)
+
+    with patch.object(Path, "replace", busy_replace):
+        set_sources(["@source-first"], config_path)
+
+    assert [item["chat"] for item in get_sources(config_path)] == ["@source-first"]
+    assert not config_path.with_suffix(".yaml.tmp").exists()
