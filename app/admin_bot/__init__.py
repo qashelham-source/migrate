@@ -53,6 +53,7 @@ CATEGORY_LABELS = {
     "temporary": "Temporary/Network",
     "source_missing": "Source Missing",
     "unsupported": "Unsupported",
+    "needs_review": "Verify Before Retry",
     "other": "Other",
 }
 
@@ -1024,7 +1025,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             "capacity:view": (_capacity_text, _back("smart:menu", "⬅️ Smart Center")),
             "advanced:menu": (_advanced_text, _advanced_menu()),
             "advanced:health": (_health_text, _buttons([[("▶️ Run Check", "health:run"), ("🔄 Refresh", "advanced:health")], [("⬅️ Smart Center", "smart:menu")]])),
-            "advanced:repair": (_repair_text, _buttons([[("🔄 Retry temporary", "repair:retry:all")], [("📋 Details", "repair:details")], [("⬅️ Smart Center", "smart:menu")]])),
+            "advanced:repair": (_repair_text, _buttons([[("🔄 Retry safe jobs", "repair:retry:all")], [("📋 Details", "repair:details")], [("⬅️ Smart Center", "smart:menu")]])),
             "checkpoint:view": (_checkpoint_text, _buttons([[("♻️ Reset + Full Scan", "checkpoint:reset:confirm")], [("⬅️ Recovery Tools", "advanced:menu")]])),
         }
         if data == "finder:view":
@@ -1081,7 +1082,10 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 db.close()
             if revived:
                 _request_mode(config, "process")
-            await query.answer(f"{revived} job(s) returned to pending.", show_alert=True)
+            await query.answer(
+                f"{revived} safe job(s) returned to pending. Unknown upload results remain held.",
+                show_alert=True,
+            )
             return
         if data == "checkpoint:reset:confirm":
             await edit(query, "♻️ Reset all checkpoints?\n\nThe existing queue will not be deleted.", _buttons([[("✅ Reset", "checkpoint:reset:all")], [("❌ Cancel", "checkpoint:view")]]))
