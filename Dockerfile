@@ -12,7 +12,9 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 WORKDIR /build
 COPY requirements.txt ./
 RUN python -m pip install --upgrade pip \
-    && pip install --requirement requirements.txt
+    && pip install --requirement requirements.txt \
+    && pip uninstall --yes setuptools wheel jaraco.context \
+    && python -m pip uninstall --yes pip
 
 
 FROM python:3.11-slim AS runtime
