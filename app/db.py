@@ -277,25 +277,35 @@ class Database:
         self.conn.commit()
         return cursor.rowcount
 
-    def claim_due_messages(self, limit: int) -> list[sqlite3.Row]:
+    def claim_due_messages(
+        self,
+        limit: int,
+        source_chat_id: int | str | None = None,
+    ) -> list[sqlite3.Row]:
         """Atomically reserve pending jobs so two workers cannot send the same post."""
         now = utc_now()
         limit = max(1, int(limit))
+        source_clause = ""
+        source_params: tuple[Any, ...] = ()
+        if source_chat_id is not None:
+            source_clause = " AND m.source_chat_id = ?"
+            source_params = (str(source_chat_id),)
         try:
             self.conn.execute("BEGIN IMMEDIATE")
             rows = list(
                 self.conn.execute(
-                    """
+                    f"""
                     SELECT m.id
                     FROM messages m
                     LEFT JOIN destination_health dh ON dh.dest_chat_id = m.dest_chat_id
                     WHERE m.status = 'pending'
                       AND (m.next_retry_at IS NULL OR m.next_retry_at <= ?)
                       AND COALESCE(dh.paused, 0) = 0
+                      {source_clause}
                     ORDER BY m.updated_at ASC, m.id ASC
                     LIMIT ?
                     """,
-                    (now, limit),
+                    (now, *source_params, limit),
                 )
             )
             ids = [int(row["id"]) for row in rows]
@@ -328,34 +338,168 @@ class Database:
             self.conn.rollback()
             raise
 
-    def due_jobs(self, limit: int) -> list[sqlite3.Row]:
+    def due_jobs(
+        self,
+        limit: int,
+        source_chat_id: int | str | None = None,
+    ) -> list[sqlite3.Row]:
+        source_clause = ""
+        source_params: tuple[Any, ...] = ()
+        if source_chat_id is not None:
+            source_clause = " AND source_chat_id = ?"
+            source_params = (str(source_chat_id),)
         return self.query(
-            """
+            f"""
             SELECT * FROM messages
             WHERE status = 'pending'
               AND (next_retry_at IS NULL OR next_retry_at <= ?)
+              {source_clause}
             ORDER BY updated_at ASC, id ASC
             LIMIT ?
             """,
-            (utc_now(), limit),
+            (utc_now(), *source_params, limit),
         )
 
-    def copied_jobs_for_verification(self, limit: int) -> list[sqlite3.Row]:
+    def copied_jobs_for_verification(
+        self,
+        limit: int,
+        source_chat_id: int | str | None = None,
+    ) -> list[sqlite3.Row]:
+        source_clause = ""
+        source_params: tuple[Any, ...] = ()
+        if source_chat_id is not None:
+            source_clause = " AND source_chat_id = ?"
+            source_params = (str(source_chat_id),)
         return self.query(
-            """
+            f"""
             SELECT * FROM messages
             WHERE status = 'copied'
               AND dest_message_ids IS NOT NULL
               AND verified_at IS NULL
+              {source_clause}
             ORDER BY updated_at ASC, id ASC
             LIMIT ?
             """,
-            (limit,),
+            (*source_params, limit),
         )
 
-    def counts_by_status(self) -> dict[str, int]:
-        rows = self.query("SELECT status, COUNT(*) AS count FROM messages GROUP BY status")
+    def counts_by_status(self, source_chat_id: int | str | None = None) -> dict[str, int]:
+        if source_chat_id is None:
+            rows = self.query("SELECT status, COUNT(*) AS count FROM messages GROUP BY status")
+        else:
+            rows = self.query(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM messages
+                WHERE source_chat_id = ?
+                GROUP BY status
+                """,
+                (str(source_chat_id),),
+            )
         return {str(row["status"]): int(row["count"]) for row in rows}
+
+    def source_work_state(self, source_chat_id: int | str) -> dict[str, Any]:
+        """Summarise whether one source can advance without touching another source."""
+        source_id = str(source_chat_id)
+        now = utc_now()
+        row = self.query_one(
+            """
+            SELECT
+                COUNT(*) AS total_jobs,
+                SUM(CASE WHEN m.status = 'pending' THEN 1 ELSE 0 END) AS pending_jobs,
+                SUM(CASE
+                    WHEN m.status = 'pending'
+                     AND COALESCE(dh.paused, 0) = 0
+                     AND (m.next_retry_at IS NULL OR m.next_retry_at <= ?)
+                    THEN 1 ELSE 0
+                END) AS runnable_jobs,
+                SUM(CASE
+                    WHEN m.status = 'pending'
+                     AND COALESCE(dh.paused, 0) = 0
+                     AND m.next_retry_at IS NOT NULL
+                     AND m.next_retry_at > ?
+                    THEN 1 ELSE 0
+                END) AS delayed_jobs,
+                MIN(CASE
+                    WHEN m.status = 'pending'
+                     AND COALESCE(dh.paused, 0) = 0
+                     AND m.next_retry_at IS NOT NULL
+                     AND m.next_retry_at > ?
+                    THEN m.next_retry_at
+                END) AS next_retry_at,
+                SUM(CASE
+                    WHEN m.status = 'pending' AND COALESCE(dh.paused, 0) = 1
+                    THEN 1 ELSE 0
+                END) AS paused_jobs,
+                SUM(CASE WHEN m.status IN ('downloading', 'uploading') THEN 1 ELSE 0 END)
+                    AS active_jobs,
+                SUM(CASE WHEN m.status = 'failed' THEN 1 ELSE 0 END) AS failed_jobs,
+                SUM(CASE
+                    WHEN m.status = 'skipped'
+                     AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%'
+                    THEN 1 ELSE 0
+                END) AS skipped_issue_jobs,
+                SUM(CASE
+                    WHEN m.status = 'copied'
+                     AND m.verified_at IS NULL
+                     AND (vr.status IS NULL OR vr.status NOT IN (
+                        'verified', 'verified_repaired', 'failed', 'repairing'
+                     ))
+                    THEN 1 ELSE 0
+                END) AS verification_pending_jobs,
+                SUM(CASE
+                    WHEN m.status = 'copied' AND vr.status = 'failed'
+                    THEN 1 ELSE 0
+                END) AS verification_failed_jobs,
+                SUM(CASE
+                    WHEN m.status = 'copied' AND vr.status = 'repairing'
+                    THEN 1 ELSE 0
+                END) AS verification_repairing_jobs
+            FROM messages m
+            LEFT JOIN destination_health dh ON dh.dest_chat_id = m.dest_chat_id
+            LEFT JOIN verification_results vr ON vr.job_id = m.id
+            WHERE m.source_chat_id = ?
+            """,
+            (now, now, now, source_id),
+        )
+        fields = (
+            "total_jobs",
+            "pending_jobs",
+            "runnable_jobs",
+            "delayed_jobs",
+            "paused_jobs",
+            "active_jobs",
+            "failed_jobs",
+            "skipped_issue_jobs",
+            "verification_pending_jobs",
+            "verification_failed_jobs",
+            "verification_repairing_jobs",
+        )
+        result = {field: int(row[field] or 0) if row else 0 for field in fields}
+        result["source_chat_id"] = source_id
+        result["next_retry_at"] = str(row["next_retry_at"]) if row and row["next_retry_at"] else None
+
+        issue = self.query_one(
+            """
+            SELECT m.last_error
+            FROM messages m
+            LEFT JOIN verification_results vr ON vr.job_id = m.id
+            WHERE m.source_chat_id = ?
+              AND (
+                    m.status = 'failed'
+                 OR m.status = 'pending'
+                 OR (m.status = 'skipped'
+                     AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%')
+                 OR vr.status = 'failed'
+              )
+              AND COALESCE(m.last_error, '') != ''
+            ORDER BY m.updated_at DESC, m.id DESC
+            LIMIT 1
+            """,
+            (source_id,),
+        )
+        result["last_error"] = str(issue["last_error"]) if issue and issue["last_error"] else None
+        return result
 
     def get_scan_checkpoint(
         self,
