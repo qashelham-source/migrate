@@ -159,7 +159,7 @@ def source_migration_progress(db: Database) -> list[dict[str, Any]]:
                 "source_chat_id": str(row["source_chat_id"]),
                 "title": str(row["title"] or row["source_chat_id"]),
                 "total_items": total_items,
-                "excluded_items": excluded_items,
+                "filtered_items": excluded_items,
                 "eligible_items": eligible_items,
                 "copied_items": copied_items,
                 "active_items": active_items,
