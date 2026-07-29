@@ -7,6 +7,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from app.skip_policy import expected_skip_reason_sql
+
 
 STATUSES = {"pending", "downloading", "uploading", "copied", "failed", "skipped"}
 
@@ -458,8 +460,9 @@ class Database:
         """Summarise whether one source can advance without touching another source."""
         source_id = str(source_chat_id)
         now = utc_now()
+        expected_skip = expected_skip_reason_sql("m.last_error")
         row = self.query_one(
-            """
+            f"""
             SELECT
                 COUNT(*) AS total_jobs,
                 SUM(CASE WHEN m.status = 'pending' THEN 1 ELSE 0 END) AS pending_jobs,
@@ -502,19 +505,19 @@ class Database:
                 END) AS repair_failed_jobs,
                 SUM(CASE
                     WHEN m.status = 'skipped'
-                     AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%'
+                     AND NOT {expected_skip}
                     THEN 1 ELSE 0
                 END) AS skipped_issue_jobs,
                 SUM(CASE
                     WHEN m.status = 'skipped'
                      AND m.file_unique_key NOT LIKE 'repair:%'
-                     AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%'
+                     AND NOT {expected_skip}
                     THEN 1 ELSE 0
                 END) AS primary_skipped_issue_jobs,
                 SUM(CASE
                     WHEN m.status = 'skipped'
                      AND m.file_unique_key LIKE 'repair:%'
-                     AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%'
+                     AND NOT {expected_skip}
                     THEN 1 ELSE 0
                 END) AS repair_skipped_issue_jobs,
                 SUM(CASE
@@ -583,7 +586,7 @@ class Database:
                     m.status = 'failed'
                  OR m.status = 'pending'
                  OR (m.status = 'skipped'
-                     AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%')
+                     AND NOT {expected_skip})
                  OR vr.status = 'failed'
               )
               AND (vr.status = 'failed' OR COALESCE(m.last_error, '') != '')
@@ -592,7 +595,7 @@ class Database:
                     WHEN m.status = 'failed' AND m.file_unique_key NOT LIKE 'repair:%' THEN 0
                     WHEN m.status = 'skipped'
                          AND m.file_unique_key NOT LIKE 'repair:%'
-                         AND LOWER(COALESCE(m.last_error, '')) NOT LIKE '%filtered out by config%'
+                         AND NOT {expected_skip}
                     THEN 1
                     WHEN vr.status = 'failed' THEN 2
                     WHEN m.file_unique_key LIKE 'repair:%' THEN 3
