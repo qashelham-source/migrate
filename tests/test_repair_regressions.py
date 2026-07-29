@@ -9,7 +9,6 @@ from types import SimpleNamespace
 import pytest
 import yaml
 
-import app.config as app_config
 import app.destination_manager as destination_manager
 from app.admin_bot import _authorized_ids
 from app.config import ChatSpec, load_config
