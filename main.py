@@ -170,6 +170,42 @@ def _source_status_details(
     }
 
 
+def _write_source_complete_status(
+    config: AppConfig,
+    *,
+    state: dict[str, Any],
+    outcome: CycleOutcome,
+    source: str,
+    source_chat_id: int,
+    source_index: int,
+    source_total: int,
+) -> None:
+    """Record completion without allowing review metadata to duplicate keyword arguments."""
+    message = "Source complete. Moving to the next source in the queue."
+    if outcome.review_items:
+        message = (
+            f"Source complete. {outcome.review_items} item(s) were saved in Issue Center; "
+            "moving to the next source."
+        )
+
+    details = _source_status_details(
+        state,
+        source=source,
+        source_chat_id=source_chat_id,
+        source_index=source_index,
+        source_total=source_total,
+    )
+    details.update(
+        {
+            "review_items": outcome.review_items,
+            "review_job_id": outcome.review_job_id,
+            "review_summary": outcome.review_summary,
+        }
+    )
+    write_status(config, "source_complete", message=message, **details)
+
+
+
 def _source_outcome(
     state: dict[str, Any],
     *,
@@ -729,26 +765,14 @@ async def _execute_cycle(
         )
         if outcome.state == "complete":
             if source_index < source_total:
-                completion_message = "Source complete. Moving to the next source in the queue."
-                if outcome.review_items:
-                    completion_message = (
-                        f"Source complete. {outcome.review_items} item(s) were saved in Issue Center; "
-                        "moving to the next source."
-                    )
-                write_status(
+                _write_source_complete_status(
                     config,
-                    "source_complete",
-                    message=completion_message,
-                    review_items=outcome.review_items,
-                    review_job_id=outcome.review_job_id,
-                    review_summary=outcome.review_summary,
-                    **_source_status_details(
-                        state,
-                        source=source_title,
-                        source_chat_id=source_chat_id,
-                        source_index=source_index,
-                        source_total=source_total,
-                    ),
+                    state=state,
+                    outcome=outcome,
+                    source=source_title,
+                    source_chat_id=source_chat_id,
+                    source_index=source_index,
+                    source_total=source_total,
                 )
             continue
 
