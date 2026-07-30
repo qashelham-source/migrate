@@ -204,6 +204,10 @@ def _dashboard_text(config: AppConfig) -> str:
     phase = str(status.get("phase") or "idle").lower()
     current_source = active_source_progress(status, data["source_progress"])
     headline, subline = _phase_summary(phase, current_source)
+    stalled_jobs = list(data["health"].get("stalled_jobs") or [])
+    if stalled_jobs:
+        headline = "🚨 Job Stalled"
+        subline = "A job has stopped showing activity and needs attention before restart."
     active_jobs = q["downloading"] + q["uploading"]
 
     lines = ["🏠 Migration Dashboard", "", headline, subline]
@@ -281,6 +285,12 @@ def _dashboard_text(config: AppConfig) -> str:
             f"⚠️ {int(review['total'])} item(s) saved in Issue Center.",
             "The source queue continues automatically while they wait for review.",
         ]
+    if stalled_jobs:
+        lines += [
+            "",
+            f"🚨 {len(stalled_jobs)} job(s) tidak menunjukkan aktiviti.",
+            "Buka Issue Center untuk semak status dengan selamat.",
+        ]
     if storage.percent_used >= 80:
         level = "🚨 Critical storage" if storage.percent_used >= 90 else "⚠️ Low storage"
         lines += ["", level, f"Free: {format_bytes(storage.free_bytes)}"]
@@ -313,7 +323,9 @@ def _issues_text(config: AppConfig) -> str:
     if not rows:
         return "\n".join(lines + ["✅ No active issues."])
     for item in rows:
-        if item["kind"] == "destination":
+        if item["kind"] == "stalled":
+            lines += [f"🚨 Job #{item['id']} stalled", str(item["error"])[:180], ""]
+        elif item["kind"] == "destination":
             lines += [f"⏸ Destination {item['id']} paused", str(item["error"])[:180], ""]
         elif item["kind"] == "verification":
             lines += [
