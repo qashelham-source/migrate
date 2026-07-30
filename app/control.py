@@ -54,8 +54,11 @@ def write_status(config: AppConfig, phase: str, **details: Any) -> None:
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
         temporary.replace(path)
-    except OSError:
-        temporary.unlink(missing_ok=True)
+    except (OSError, TypeError, ValueError):
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def read_status(config: AppConfig) -> dict[str, Any]:
