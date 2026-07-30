@@ -18,7 +18,7 @@ from app.db import Database
 from app.queue import MessageJob, MessageQueue
 from app.scanner import Scanner
 from app.telegram_client import save_accounts
-from app.upload import Uploader
+from app.upload import UploadResult, Uploader
 from main import choose_writer_for_destinations
 
 
@@ -574,3 +574,171 @@ def test_source_queue_uses_saved_channel_titles_after_bot_restart(tmp_path: Path
         admin_bot._CHANNEL_CACHE.pop(user_id, None)
         admin_bot._SELECTIONS.pop(user_id, None)
         admin_bot._SOURCE_TITLE_CACHE.pop(path.resolve(), None)
+
+
+def _document_message(message_id: int = 7) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=message_id,
+        video=None,
+        photo=None,
+        document=SimpleNamespace(file_id="source-document"),
+        animation=None,
+        audio=None,
+        voice=None,
+        video_note=None,
+        text=None,
+        caption=None,
+        media_group_id=None,
+    )
+
+
+def _document_job(file_unique_key: str = "cache-type-mismatch") -> MessageJob:
+    return MessageJob(
+        id=71,
+        source_chat_id=-1001,
+        source_message_id=7,
+        dest_chat_id=-1002,
+        status="pending",
+        attempts=1,
+        last_error=None,
+        next_retry_at=None,
+        file_unique_key=file_unique_key,
+        source_topic_id=None,
+        dest_topic_id=None,
+        media_group_id=None,
+        source_message_ids=[7],
+        dest_message_ids=[],
+        media_type="document",
+        file_size=1,
+        caption=None,
+    )
+
+
+def test_incompatible_cached_media_type_falls_back_before_sending(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    config = replace(config, transfer=replace(config.transfer, include_documents=True))
+
+    class CacheQueue:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        def get_media_cache(self, file_unique_key: str) -> object:
+            return SimpleNamespace(
+                file_unique_key=file_unique_key,
+                bot_file_ids=["animation-file-id"],
+                media_types=["animation"],
+            )
+
+        def delete_media_cache(self, file_unique_key: str) -> None:
+            self.deleted.append(file_unique_key)
+
+    queue = CacheQueue()
+    uploader = Uploader.__new__(Uploader)
+    uploader.config = config
+    uploader.queue = queue
+    uploader.logger = None
+    calls: list[str] = []
+
+    async def send_cached(*_args: object) -> UploadResult:
+        raise AssertionError("incompatible cached file_id must not be sent")
+
+    async def load_source_messages(*_args: object) -> list[SimpleNamespace]:
+        return [_document_message()]
+
+    async def copy_or_forward(*_args: object) -> UploadResult:
+        calls.append("native-copy")
+        return UploadResult(status="copied", dest_message_ids=[9001])
+
+    async def phase(_name: str) -> None:
+        return None
+
+    uploader._send_cached = send_cached
+    uploader._load_source_messages = load_source_messages
+    uploader._copy_or_forward = copy_or_forward
+
+    result = asyncio.run(uploader.process(_document_job(), asyncio.Event(), phase))
+
+    assert result.dest_message_ids == [9001]
+    assert queue.deleted == ["cache-type-mismatch"]
+    assert calls == ["native-copy"]
+
+
+def test_cached_file_id_type_error_is_discarded_then_retried_natively(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    config = replace(config, transfer=replace(config.transfer, include_documents=True))
+
+    class CacheQueue:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        def get_media_cache(self, file_unique_key: str) -> object:
+            return SimpleNamespace(
+                file_unique_key=file_unique_key,
+                bot_file_ids=["stale-file-id"],
+                media_types=["document"],
+            )
+
+        def delete_media_cache(self, file_unique_key: str) -> None:
+            self.deleted.append(file_unique_key)
+
+    queue = CacheQueue()
+    uploader = Uploader.__new__(Uploader)
+    uploader.config = config
+    uploader.queue = queue
+    uploader.logger = None
+    calls: list[str] = []
+
+    async def send_cached(*_args: object) -> UploadResult:
+        raise ValueError("Expected DOCUMENT, got ANIMATION file id instead")
+
+    async def load_source_messages(*_args: object) -> list[SimpleNamespace]:
+        return [_document_message()]
+
+    async def copy_or_forward(*_args: object) -> UploadResult:
+        calls.append("native-copy")
+        return UploadResult(status="copied", dest_message_ids=[9002])
+
+    async def phase(_name: str) -> None:
+        return None
+
+    uploader._send_cached = send_cached
+    uploader._load_source_messages = load_source_messages
+    uploader._copy_or_forward = copy_or_forward
+
+    result = asyncio.run(uploader.process(_document_job(), asyncio.Event(), phase))
+
+    assert result.dest_message_ids == [9002]
+    assert queue.deleted == ["cache-type-mismatch"]
+    assert calls == ["native-copy"]
+
+
+def test_recover_cached_file_id_mismatches_requeues_without_cache(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, config)
+        assert queue.enqueue(
+            source_chat_id="-1001",
+            source_message_id=88,
+            dest_chat_id="-1002",
+            file_unique_key="cache-type-mismatch",
+            source_message_ids=[88],
+            source_topic_id=None,
+            dest_topic_id=None,
+            media_group_id=None,
+            media_type="document",
+            file_size=1,
+            caption=None,
+            status="failed",
+            last_error="ValueError: Expected DOCUMENT, got ANIMATION file id instead",
+        )
+        queue.save_media_cache("cache-type-mismatch", ["animation-file-id"], ["animation"])
+
+        assert queue.recover_cached_file_id_mismatches() == 1
+        row = db.query_one("SELECT status, attempts, last_error FROM messages WHERE source_message_id = 88")
+        assert row is not None
+        assert dict(row) == {"status": "pending", "attempts": 0, "last_error": None}
+        assert queue.get_media_cache("cache-type-mismatch") is None
+    finally:
+        db.close()
