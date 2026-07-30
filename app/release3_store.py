@@ -34,6 +34,12 @@ class Release3Store:
     def initialize(self) -> None:
         self.db.conn.executescript(
             """
+            -- This trigger existed in older releases and could silently prevent a
+            -- fixed destination from resuming. It is persisted in SQLite, so
+            -- remove it during every schema initialization rather than relying on
+            -- a code-only deletion.
+            DROP TRIGGER IF EXISTS trg_keep_permission_destination_paused;
+
             CREATE TABLE IF NOT EXISTS source_registry (
                 source_chat_id TEXT PRIMARY KEY,
                 title TEXT NOT NULL,
@@ -421,16 +427,17 @@ class Release3Store:
             (str(dest_chat_id), reason[:1000], (error or reason)[:4000], now),
         )
 
-    def resume_destination(self, dest_chat_id: int | str) -> None:
-        self.db.execute(
+    def resume_destination(self, dest_chat_id: int | str) -> bool:
+        """Clear an existing pause after the caller verified the writer can post."""
+        cursor = self.db.execute(
             """
-            INSERT INTO destination_health (dest_chat_id, paused, updated_at)
-            VALUES (?, 0, ?)
-            ON CONFLICT(dest_chat_id) DO UPDATE SET
-                paused = 0, pause_reason = NULL, last_error = NULL, updated_at = excluded.updated_at
+            UPDATE destination_health
+            SET paused = 0, pause_reason = NULL, last_error = NULL, updated_at = ?
+            WHERE dest_chat_id = ? AND paused = 1
             """,
-            (str(dest_chat_id), utc_now()),
+            (utc_now(), str(dest_chat_id)),
         )
+        return cursor.rowcount > 0
 
     def log_repair(
         self,
