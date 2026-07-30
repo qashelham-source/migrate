@@ -592,6 +592,47 @@ class MessageQueue:
     def delete_media_cache(self, file_unique_key: str) -> None:
         self.db.delete_media_cache(file_unique_key)
 
+    def recover_cached_file_id_mismatches(self) -> int:
+        """Safely retry historical jobs rejected before Telegram accepted an upload."""
+        rows = self.db.query(
+            """
+            SELECT id, source_chat_id, file_unique_key
+            FROM messages
+            WHERE status IN ('failed', 'skipped')
+              AND LOWER(COALESCE(last_error, '')) LIKE
+                  'valueerror: expected % got % file id instead%'
+            """
+        )
+        if not rows:
+            return 0
+
+        now = utc_now()
+        try:
+            self.db.conn.execute("BEGIN IMMEDIATE")
+            for row in rows:
+                self.db.conn.execute(
+                    "DELETE FROM media_cache WHERE file_unique_key = ?",
+                    (str(row["file_unique_key"]),),
+                )
+                self.db.conn.execute(
+                    """
+                    UPDATE messages
+                    SET status = 'pending', attempts = 0, last_error = NULL,
+                        next_retry_at = NULL, dest_message_ids = NULL,
+                        verified_at = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (now, int(row["id"])),
+                )
+            self.db.conn.commit()
+        except BaseException:
+            self.db.conn.rollback()
+            raise
+
+        for source_chat_id in {str(row["source_chat_id"]) for row in rows}:
+            self.release3.recompute_source_state(source_chat_id)
+        return len(rows)
+
     def media_cache_count(self) -> int:
         return self.db.media_cache_count()
 

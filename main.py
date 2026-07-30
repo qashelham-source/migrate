@@ -928,18 +928,26 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
             return
         if command == "recover":
             recovery = queue.recover_in_progress()
+            cache_mismatches = queue.recover_cached_file_id_mismatches()
             print(f"Recovered {recovery.requeued_downloads} interrupted download job(s) to pending")
             print(
                 f"Held {recovery.held_uploads} interrupted upload job(s) for manual destination verification"
             )
+            print(f"Requeued {cache_mismatches} cached media-type mismatch job(s)")
             return
 
         recovery = queue.recover_in_progress()
+        cache_mismatches = queue.recover_cached_file_id_mismatches()
         if recovery.total and logger:
             logger.warning(
                 "Recovered interrupted queue state: downloads=%s uploads_held=%s",
                 recovery.requeued_downloads,
                 recovery.held_uploads,
+            )
+        if cache_mismatches and logger:
+            logger.warning(
+                "Requeued %s job(s) after discarding cached media-type mismatches",
+                cache_mismatches,
             )
 
         clear_stop(config)
