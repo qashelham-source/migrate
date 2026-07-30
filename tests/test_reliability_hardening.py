@@ -179,6 +179,29 @@ def test_expired_worker_cannot_change_a_reclaimed_job_phase(tmp_path: Path) -> N
         db.close()
 
 
+def test_worker_lease_heartbeat_uses_database_lease_fields(tmp_path: Path) -> None:
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, make_config(tmp_path))  # type: ignore[arg-type]
+        assert enqueue(queue, source_message_id=13, file_unique_key="heartbeat-lease")
+        job = queue.claim_due(1, worker_id="worker-one", lease_seconds=60)[0]
+
+        assert queue.touch_active_job(job, lease_seconds=60)
+
+        row = db.query_one(
+            "SELECT status, worker_id, lease_token, lease_expires_at FROM messages WHERE id = ?",
+            (job.id,),
+        )
+        assert row is not None
+        assert row["status"] == "downloading"
+        assert row["worker_id"] == "worker-one"
+        assert int(row["lease_token"]) == job.lease_token
+        assert row["lease_expires_at"]
+    finally:
+        db.close()
+
+
 def test_worker_claims_one_job_at_a_time_before_processing(tmp_path: Path) -> None:
     config = worker_config(tmp_path)
     db = Database(config.queue.db_path)
