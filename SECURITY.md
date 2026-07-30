@@ -45,7 +45,11 @@ Deleting a secret in a later commit is not sufficient because it remains in Git 
 
 ## Removing the legacy archive from Git history
 
-A legacy ZIP archive existed in early repository history. The current tree must not contain it, but a normal deletion cannot remove its historical blob. The later deletion commit is not evidence that clones, forks, caches, or reachable history no longer contain the archive.
+A legacy ZIP archive (`Telegram-Save-Restricted-Content-main.zip.zip`, 29 KB) remains in early repository history at commit `bb34f14`.
+
+It was audited on 2026-07-30. The archive contains application source files only: no `.env`, no session files, and a `config.yaml` whose credentials are placeholder values rather than live secrets. Scanning all history for `.env`, `config.yaml`, and session files confirmed no real credential was ever committed.
+
+**No history rewrite and no credential rotation are required for this archive.** The procedure below is retained for reference should a genuine secret enter history in future.
 
 History rewriting is destructive and must be coordinated during a maintenance window. Create an out-of-band mirror backup first, confirm all open branches have been merged or preserved, rotate any credentials that may have been present, and notify every collaborator. Do not run the force-push steps from an automated deployment or without explicit repository-owner approval.
 
