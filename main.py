@@ -899,6 +899,23 @@ async def _run_live_service(
                 continue
 
             cycle_number += 1
+
+            # BUG FIX: recover_in_progress() is called once at startup in
+            # run_with_clients(), but the long-running serve loop must repeat it
+            # at the start of every cycle.  Without this, a worker that crashes
+            # mid-download or mid-upload leaves jobs permanently in
+            # 'downloading'/'uploading' status, which causes active_jobs > 0 and
+            # blocks the source queue forever (the "stuck source" bug).
+            _cycle_recovery = queue.recover_in_progress()
+            if _cycle_recovery.total and logger:
+                logger.warning(
+                    "Cycle %s: recovered interrupted jobs "
+                    "(downloads_reset=%s, uploads_held=%s)",
+                    cycle_number,
+                    _cycle_recovery.requeued_downloads,
+                    _cycle_recovery.held_uploads,
+                )
+
             write_status(
                 config,
                 "starting",
