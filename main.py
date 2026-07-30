@@ -18,6 +18,7 @@ from app.destination_manager import add_destination, list_destinations, remove_d
 from app.health import run_health_check
 from app.live import LiveTrigger
 from app.logging import setup_logging
+from app.mini_app import run_mini_app_server
 from app.queue import MessageQueue
 from app.release3_uploader import Release3Uploader
 from app.scanner import Scanner
@@ -37,6 +38,7 @@ from app.worker import Verifier, Worker
 COMMANDS = (
     "login",
     "admin",
+    "web",
     "health",
     "scan",
     "sync",
@@ -1041,6 +1043,10 @@ async def async_main() -> None:
 
     if args.command == "admin":
         await run_admin_bot(config, args.config)
+        return
+
+    if args.command == "web":
+        await asyncio.to_thread(run_mini_app_server, config, args.config)
         return
 
     await run_with_clients(config, args.command, args.config)

@@ -15,6 +15,15 @@ telegram:
     session_name: "uploader_bot"
     use_for_uploads: true
 
+# Mini App remains disabled until a public HTTPS URL is configured.
+# Do not put tokens or credentials in this URL.
+mini_app:
+  enabled: false
+  public_url: "${MINI_APP_URL}"
+  host: "0.0.0.0"
+  port: "${MINI_APP_PORT:8080}"
+  auth_max_age_seconds: 3600
+
 # Source and destinations are configured from the Telegram control panel.
 migration:
   sources: []

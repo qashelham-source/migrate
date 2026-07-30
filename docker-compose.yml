@@ -17,11 +17,19 @@ services:
       - ALL
     tmpfs:
       - /tmp:size=256m,mode=1777
+    # The public HTTPS endpoint is terminated by Caddy/Nginx on the host.
+    ports:
+      - "127.0.0.1:${MINI_APP_PORT:-8080}:${MINI_APP_PORT:-8080}"
     environment:
       API_ID: "${API_ID:-}"
       API_HASH: "${API_HASH:-}"
       BOT_TOKEN: "${BOT_TOKEN:-}"
       ADMIN_USER_ID: "${ADMIN_USER_ID:-}"
+      MINI_APP_ENABLED: "${MINI_APP_ENABLED:-}"
+      MINI_APP_URL: "${MINI_APP_URL:-}"
+      MINI_APP_HOST: "${MINI_APP_HOST:-0.0.0.0}"
+      MINI_APP_PORT: "${MINI_APP_PORT:-8080}"
+      MINI_APP_AUTH_MAX_AGE_SECONDS: "${MINI_APP_AUTH_MAX_AGE_SECONDS:-3600}"
       RUN_INTERVAL_SECONDS: "${RUN_INTERVAL_SECONDS:-300}"
       LIVE_RECONCILE_SECONDS: "${LIVE_RECONCILE_SECONDS:-300}"
       LIVE_EVENT_DEBOUNCE_SECONDS: "${LIVE_EVENT_DEBOUNCE_SECONDS:-2}"
@@ -50,17 +58,19 @@ services:
         admin_pid=$$!
         python main.py serve &
         service_pid=$$!
+        python main.py web &
+        web_pid=$$!
 
         cleanup() {
-          kill "$$admin_pid" "$$service_pid" 2>/dev/null || true
-          wait "$$admin_pid" "$$service_pid" 2>/dev/null || true
+          kill "$$admin_pid" "$$service_pid" "$$web_pid" 2>/dev/null || true
+          wait "$$admin_pid" "$$service_pid" "$$web_pid" 2>/dev/null || true
         }
         trap cleanup EXIT INT TERM
 
-        while kill -0 "$$admin_pid" 2>/dev/null && kill -0 "$$service_pid" 2>/dev/null; do
+        while kill -0 "$$admin_pid" 2>/dev/null && kill -0 "$$service_pid" 2>/dev/null && kill -0 "$$web_pid" 2>/dev/null; do
           sleep 5
         done
 
-        echo "Admin bot or live migration service stopped unexpectedly"
+        echo "Admin bot, Mini App, or live migration service stopped unexpectedly"
         exit 1
     stop_grace_period: 45s

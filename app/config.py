@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 import yaml
@@ -75,6 +76,22 @@ def _path(base_dir: Path, value: str) -> Path:
     if path.is_absolute():
         return path
     return (base_dir / path).resolve()
+
+
+def _https_url(value: Any, *, name: str) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username
+        or parsed.password
+        or parsed.fragment
+    ):
+        raise ValueError(f"{name} must be a public HTTPS URL without credentials or fragment")
+    return url.rstrip("/")
 
 
 def _admin_ids(value: Any) -> tuple[int, ...]:
@@ -160,6 +177,15 @@ class TelegramConfig:
 
 
 @dataclass(frozen=True)
+class MiniAppConfig:
+    enabled: bool
+    public_url: str
+    host: str
+    port: int
+    auth_max_age_seconds: int
+
+
+@dataclass(frozen=True)
 class TransferConfig:
     include_videos: bool
     include_photos: bool
@@ -232,6 +258,7 @@ class LoggingConfig:
 class AppConfig:
     base_dir: Path
     telegram: TelegramConfig
+    mini_app: MiniAppConfig
     transfer: TransferConfig
     queue: QueueConfig
     limits: LimitsConfig
@@ -274,6 +301,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     downloads = raw.get("downloads") or {}
     logging_cfg = raw.get("logging") or {}
     migration = raw.get("migration") or {}
+    mini_app = raw.get("mini_app") or {}
     bot = telegram.get("bot") or {}
     include = transfer.get("include") or {}
     native_copy = transfer.get("native_copy") or {}
@@ -289,6 +317,33 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         raise ValueError("telegram.api_hash is required in config.yaml or API_HASH environment variable")
     if bot_enabled and not bot_token:
         raise ValueError("telegram.bot.token is required when telegram.bot.enabled is true")
+
+    mini_app_url = _https_url(
+        mini_app.get("public_url") or os.getenv("MINI_APP_URL"),
+        name="mini_app.public_url",
+    )
+    mini_app_enabled = _as_bool(
+        mini_app.get("enabled", os.getenv("MINI_APP_ENABLED")),
+        bool(mini_app_url),
+        name="mini_app.enabled",
+    )
+    if mini_app_enabled and not mini_app_url:
+        raise ValueError("mini_app.public_url is required when mini_app.enabled is true")
+    if mini_app_enabled and not bot_enabled:
+        raise ValueError("telegram.bot.enabled must be true when mini_app.enabled is true")
+    mini_app_host = str(mini_app.get("host") or os.getenv("MINI_APP_HOST") or "0.0.0.0").strip()
+    if not mini_app_host:
+        raise ValueError("mini_app.host cannot be empty")
+    mini_app_port = _positive_int(
+        mini_app.get("port") or os.getenv("MINI_APP_PORT"),
+        8080,
+        name="mini_app.port",
+    )
+    mini_app_auth_max_age_seconds = _positive_int(
+        mini_app.get("auth_max_age_seconds") or os.getenv("MINI_APP_AUTH_MAX_AGE_SECONDS"),
+        3600,
+        name="mini_app.auth_max_age_seconds",
+    )
 
     root = _path(base_dir, str(downloads.get("root", "downloads")))
     active_dir = _path(base_dir, str(downloads.get("active_dir", root / "active")))
@@ -334,6 +389,13 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
                 bot.get("use_for_uploads"), True, name="telegram.bot.use_for_uploads"
             ),
             admin_ids=_admin_ids(telegram.get("admin_ids")),
+        ),
+        mini_app=MiniAppConfig(
+            enabled=mini_app_enabled,
+            public_url=mini_app_url,
+            host=mini_app_host,
+            port=mini_app_port,
+            auth_max_age_seconds=mini_app_auth_max_age_seconds,
         ),
         transfer=TransferConfig(
             include_videos=_as_bool(include.get("videos"), True, name="transfer.include.videos"),

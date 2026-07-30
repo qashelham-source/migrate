@@ -17,7 +17,7 @@ Use this project only for content you own or have permission to access, copy, an
 - reusable bot `file_id` cache
 - strong destination verification and item-level repair
 - fail-safe destination readiness checks and Issue Center reporting
-- Telegram admin control panel
+- Telegram admin control panel and authenticated Mini App dashboard
 - FloodWait-aware operation pacing
 - storage pressure protection and progress telemetry
 - Docker deployment with health checks, backups, and rollback
@@ -74,6 +74,12 @@ telegram:
     token: "${BOT_TOKEN}"
     use_for_uploads: true
 
+mini_app:
+  enabled: false
+  public_url: "${MINI_APP_URL}"
+  host: "0.0.0.0"
+  port: 8080
+
 migration:
   sources: []
   destinations: []
@@ -102,6 +108,7 @@ The session is stored under `sessions/`. Never commit or share session files.
 
 ```bash
 python main.py admin                 # private Telegram control panel
+python main.py web                   # local Mini App HTTP server (behind HTTPS proxy)
 python main.py health                # Telegram-aware health report
 python main.py scan                  # full scan into the durable queue
 python main.py sync                  # scan only after the latest checkpoint
@@ -149,6 +156,24 @@ python main.py admin
 
 Only explicit IDs from `telegram.admin_ids` and `ADMIN_USER_ID` are accepted. On a first-run setup with no explicit admin ID, only the configured active user session may bootstrap access; unrelated entries in the cached account list never become admins. The panel supports source and destination management, live status, stop requests, health checks, repair queue controls, checkpoint reset, full scans, and incremental sync.
 
+## Mini App dashboard
+
+When `mini_app.enabled` is true and `mini_app.public_url` is a public HTTPS URL, the private bot dashboard shows **Open Mini Dashboard**. The Mini App is designed for live status and source-queue ordering on a phone; destructive actions such as deleting a source, clearing history, and checkpoint reset remain in the chat panel with their existing confirmations.
+
+The browser never gets access merely because it sends a Telegram user ID. Every API request carries Telegram `initData`, which the server validates with the bot token and checks against the same admin allow-list as the chat bot. The dashboard omits raw channel IDs, bot tokens, and session data.
+
+Set the public URL in `.env` and enable the section in `config.yaml`:
+
+```env
+MINI_APP_URL=https://migration.example.com
+```
+
+```yaml
+mini_app:
+  enabled: true
+  public_url: "${MINI_APP_URL}"
+```
+
 ## Docker
 
 Prepare files and directories:
@@ -174,6 +199,18 @@ Set `APP_UID` and `APP_GID` when the host directories belong to a different serv
 APP_UID=10001
 APP_GID=10001
 ```
+
+### Mini App HTTPS proxy
+
+Compose binds the Mini App port to `127.0.0.1` only. Put a TLS reverse proxy in front of it; do not expose the container port directly to the internet. For example, with Caddy and a DNS name pointed at the server:
+
+```caddyfile
+migration.example.com {
+  reverse_proxy 127.0.0.1:8080
+}
+```
+
+Use the same HTTPS address in `MINI_APP_URL`. Once the admin bot restarts, the button appears in its dashboard. Keep `mini_app.enabled: false` until the proxy and DNS are ready.
 
 ## Production deployment
 

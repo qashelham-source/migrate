@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="ms">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <title>Migration Control</title>
+  <script src="https://telegram.org/js/telegram-web-app.js?63"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: var(--tg-theme-bg-color, #111318);
+      --surface: var(--tg-theme-secondary-bg-color, #1d212a);
+      --surface-2: color-mix(in srgb, var(--surface) 86%, var(--bg));
+      --text: var(--tg-theme-text-color, #f4f6fb);
+      --muted: var(--tg-theme-hint-color, #9299a8);
+      --accent: var(--tg-theme-button-color, #5d8dff);
+      --accent-text: var(--tg-theme-button-text-color, #ffffff);
+      --line: color-mix(in srgb, var(--text) 12%, transparent);
+      --good: #2bb673;
+      --warn: #f2b84b;
+      --danger: #ea5a67;
+      --radius: 18px;
+    }
+
+    * { box-sizing: border-box; }
+    html { background: var(--bg); }
+    body {
+      margin: 0;
+      min-width: 300px;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    }
+
+    button {
+      font: inherit;
+      color: inherit;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .app {
+      width: min(100%, 620px);
+      min-height: 100vh;
+      margin: 0 auto;
+      padding: calc(18px + env(safe-area-inset-top)) 16px calc(28px + env(safe-area-inset-bottom));
+    }
+
+    .topbar, .heading, .row, .source-top, .metric {
+      display: flex;
+      align-items: center;
+    }
+
+    .topbar {
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 24px;
+    }
+
+    .eyebrow {
+      margin: 0 0 2px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+      letter-spacing: .04em;
+      text-transform: uppercase;
+    }
+
+    h1, h2, h3, p { margin-top: 0; }
+    h1 { margin-bottom: 0; font-size: 25px; letter-spacing: -.03em; }
+    h2 { margin-bottom: 0; font-size: 17px; letter-spacing: -.01em; }
+    h3 { margin-bottom: 0; font-size: 15px; }
+
+    .refresh, .move {
+      display: grid;
+      place-items: center;
+      border: 0;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+    }
+
+    .refresh {
+      width: 42px;
+      height: 42px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      font-size: 21px;
+    }
+
+    .refresh.loading { animation: spin .8s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .status {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      max-width: 100%;
+      margin-top: 12px;
+      padding: 7px 10px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      flex: 0 0 auto;
+      border-radius: 100%;
+      background: var(--muted);
+    }
+
+    .status.active .dot { background: var(--good); box-shadow: 0 0 0 4px color-mix(in srgb, var(--good) 18%, transparent); }
+    .status.waiting .dot { background: var(--warn); }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin: 18px 0 24px;
+    }
+
+    .metric, .card {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+    }
+
+    .metric {
+      min-height: 90px;
+      flex-direction: column;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 14px;
+      gap: 4px;
+    }
+
+    .metric strong { font-size: 23px; line-height: 1; letter-spacing: -.04em; }
+    .metric span { color: var(--muted); font-size: 12px; }
+
+    .metric.danger strong { color: var(--danger); }
+    .metric.good strong { color: var(--good); }
+
+    .section { margin-top: 24px; }
+    .heading { justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .heading small { color: var(--muted); }
+
+    .card { padding: 16px; }
+    .active-card { overflow: hidden; }
+    .subline { margin: 4px 0 14px; color: var(--muted); font-size: 13px; }
+
+    .progress {
+      width: 100%;
+      height: 9px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--text) 12%, transparent);
+    }
+
+    .progress > span {
+      display: block;
+      width: 0%;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--accent);
+      transition: width .35s ease;
+    }
+
+    .facts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      margin-top: 12px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      margin-bottom: 12px;
+      padding: 4px;
+      border-radius: 14px;
+      background: color-mix(in srgb, var(--surface) 75%, var(--bg));
+    }
+
+    .tab {
+      border: 0;
+      border-radius: 10px;
+      padding: 9px 8px;
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer;
+      font-weight: 650;
+    }
+
+    .tab.selected {
+      background: var(--surface);
+      color: var(--text);
+      box-shadow: 0 1px 2px rgb(0 0 0 / .12);
+    }
+
+    .source-list, .issue-list { display: grid; gap: 10px; }
+    .source { padding: 14px; }
+    .source-top { justify-content: space-between; align-items: flex-start; gap: 12px; }
+    .source-title { min-width: 0; }
+    .source-title h3, .source-title p { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .source-title p { margin: 3px 0 0; color: var(--muted); font-size: 13px; }
+    .badge {
+      flex: 0 0 auto;
+      max-width: 46%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      padding: 4px 8px;
+      border-radius: 999px;
+      background: color-mix(in srgb, var(--text) 9%, transparent);
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .badge.running { color: var(--good); background: color-mix(in srgb, var(--good) 14%, transparent); }
+    .badge.attention { color: var(--warn); background: color-mix(in srgb, var(--warn) 14%, transparent); }
+    .badge.complete { color: var(--good); }
+
+    .source-progress { margin-top: 12px; }
+    .source-progress .facts { margin-top: 8px; }
+
+    .queue-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .move {
+      width: 34px;
+      height: 34px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--surface-2);
+      font-size: 18px;
+    }
+
+    .move:disabled { opacity: .35; cursor: default; }
+    .move:not(:disabled):active, .refresh:active { transform: scale(.96); }
+
+    .issue { padding: 13px 14px; }
+    .issue p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+    .issue .issue-status { color: var(--warn); }
+
+    .empty, .notice {
+      padding: 22px 16px;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .notice {
+      margin-top: 28px;
+      border: 1px dashed var(--line);
+      border-radius: var(--radius);
+      line-height: 1.55;
+    }
+
+    .hidden { display: none !important; }
+
+    @media (min-width: 480px) {
+      .metrics { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .metric { min-height: 102px; padding: 15px 12px; }
+      .metric strong { font-size: 21px; }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <div class="topbar">
+      <div>
+        <p class="eyebrow">Telegram Mini App</p>
+        <h1>Migration Control</h1>
+      </div>
+      <button id="refresh" class="refresh" aria-label="Muat semula" title="Muat semula">↻</button>
+    </div>
+
+    <div id="dashboard" class="hidden">
+      <div id="state" class="status"><span class="dot"></span><span>Memuatkan status…</span></div>
+      <section id="metrics" class="metrics"></section>
+
+      <section id="active-section" class="section hidden">
+        <div class="heading"><h2>Sedang diproses</h2><small id="active-percent"></small></div>
+        <div id="active-card" class="card active-card"></div>
+      </section>
+
+      <section class="section">
+        <div class="tabs" role="tablist" aria-label="Paparan dashboard">
+          <button class="tab selected" data-tab="overview" role="tab" aria-selected="true">Ringkasan</button>
+          <button class="tab" data-tab="queue" role="tab" aria-selected="false">Susun Queue</button>
+        </div>
+        <div id="source-list" class="source-list"></div>
+        <p id="queue-note" class="notice hidden">Susun keutamaan sumber di sini. Tambah, buang, dan aksi yang memadam data kekal di bot chat supaya setiap perubahan itu jelas dan selamat.</p>
+      </section>
+
+      <section id="issues-section" class="section">
+        <div class="heading"><h2>Perlu perhatian</h2><small>Isu sebenar sahaja</small></div>
+        <div id="issue-list" class="issue-list"></div>
+      </section>
+    </div>
+
+    <div id="notice" class="notice">
+      Buka dashboard ini melalui butang dalam chat bot Telegram.
+    </div>
+  </main>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const telegram = window.Telegram && window.Telegram.WebApp;
+      const state = { payload: null, tab: "overview", loading: false };
+      const $ = (id) => document.getElementById(id);
+
+      function escapeHtml(value) {
+        return String(value ?? "").replace(/[&<>"']/g, (char) => ({
+          "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;"
+        }[char]));
+      }
+
+      function number(value) {
+        return new Intl.NumberFormat("ms-MY").format(Number(value || 0));
+      }
+
+      function request(path, body) {
+        const headers = { "X-Telegram-Init-Data": telegram ? telegram.initData : "" };
+        const options = { method: "POST", headers, credentials: "same-origin" };
+        if (body !== undefined) {
+          headers["Content-Type"] = "application/json";
+          options.body = JSON.stringify(body);
+        }
+        return fetch(path, options).then(async (response) => {
+          const data = await response.json().catch(() => ({}));
+          if (!response.ok) throw new Error(data.error || "Tidak dapat memuatkan dashboard.");
+          return data;
+        });
+      }
+
+      function progress(value) {
+        const safe = Math.max(0, Math.min(100, Number(value || 0)));
+        return '<div class="progress" aria-label="' + safe + '%"><span style="width:' + safe + '%"></span></div>';
+      }
+
+      function sourceCard(source) {
+        const details = source.progress
+          ? '<div class="source-progress">' +
+              progress(source.progress.percent) +
+              '<div class="facts"><span>' + number(source.progress.copied) + ' / ' + number(source.progress.eligible) + ' siap</span>' +
+              '<span>' + number(source.progress.remaining) + ' lagi</span></div></div>'
+          : "";
+        const actions = state.tab === "queue"
+          ? '<div class="queue-actions">' +
+              '<button class="move" data-move="up" data-index="' + source.position + '" aria-label="Naikkan ' + escapeHtml(source.title) + '" ' + (source.can_move_up ? "" : "disabled") + '>↑</button>' +
+              '<button class="move" data-move="down" data-index="' + source.position + '" aria-label="Turunkan ' + escapeHtml(source.title) + '" ' + (source.can_move_down ? "" : "disabled") + '>↓</button>' +
+            '</div>'
+          : "";
+        return '<article class="card source">' +
+          '<div class="source-top"><div class="source-title"><h3>' + escapeHtml(source.title) + '</h3>' +
+          (source.handle ? '<p>' + escapeHtml(source.handle) + '</p>' : "") +
+          '</div><span class="badge ' + escapeHtml(source.state) + '">' + escapeHtml(source.state_label) + '</span></div>' +
+          details + actions + '</article>';
+      }
+
+      function render(payload) {
+        state.payload = payload;
+        $("dashboard").classList.remove("hidden");
+        $("notice").classList.add("hidden");
+
+        const status = $("state");
+        status.className = "status " + (payload.state.active ? "active" : "waiting");
+        status.innerHTML = '<span class="dot"></span><span>' + escapeHtml(payload.state.label) + '</span>';
+
+        const summary = payload.summary;
+        $("metrics").innerHTML = [
+          ["Aktif", number(summary.active), ""],
+          ["Menunggu", number(summary.pending), ""],
+          ["Berjaya", number(summary.copied), "good"],
+          ["Isu", number(summary.issues), summary.issues ? "danger" : ""]
+        ].map(([label, value, extra]) =>
+          '<div class="metric ' + extra + '"><strong>' + value + '</strong><span>' + label + '</span></div>'
+        ).join("");
+
+        const activeSection = $("active-section");
+        if (payload.active) {
+          activeSection.classList.remove("hidden");
+          $("active-percent").textContent = payload.active.percent + "%";
+          $("active-card").innerHTML =
+            '<h3>' + escapeHtml(payload.active.title) + '</h3>' +
+            '<p class="subline">' + number(payload.active.copied) + ' / ' + number(payload.active.eligible) +
+              ' item siap · ' + number(payload.active.remaining) + ' berbaki</p>' +
+            progress(payload.active.percent) +
+            '<div class="facts"><span>' + number(payload.active.active) + ' aktif</span>' +
+              '<span>' + escapeHtml(summary.speed) + '</span><span>ETA ' + escapeHtml(summary.eta) + '</span></div>';
+        } else {
+          activeSection.classList.add("hidden");
+        }
+
+        $("source-list").innerHTML = payload.sources.length
+          ? payload.sources.map(sourceCard).join("")
+          : '<div class="card empty">Belum ada sumber dalam queue. Tambah sumber melalui bot chat.</div>';
+        $("queue-note").classList.toggle("hidden", state.tab !== "queue");
+
+        const issueSection = $("issues-section");
+        issueSection.classList.toggle("hidden", state.tab === "queue");
+        $("issue-list").innerHTML = payload.issues.length
+          ? payload.issues.map((issue) =>
+              '<article class="card issue"><h3>' + escapeHtml(issue.source) + '</h3>' +
+              '<p class="issue-status">' + escapeHtml(issue.status) + '</p>' +
+              '<p>' + escapeHtml(issue.error) + '</p></article>'
+            ).join("")
+          : '<div class="card empty">Tiada isu aktif. Skip yang dijangka tidak dipaparkan di sini.</div>';
+
+        document.querySelectorAll(".tab").forEach((button) => {
+          const selected = button.dataset.tab === state.tab;
+          button.classList.toggle("selected", selected);
+          button.setAttribute("aria-selected", String(selected));
+        });
+        document.querySelectorAll("[data-move]").forEach((button) => {
+          button.addEventListener("click", () => move(Number(button.dataset.index), button.dataset.move));
+        });
+      }
+
+      function showError(message) {
+        $("dashboard").classList.add("hidden");
+        $("notice").classList.remove("hidden");
+        $("notice").textContent = message || "Tidak dapat memuatkan dashboard. Cuba semula dari bot chat.";
+      }
+
+      function setLoading(loading) {
+        state.loading = loading;
+        $("refresh").classList.toggle("loading", loading);
+        $("refresh").disabled = loading;
+      }
+
+      async function refresh() {
+        if (state.loading) return;
+        setLoading(true);
+        try {
+          render(await request("/api/dashboard"));
+        } catch (error) {
+          showError(error.message);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      async function move(index, direction) {
+        if (state.loading) return;
+        setLoading(true);
+        try {
+          render(await request("/api/queue/move", { index, direction }));
+          if (telegram && telegram.HapticFeedback) telegram.HapticFeedback.notificationOccurred("success");
+        } catch (error) {
+          if (telegram && telegram.HapticFeedback) telegram.HapticFeedback.notificationOccurred("error");
+          showError(error.message);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      $("refresh").addEventListener("click", refresh);
+      document.querySelectorAll(".tab").forEach((button) => {
+        button.addEventListener("click", () => {
+          state.tab = button.dataset.tab;
+          if (state.payload) render(state.payload);
+        });
+      });
+
+      if (!telegram || !telegram.initData) {
+        showError("Buka dashboard ini melalui butang dalam chat bot Telegram.");
+        return;
+      }
+      telegram.ready();
+      telegram.expand();
+      refresh();
+      window.setInterval(() => {
+        if (!document.hidden) refresh();
+      }, 15000);
+    })();
+  </script>
+</body>
+</html>
