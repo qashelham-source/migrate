@@ -30,6 +30,7 @@ from app.telegram_client import (
     make_bot_client,
     make_user_client,
     resolve_chat,
+    start_client_with_floodwait,
     update_account_cache,
 )
 from app.worker import Verifier, Worker
@@ -1022,7 +1023,12 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
 
         async with AsyncExitStack() as stack:
             reader = make_user_client(config)
-            await stack.enter_async_context(reader)
+            await start_client_with_floodwait(
+                reader,
+                label="reader session",
+                logger=logger,
+            )
+            stack.push_async_callback(reader.stop)
             me = await limiter.call("read", reader.get_me)
             update_account_cache(config, config.telegram.user_session, me)
             logger.info("Reader session: %s (%s)", me.first_name, me.id)
@@ -1032,7 +1038,12 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
             bot = make_bot_client(config)
             writer_me = me
             if bot and config.telegram.use_bot_for_uploads:
-                await stack.enter_async_context(bot)
+                await start_client_with_floodwait(
+                    bot,
+                    label="writer bot",
+                    logger=logger,
+                )
+                stack.push_async_callback(bot.stop)
                 writer_me = await limiter.call("read", bot.get_me)
                 logger.info("Writer bot: %s (%s)", writer_me.first_name, writer_me.id)
             else:
