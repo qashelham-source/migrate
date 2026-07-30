@@ -9,6 +9,7 @@ from typing import Any
 from app.config import AppConfig
 from app.db import Database, RecoverySummary, utc_now
 from app.release3_store import Release3Store
+from app.skip_policy import expected_skip_reason_sql
 from app.telegram_client import telegram_peer
 
 
@@ -290,6 +291,41 @@ class MessageQueue:
         if row:
             self.release3.recompute_source_state(row["source_chat_id"])
 
+    @staticmethod
+    def is_repair_job(job: MessageJob) -> bool:
+        return job.file_unique_key.startswith("repair:")
+
+    def cancel_job(self, job: MessageJob, reason: str) -> str:
+        """Remove a non-repair job from live work while retaining its anti-duplicate record."""
+        cancellation = f"Cancelled by policy. {str(reason or 'Terminal job cancelled.')}"
+        self.db.set_status(job.id, "skipped", last_error=cancellation)
+        self.release3.finish_telemetry(job.id, stage="skipped")
+        row = self.db.query_one("SELECT source_chat_id FROM messages WHERE id = ?", (job.id,))
+        if row:
+            self.release3.recompute_source_state(row["source_chat_id"])
+        return cancellation
+
+    def cancel_terminal_issues(self) -> int:
+        """Hide old terminal non-repair jobs without allowing a later scan to recreate them."""
+        expected_skip = expected_skip_reason_sql("last_error")
+        rows = self.db.query(
+            f"""
+            SELECT *
+            FROM messages
+            WHERE status IN ('failed', 'skipped')
+              AND file_unique_key NOT LIKE 'repair:%'
+              AND NOT {expected_skip}
+              AND LOWER(COALESCE(last_error, '')) NOT LIKE
+                  'interrupted during upload; destination result is unknown%'
+              AND LOWER(COALESCE(last_error, '')) NOT LIKE
+                  'upload connection interrupted; destination result is unknown%'
+            ORDER BY id ASC
+            """
+        )
+        for row in rows:
+            self.cancel_job(MessageJob.from_row(row), str(row["last_error"] or ""))
+        return len(rows)
+
     def mark_verified(self, job_id: int) -> None:
         self.db.set_status(job_id, "copied", verified_at=utc_now())
         parent_job_id = self.release3.complete_repair_job(job_id)
@@ -299,6 +335,9 @@ class MessageQueue:
 
     def mark_failure(self, job: MessageJob, error: str, attempts: int) -> str:
         if attempts >= self.config.queue.max_attempts:
+            if not self.is_repair_job(job):
+                self.cancel_job(job, f"Final automatic retry failed. {error}")
+                return "cancelled"
             self.db.set_status(job.id, "failed", last_error=error)
             self.release3.finish_telemetry(job.id, stage="failed")
             parent_job_id = self.release3.fail_repair_job(job.id, error)
