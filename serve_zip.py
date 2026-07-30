@@ -1,6 +1,6 @@
 import http.server, os, pathlib
 
-FILE = pathlib.Path("attached_assets/migrate-fixed.zip")
+FILE = pathlib.Path("/home/runner/workspace/attached_assets/migrate-fixed.zip")
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
