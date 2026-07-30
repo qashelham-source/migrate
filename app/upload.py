@@ -51,6 +51,31 @@ class Uploader:
         self.queue = queue
         self.logger = logger
 
+    @staticmethod
+    def _cache_matches_job(job: MessageJob, cached: MediaCacheEntry) -> bool:
+        """Only reuse a bot file_id when Telegram media types match exactly."""
+        cached_types = [str(media_type).lower() for media_type in cached.media_types]
+        supported_types = {"photo", "video", "document"}
+        if not cached_types or any(media_type not in supported_types for media_type in cached_types):
+            return False
+        if job.media_type == "album":
+            return len(cached_types) > 1
+        return all(media_type == job.media_type for media_type in cached_types)
+
+    @staticmethod
+    def _is_cached_file_id_type_mismatch(exc: ValueError) -> bool:
+        message = str(exc).casefold()
+        return (
+            message.startswith("expected ")
+            and " got " in message
+            and " file id instead" in message
+        )
+
+    def _discard_cached_media(self, job: MessageJob, reason: str) -> None:
+        self.queue.delete_media_cache(job.file_unique_key)
+        if self.logger:
+            self.logger.warning("Discarded cached bot file_id for job %s: %s", job.id, reason)
+
     async def process(
         self,
         job: MessageJob,
@@ -59,16 +84,21 @@ class Uploader:
     ) -> UploadResult:
         cached = self.queue.get_media_cache(job.file_unique_key)
         if cached and job.media_type != "text":
-            try:
-                await on_phase("uploading")
-                result = await self._send_cached(job, cached)
-                if self.logger:
-                    self.logger.info("Job %s reused cached bot file_id", job.id)
-                return result
-            except (BadRequest, MediaEmpty) as exc:
-                self.queue.delete_media_cache(job.file_unique_key)
-                if self.logger:
-                    self.logger.warning("Cached file_id invalid for job %s: %s", job.id, exc)
+            if not self._cache_matches_job(job, cached):
+                self._discard_cached_media(job, "media type does not match the queued source")
+            else:
+                try:
+                    await on_phase("uploading")
+                    result = await self._send_cached(job, cached)
+                    if self.logger:
+                        self.logger.info("Job %s reused cached bot file_id", job.id)
+                    return result
+                except (BadRequest, MediaEmpty) as exc:
+                    self._discard_cached_media(job, f"Telegram rejected cached file_id: {exc}")
+                except ValueError as exc:
+                    if not self._is_cached_file_id_type_mismatch(exc):
+                        raise
+                    self._discard_cached_media(job, f"cached file_id type mismatch: {exc}")
 
         messages = await self._load_source_messages(job)
         messages = [message for message in messages if self._message_should_process(message)]
@@ -264,10 +294,21 @@ class Uploader:
             result, sent_messages = await self._upload_downloaded(job, downloaded)
             bot_file_ids = [self._message_file_id(message) for message in sent_messages]
             media_types = [message_media_type(message) for message in sent_messages]
-            if bot_file_ids and all(bot_file_ids):
+            cache_entry = MediaCacheEntry(
+                file_unique_key=job.file_unique_key,
+                bot_file_ids=bot_file_ids,
+                media_types=media_types,
+            )
+            if bot_file_ids and all(bot_file_ids) and self._cache_matches_job(job, cache_entry):
                 self.queue.save_media_cache(job.file_unique_key, bot_file_ids, media_types)
                 if self.logger:
                     self.logger.info("Saved %s reusable bot file_id value(s)", len(bot_file_ids))
+            elif bot_file_ids:
+                self.queue.delete_media_cache(job.file_unique_key)
+                if self.logger:
+                    self.logger.warning(
+                        "Did not cache job %s because Telegram changed its media type", job.id
+                    )
             return result
         finally:
             shutil.rmtree(job_dir, ignore_errors=True)
