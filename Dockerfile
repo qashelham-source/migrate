@@ -1,4 +1,4 @@
-FROM python:3.11-slim AS builder
+FROM python:3.14-slim AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     VIRTUAL_ENV=/opt/venv
@@ -17,7 +17,7 @@ RUN python -m pip install --upgrade pip \
     && python -m pip uninstall --yes pip
 
 
-FROM python:3.11-slim AS runtime
+FROM python:3.14-slim AS runtime
 
 ARG APP_UID=10001
 ARG APP_GID=10001
