@@ -248,21 +248,27 @@ class Worker:
             else:
                 raise RuntimeError(f"Unknown upload result status: {result.status}")
         except PermanentJobError as exc:
-            self.queue.mark_skipped(job.id, compact_error(exc))
+            error = compact_error(exc)
+            if self.queue.is_repair_job(job):
+                self.queue.mark_skipped(job.id, error)
+                outcome = "skipped"
+            else:
+                error = self.queue.cancel_job(job, error)
+                outcome = "cancelled"
             self.queue.log_repair(
                 action="permanent_skip",
                 job=job,
-                reason=compact_error(exc),
-                outcome="skipped",
+                reason=error,
+                outcome=outcome,
             )
             if self.logger:
-                self.logger.warning("Job %s skipped permanently: %s", job.id, exc)
+                self.logger.warning("Job %s %s after permanent error: %s", job.id, outcome, exc)
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} was skipped because of a permanent error.",
-                last_result="skipped",
-                last_error=compact_error(exc),
+                message=f"Job #{job.id} was {outcome} after a permanent error.",
+                last_result=outcome,
+                last_error=error,
                 **self._status_details(job, **common),
             )
         except RetryableJobError as exc:
@@ -272,7 +278,11 @@ class Worker:
                 message = f"Job #{job.id} was returned to pending."
             else:
                 status = self.queue.mark_failure(job, compact_error(exc), attempts)
-                message = f"Job #{job.id} will be retried."
+                message = (
+                    f"Job #{job.id} was cancelled after its final failed attempt."
+                    if status == "cancelled"
+                    else f"Job #{job.id} will be retried."
+                )
             self.queue.log_repair(
                 action="retry_with_backoff",
                 job=job,
@@ -293,7 +303,10 @@ class Worker:
         except (ChannelPrivate, ChannelInvalid, ChatWriteForbidden) as exc:
             error = compact_error(exc)
             self.queue.pause_destination(job, "Destination access/permission failed", error)
-            self.queue.mark_skipped(job.id, error)
+            if self.queue.is_repair_job(job):
+                self.queue.mark_skipped(job.id, error)
+            else:
+                error = self.queue.cancel_job(job, error)
             self.queue.log_repair(
                 action="pause_destination",
                 job=job,
@@ -326,7 +339,11 @@ class Worker:
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} had a media error and will go through recovery.",
+                message=(
+                    f"Job #{job.id} was cancelled after its final failed attempt."
+                    if status == "cancelled"
+                    else f"Job #{job.id} had a media error and will go through recovery."
+                ),
                 last_result=status,
                 last_error=error,
                 **self._status_details(job, **common),
@@ -393,7 +410,11 @@ class Worker:
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} failed and recovery was recorded.",
+                message=(
+                    f"Job #{job.id} was cancelled after its final failed attempt."
+                    if status == "cancelled"
+                    else f"Job #{job.id} failed and recovery was recorded."
+                ),
                 last_result=status,
                 last_error=error,
                 **self._status_details(job, **common),
@@ -413,7 +434,11 @@ class Worker:
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} failed and recovery was recorded.",
+                message=(
+                    f"Job #{job.id} was cancelled after its final failed attempt."
+                    if status == "cancelled"
+                    else f"Job #{job.id} failed and recovery was recorded."
+                ),
                 last_result=status,
                 last_error=error,
                 **self._status_details(job, **common),
