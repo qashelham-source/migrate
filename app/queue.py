@@ -269,6 +269,15 @@ class MessageQueue:
         self.db.set_status(job_id, status)
         self.release3.update_telemetry(job_id, stage=status)
 
+    def begin_verification(self, job_id: int) -> bool:
+        return self.db.start_verification(job_id)
+
+    def clear_activity_phase(self, job_id: int) -> bool:
+        return self.db.clear_activity_phase(job_id)
+
+    def touch_active_job(self, job_id: int) -> bool:
+        return self.db.touch_active_job(job_id)
+
     def mark_copied(self, job_id: int, dest_message_ids: list[int], route: str | None = None) -> None:
         self.db.set_status(job_id, "copied", last_error="", dest_message_ids=dest_message_ids)
         self.release3.finish_telemetry(job_id, stage="copied", route=route)
