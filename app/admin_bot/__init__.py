@@ -83,6 +83,22 @@ def _menu(config: AppConfig | None = None) -> InlineKeyboardMarkup:
          InlineKeyboardButton("⏹ Stop", callback_data="stop:current")],
         [InlineKeyboardButton("🔄 Refresh", callback_data="dashboard:view")],
     ]
+    # When a source is blocked (stuck jobs with no live worker), surface a
+    # one-tap shortcut to delete the migration directly from the dashboard.
+    if config:
+        try:
+            _status = read_status(config)
+            _phase = str(_status.get("phase") or "").lower()
+            if _phase == "blocked" and _status.get("source_chat"):
+                rows.insert(
+                    -1,
+                    [InlineKeyboardButton(
+                        "🗑 Delete Active Migration",
+                        callback_data="advanced:delete_active_migration",
+                    )],
+                )
+        except Exception:
+            pass  # Never crash the menu render over an optional status read
     if config and config.mini_app.enabled:
         rows.insert(
             0,
@@ -115,6 +131,7 @@ def _advanced_menu() -> InlineKeyboardMarkup:
             [("🩺 Health Check", "advanced:health"), ("🛠 Repair Queue", "advanced:repair")],
             [("▶️ Resume Pending", "advanced:resume"), ("🆕 Sync New Posts", "advanced:sync")],
             [("🔍 Full Scan", "advanced:full"), ("📍 Checkpoints", "checkpoint:view")],
+            [("🔓 Force Recover Stuck Jobs", "advanced:force_recover")],
             [("⬅️ Smart Center", "smart:menu")],
         ]
     )
@@ -1479,6 +1496,87 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 db.close()
             _request_mode(config, "run")
             await query.answer(f"{removed} checkpoint(s) removed.", show_alert=True)
+            return
+        if data == "advanced:force_recover":
+            db = _database(config)
+            try:
+                recovery = MessageQueue(db, config).recover_in_progress()
+            finally:
+                db.close()
+            if recovery.total:
+                msg = (
+                    f"Recovered {recovery.requeued_downloads} stuck download(s) → pending.\n"
+                    f"Held {recovery.held_uploads} stuck upload(s) as failed (verify destination "
+                    f"before retrying)."
+                )
+            else:
+                msg = "No stuck jobs found. All active jobs have valid worker leases."
+            await query.answer(msg[:200], show_alert=True)
+            if recovery.total:
+                _request_mode(config, "process")
+            await edit(query, _dashboard_text(config), _menu(config))
+            start_live(user_id, query.message)
+            return
+        if data == "advanced:delete_active_migration":
+            status = read_status(config)
+            active_source_chat = str(status.get("source_chat") or "")
+            if not active_source_chat:
+                await query.answer("No active source found in status.", show_alert=True)
+                return
+            source_title = _channel_title(user_id, active_source_chat, path)[:60]
+            await edit(
+                query,
+                "\n".join([
+                    "🗑 Delete Active Migration?",
+                    "",
+                    source_title,
+                    "",
+                    "This permanently removes all jobs and checkpoints for this source "
+                    "and adds it to the blacklist so it will not run again.",
+                    "",
+                    "The next source in the queue will start automatically.",
+                ]),
+                _buttons([
+                    [("🗑 Delete Permanently", "advanced:delete_active_confirm")],
+                    [("⬅️ Cancel", "menu")],
+                ]),
+            )
+            await query.answer()
+            return
+        if data == "advanced:delete_active_confirm":
+            status = read_status(config)
+            active_source_chat = str(status.get("source_chat") or "")
+            if not active_source_chat:
+                await query.answer("No active source found. Nothing deleted.", show_alert=True)
+                return
+            source_title = _channel_title(user_id, active_source_chat, path)[:60]
+            try:
+                db = _database(config)
+                try:
+                    deleted = MessageQueue(db, config).purge_source_jobs(active_source_chat)
+                finally:
+                    db.close()
+                blacklisted = blacklist_source(active_source_chat, path)
+            except Exception as exc:
+                await query.answer(
+                    f"Delete failed: {exc.__class__.__name__}: {exc}"[:190],
+                    show_alert=True,
+                )
+                return
+            if user_id in _SELECTIONS:
+                sel = _SELECTIONS[user_id]
+                sel["sources"] = [
+                    v for v in sel.get("sources", [])
+                    if str(v).lower() != blacklisted.lower()
+                ]
+            _request_mode(config, "run")
+            await query.answer(
+                f"Deleted {deleted['jobs']} job(s) for {source_title}. "
+                f"Starting the next source.",
+                show_alert=True,
+            )
+            await edit(query, _dashboard_text(config), _menu(config))
+            start_live(user_id, query.message)
             return
         if data in {"advanced:resume", "advanced:full", "advanced:sync", "run:now"}:
             if data == "run:now":
