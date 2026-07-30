@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import uuid
 from contextlib import suppress
 from typing import Any
 
@@ -24,6 +25,11 @@ from app.upload import Uploader
 
 
 JOB_HEARTBEAT_SECONDS = 30
+DEFAULT_JOB_LEASE_SECONDS = 120
+
+
+class WorkerLeaseLostError(RuntimeError):
+    """Raised before a stale worker can begin a destination operation."""
 
 
 class Worker:
@@ -37,6 +43,8 @@ class Worker:
         source_index: int | None = None,
         source_total: int | None = None,
         source_label: str | None = None,
+        worker_id: str | None = None,
+        lease_seconds: int | float = DEFAULT_JOB_LEASE_SECONDS,
     ) -> None:
         self.config = config
         self.queue = queue
@@ -46,6 +54,8 @@ class Worker:
         self.source_index = source_index
         self.source_total = source_total
         self.source_label = source_label
+        self.worker_id = worker_id or f"worker-{uuid.uuid4().hex}"
+        self.lease_seconds = max(JOB_HEARTBEAT_SECONDS * 2, int(lease_seconds))
         self.storage_policy = StoragePolicy.from_environment()
 
     @staticmethod
@@ -100,8 +110,15 @@ class Worker:
         return details
 
     async def run(self, stop_event: asyncio.Event) -> None:
+        processed_in_batch = 0
+        batch_size = max(1, int(self.config.batch.size))
         while not stop_event.is_set():
-            jobs = self.queue.claim_due(self.config.batch.size, self.source_chat_id)
+            jobs = self.queue.claim_due(
+                1,
+                self.source_chat_id,
+                worker_id=self.worker_id,
+                lease_seconds=self.lease_seconds,
+            )
             if not jobs:
                 if self.logger:
                     self.logger.info("No due pending jobs")
@@ -113,46 +130,39 @@ class Worker:
                 )
                 return
 
-            for index, job in enumerate(jobs, start=1):
-                if stop_event.is_set():
-                    break
-                await self._process_one(
-                    job,
-                    stop_event,
-                    batch_index=index,
-                    batch_total=len(jobs),
-                )
+            job = jobs[0]
+            processed_in_batch += 1
+            await self._process_one(
+                job,
+                stop_event,
+                batch_index=processed_in_batch,
+                batch_total=batch_size,
+            )
 
             if stop_event.is_set():
                 break
-            if len(jobs) >= self.config.batch.size:
-                if not self.queue.fetch_due(1, self.source_chat_id):
-                    write_status(
-                        self.config,
-                        "idle",
-                        message="All runnable jobs for this source are complete.",
-                        **self._status_details(),
-                    )
-                    return
-                pause = self.config.batch.pause_between_batches_seconds
-                if self.logger:
-                    self.logger.info("Batch complete; pausing %ss before next batch", pause)
-                write_status(
-                    self.config,
-                    "batch_pause",
-                    message=f"Batch complete. Pausing for {pause} seconds before continuing.",
-                    pause_seconds=pause,
-                    **self._status_details(),
-                )
-                await sleep_or_stop(stop_event, pause)
-            else:
+            if processed_in_batch < batch_size:
+                continue
+            if not self.queue.fetch_due(1, self.source_chat_id):
                 write_status(
                     self.config,
                     "idle",
-                    message="All jobs for this cycle are complete.",
+                    message="All runnable jobs for this source are complete.",
                     **self._status_details(),
                 )
                 return
+            pause = self.config.batch.pause_between_batches_seconds
+            if self.logger:
+                self.logger.info("Batch complete; pausing %ss before next batch", pause)
+            write_status(
+                self.config,
+                "batch_pause",
+                message=f"Batch complete. Pausing for {pause} seconds before continuing.",
+                pause_seconds=pause,
+                **self._status_details(),
+            )
+            processed_in_batch = 0
+            await sleep_or_stop(stop_event, pause)
 
         if self.logger:
             self.logger.info("Stopping after current safe operation")
@@ -190,8 +200,9 @@ class Worker:
 
         async def set_phase(status: str) -> None:
             nonlocal phase
+            if not self.queue.set_phase(job, status, lease_seconds=self.lease_seconds):
+                raise WorkerLeaseLostError(f"Worker lease lost before {status}")
             phase = status
-            self.queue.set_phase(job.id, status)
             message = {
                 "downloading": "Downloading restricted media.",
                 "uploading": "Uploading to the destination.",
@@ -206,7 +217,7 @@ class Worker:
         async def heartbeat() -> None:
             while True:
                 await asyncio.sleep(JOB_HEARTBEAT_SECONDS)
-                if not self.queue.touch_active_job(job.id):
+                if not self.queue.touch_active_job(job, lease_seconds=self.lease_seconds):
                     return
                 message = {
                     "downloading": "Downloading restricted media.",
@@ -223,7 +234,7 @@ class Worker:
         try:
             result = await self.uploader.process(job, stop_event, set_phase)
             if result.status == "copied":
-                self.queue.mark_copied(job.id, result.dest_message_ids)
+                self.queue.mark_copied(job, result.dest_message_ids)
                 if self.logger:
                     self.logger.info("Job %s copied to %s", job.id, result.dest_message_ids or "destination")
                 write_status(
@@ -234,7 +245,7 @@ class Worker:
                     **self._status_details(job, **common),
                 )
             elif result.status == "skipped":
-                self.queue.mark_skipped(job.id, result.reason)
+                self.queue.mark_skipped(job, result.reason)
                 if self.logger:
                     self.logger.info("Job %s skipped: %s", job.id, result.reason)
                 write_status(
@@ -247,10 +258,14 @@ class Worker:
                 )
             else:
                 raise RuntimeError(f"Unknown upload result status: {result.status}")
+        except WorkerLeaseLostError as exc:
+            if self.logger:
+                self.logger.warning("Job %s stopped because its worker lease changed: %s", job.id, exc)
+            return
         except PermanentJobError as exc:
             error = compact_error(exc)
             if self.queue.is_repair_job(job):
-                self.queue.mark_skipped(job.id, error)
+                self.queue.mark_skipped(job, error)
                 outcome = "skipped"
             else:
                 error = self.queue.cancel_job(job, error)
@@ -273,7 +288,7 @@ class Worker:
             )
         except RetryableJobError as exc:
             if stop_event.is_set():
-                self.queue.set_phase(job.id, "pending")
+                self.queue.set_phase(job, "pending")
                 status = "pending"
                 message = f"Job #{job.id} was returned to pending."
             else:
@@ -304,7 +319,7 @@ class Worker:
             error = compact_error(exc)
             self.queue.pause_destination(job, "Destination access/permission failed", error)
             if self.queue.is_repair_job(job):
-                self.queue.mark_skipped(job.id, error)
+                self.queue.mark_skipped(job, error)
             else:
                 error = self.queue.cancel_job(job, error)
             self.queue.log_repair(
@@ -362,7 +377,7 @@ class Worker:
                 elif stop_event.is_set():
                     status = "pending"
                     reason = error
-                    self.queue.set_phase(job.id, "pending")
+                    self.queue.set_phase(job, "pending")
                     action = "stop_during_download"
                     message = f"Job #{job.id} was returned to pending."
                     status_phase = "stopping"

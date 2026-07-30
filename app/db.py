@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -11,6 +11,7 @@ from app.skip_policy import expected_skip_reason_sql
 
 
 STATUSES = {"pending", "downloading", "uploading", "copied", "failed", "skipped"}
+LEGACY_WORKER_GRACE_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -25,6 +26,11 @@ class RecoverySummary:
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def lease_deadline(seconds: int | float) -> str:
+    duration = max(1.0, float(seconds))
+    return (datetime.now(timezone.utc) + timedelta(seconds=duration)).isoformat(timespec="seconds")
 
 
 def _topic_key(topic_id: int | None) -> int:
@@ -70,7 +76,10 @@ class Database:
                 file_size INTEGER,
                 caption TEXT,
                 verified_at TEXT,
-                activity_phase TEXT
+                activity_phase TEXT,
+                worker_id TEXT,
+                lease_token INTEGER NOT NULL DEFAULT 0,
+                lease_expires_at TEXT
             );
 
             DROP INDEX IF EXISTS idx_messages_unique_job;
@@ -118,12 +127,24 @@ class Database:
             str(row["name"])
             for row in self.conn.execute("PRAGMA table_info(messages)")
         }
-        if "activity_phase" not in columns:
-            self.conn.execute("ALTER TABLE messages ADD COLUMN activity_phase TEXT")
+        for name, declaration in (
+            ("activity_phase", "TEXT"),
+            ("worker_id", "TEXT"),
+            ("lease_token", "INTEGER NOT NULL DEFAULT 0"),
+            ("lease_expires_at", "TEXT"),
+        ):
+            if name not in columns:
+                self.conn.execute(f"ALTER TABLE messages ADD COLUMN {name} {declaration}")
         self.conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_messages_activity
                 ON messages(status, activity_phase, updated_at)
+            """
+        )
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_lease
+                ON messages(status, lease_expires_at)
             """
         )
         self.conn.commit()
@@ -241,9 +262,16 @@ class Database:
         next_retry_at: str | None = None,
         dest_message_ids: list[int] | None = None,
         verified_at: str | None = None,
-    ) -> None:
+        expected_worker_id: str | None = None,
+        expected_lease_token: int | None = None,
+        lease_seconds: int | float | None = None,
+    ) -> bool:
+        """Update a job, optionally fencing it to the current worker lease."""
         if status not in STATUSES:
             raise ValueError(f"Invalid message status: {status}")
+        if expected_worker_id is None and expected_lease_token is not None:
+            raise ValueError("expected_lease_token requires expected_worker_id")
+
         fields = ["status = ?", "updated_at = ?", "activity_phase = NULL"]
         values: list[Any] = [status, utc_now()]
         if last_error is not None:
@@ -258,8 +286,20 @@ class Database:
         if verified_at is not None:
             fields.append("verified_at = ?")
             values.append(verified_at)
-        values.append(job_id)
-        self.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = ?", values)
+
+        if status in {"pending", "copied", "failed", "skipped"}:
+            fields.extend(("worker_id = NULL", "lease_expires_at = NULL"))
+        elif expected_worker_id is not None and lease_seconds is not None:
+            fields.append("lease_expires_at = ?")
+            values.append(lease_deadline(lease_seconds))
+
+        where = "id = ?"
+        values.append(int(job_id))
+        if expected_worker_id is not None:
+            where += " AND worker_id = ? AND lease_token = ?"
+            values.extend((str(expected_worker_id), int(expected_lease_token or 0)))
+        cursor = self.execute(f"UPDATE messages SET {', '.join(fields)} WHERE {where}", values)
+        return cursor.rowcount > 0
 
     def start_verification(self, job_id: int) -> bool:
         cursor = self.execute(
@@ -283,17 +323,27 @@ class Database:
         )
         return cursor.rowcount > 0
 
-    def touch_active_job(self, job_id: int) -> bool:
+    def touch_active_job(
+        self,
+        job_id: int,
+        *,
+        worker_id: str | None = None,
+        lease_token: int | None = None,
+        lease_seconds: int | float | None = None,
+    ) -> bool:
         """Refresh a live-job heartbeat without reviving completed work."""
-        cursor = self.execute(
-            """
-            UPDATE messages
-            SET updated_at = ?
-            WHERE id = ?
-              AND (status IN ('downloading', 'uploading') OR activity_phase = 'verifying')
-            """,
-            (utc_now(), int(job_id)),
-        )
+        fields = ["updated_at = ?"]
+        values: list[Any] = [utc_now()]
+        where = "id = ? AND (status IN ('downloading', 'uploading') OR activity_phase = 'verifying')"
+        values.append(int(job_id))
+        if worker_id is not None:
+            if lease_token is None:
+                raise ValueError("lease_token is required with worker_id")
+            fields.append("lease_expires_at = ?")
+            values.insert(1, lease_deadline(lease_seconds or 1))
+            where += " AND worker_id = ? AND lease_token = ?"
+            values.extend((str(worker_id), int(lease_token)))
+        cursor = self.execute(f"UPDATE messages SET {', '.join(fields)} WHERE {where}", values)
         return cursor.rowcount > 0
 
     def increment_attempt(self, job_id: int) -> int:
@@ -306,34 +356,56 @@ class Database:
         self.conn.commit()
         return int(row["attempts"])
 
-    def recover_in_progress(self) -> RecoverySummary:
-        """Safely recover interrupted downloads without replaying uncertain uploads."""
+    def recover_in_progress(
+        self,
+        *,
+        legacy_grace_seconds: int | float = LEGACY_WORKER_GRACE_SECONDS,
+    ) -> RecoverySummary:
+        """Recover only jobs whose worker has demonstrably stopped.
+
+        Leased workers retain ownership while they renew.  Older rows created
+        before leases existed are only recovered after their heartbeat has been
+        silent for the same grace period, preventing a rolling upgrade from
+        reclaiming work still owned by the old process.
+        """
         now = utc_now()
+        legacy_cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=max(1.0, float(legacy_grace_seconds)))
+        ).isoformat(timespec="seconds")
+        expired = (
+            "((lease_expires_at IS NOT NULL AND lease_expires_at <= ?) "
+            "OR (lease_expires_at IS NULL AND updated_at <= ?))"
+        )
         downloads = self.conn.execute(
-            """
+            f"""
             UPDATE messages
             SET status = 'pending',
+                worker_id = NULL,
+                lease_expires_at = NULL,
                 last_error = CASE
                     WHEN last_error IS NULL OR last_error = ''
-                    THEN 'Recovered after interrupted download'
+                    THEN 'Recovered after expired worker lease during download'
                     ELSE last_error
                 END,
                 next_retry_at = NULL,
                 updated_at = ?
-            WHERE status = 'downloading'
+            WHERE status = 'downloading' AND {expired}
             """,
-            (now,),
+            (now, now, legacy_cutoff),
         )
         uploads = self.conn.execute(
-            """
+            f"""
             UPDATE messages
             SET status = 'failed',
-                last_error = 'Interrupted during upload; destination result is unknown. Verify destination before retrying manually.',
+                worker_id = NULL,
+                lease_expires_at = NULL,
+                last_error = 'Interrupted during upload after worker lease expired; destination result is unknown. Verify destination before retrying manually.',
                 next_retry_at = NULL,
                 updated_at = ?
-            WHERE status = 'uploading'
+            WHERE status = 'uploading' AND {expired}
             """,
-            (now,),
+            (now, now, legacy_cutoff),
         )
         self.conn.commit()
         return RecoverySummary(
@@ -387,9 +459,13 @@ class Database:
         self,
         limit: int,
         source_chat_id: int | str | None = None,
+        *,
+        worker_id: str,
+        lease_seconds: int | float,
     ) -> list[sqlite3.Row]:
-        """Atomically reserve pending jobs so two workers cannot send the same post."""
+        """Atomically claim due jobs with a worker owner and expiring lease."""
         now = utc_now()
+        lease_until = lease_deadline(lease_seconds)
         limit = max(1, int(limit))
         source_clause = ""
         source_params: tuple[Any, ...] = ()
@@ -423,10 +499,15 @@ class Database:
             self.conn.execute(
                 f"""
                 UPDATE messages
-                SET status = 'downloading', attempts = attempts + 1, updated_at = ?
+                SET status = 'downloading',
+                    attempts = attempts + 1,
+                    worker_id = ?,
+                    lease_token = COALESCE(lease_token, 0) + 1,
+                    lease_expires_at = ?,
+                    updated_at = ?
                 WHERE id IN ({placeholders}) AND status = 'pending'
                 """,
-                (now, *ids),
+                (str(worker_id), lease_until, now, *ids),
             )
             claimed = list(
                 self.conn.execute(

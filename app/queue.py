@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from sqlite3 import Row
@@ -32,9 +33,19 @@ class MessageJob:
     media_type: str
     file_size: int | None
     caption: str | None
+    worker_id: str | None = None
+    lease_token: int = 0
+    lease_expires_at: str | None = None
 
     @classmethod
     def from_row(cls, row: Row) -> "MessageJob":
+        # Some lightweight callers (and migrations) pass a mapping that predates
+        # lease columns.  SQLite rows always have them after initialize(), but
+        # restoring old data must remain backwards-compatible.
+        keys = set(row.keys())
+        worker_id = row["worker_id"] if "worker_id" in keys else None
+        lease_token = row["lease_token"] if "lease_token" in keys else 0
+        lease_expires_at = row["lease_expires_at"] if "lease_expires_at" in keys else None
         return cls(
             id=int(row["id"]),
             source_chat_id=telegram_peer(row["source_chat_id"]),
@@ -53,6 +64,9 @@ class MessageJob:
             media_type=str(row["media_type"] or "unsupported"),
             file_size=row["file_size"],
             caption=row["caption"],
+            worker_id=str(worker_id) if worker_id else None,
+            lease_token=int(lease_token or 0),
+            lease_expires_at=lease_expires_at,
         )
 
 
@@ -256,19 +270,55 @@ class MessageQueue:
         self,
         limit: int,
         source_chat_id: int | str | None = None,
+        *,
+        worker_id: str | None = None,
+        lease_seconds: int | float = 120,
     ) -> list[MessageJob]:
         """Claim work before processing so a second worker cannot send the same job."""
+        owner = worker_id or f"manual-{uuid.uuid4().hex}"
         jobs = [
             MessageJob.from_row(row)
-            for row in self.db.claim_due_messages(limit, source_chat_id=source_chat_id)
+            for row in self.db.claim_due_messages(
+                limit,
+                source_chat_id=source_chat_id,
+                worker_id=owner,
+                lease_seconds=lease_seconds,
+            )
         ]
         for job in jobs:
             self.release3.start_telemetry(job.id, job.file_size)
         return jobs
 
-    def set_phase(self, job_id: int, status: str) -> None:
-        self.db.set_status(job_id, status)
-        self.release3.update_telemetry(job_id, stage=status)
+    @staticmethod
+    def _lease_kwargs(job: MessageJob) -> dict[str, Any]:
+        if job.worker_id is None:
+            return {}
+        return {
+            "expected_worker_id": job.worker_id,
+            "expected_lease_token": job.lease_token,
+        }
+
+    def set_phase(
+        self,
+        job: MessageJob | int,
+        status: str,
+        *,
+        lease_seconds: int | float | None = None,
+    ) -> bool:
+        if isinstance(job, MessageJob):
+            updated = self.db.set_status(
+                job.id,
+                status,
+                lease_seconds=lease_seconds,
+                **self._lease_kwargs(job),
+            )
+            job_id = job.id
+        else:
+            updated = self.db.set_status(job, status)
+            job_id = job
+        if updated:
+            self.release3.update_telemetry(job_id, stage=status)
+        return updated
 
     def begin_verification(self, job_id: int) -> bool:
         return self.db.start_verification(job_id)
@@ -276,20 +326,63 @@ class MessageQueue:
     def clear_activity_phase(self, job_id: int) -> bool:
         return self.db.clear_activity_phase(job_id)
 
-    def touch_active_job(self, job_id: int) -> bool:
-        return self.db.touch_active_job(job_id)
+    def touch_active_job(
+        self,
+        job: MessageJob | int,
+        *,
+        lease_seconds: int | float | None = None,
+    ) -> bool:
+        if isinstance(job, MessageJob):
+            return self.db.touch_active_job(
+                job.id,
+                lease_seconds=lease_seconds,
+                **self._lease_kwargs(job),
+            )
+        return self.db.touch_active_job(job)
 
-    def mark_copied(self, job_id: int, dest_message_ids: list[int], route: str | None = None) -> None:
-        self.db.set_status(job_id, "copied", last_error="", dest_message_ids=dest_message_ids)
+    def mark_copied(
+        self,
+        job: MessageJob | int,
+        dest_message_ids: list[int],
+        route: str | None = None,
+    ) -> bool:
+        if isinstance(job, MessageJob):
+            updated = self.db.set_status(
+                job.id,
+                "copied",
+                last_error="",
+                dest_message_ids=dest_message_ids,
+                **self._lease_kwargs(job),
+            )
+            job_id = job.id
+        else:
+            updated = self.db.set_status(job, "copied", last_error="", dest_message_ids=dest_message_ids)
+            job_id = job
+        if not updated:
+            return False
         self.release3.finish_telemetry(job_id, stage="copied", route=route)
+        return True
 
-    def mark_skipped(self, job_id: int, reason: str) -> None:
-        self.db.set_status(job_id, "skipped", last_error=reason)
+    def mark_skipped(self, job: MessageJob | int, reason: str) -> bool:
+        if isinstance(job, MessageJob):
+            updated = self.db.set_status(
+                job.id,
+                "skipped",
+                last_error=reason,
+                **self._lease_kwargs(job),
+            )
+            job_id = job.id
+        else:
+            updated = self.db.set_status(job, "skipped", last_error=reason)
+            job_id = job
+        if not updated:
+            return False
         self.release3.finish_telemetry(job_id, stage="skipped")
         parent_job_id = self.release3.fail_repair_job(job_id, reason)
         row = self.db.query_one("SELECT source_chat_id FROM messages WHERE id = ?", (parent_job_id or job_id,))
         if row:
             self.release3.recompute_source_state(row["source_chat_id"])
+        return True
 
     @staticmethod
     def is_repair_job(job: MessageJob) -> bool:
@@ -298,7 +391,13 @@ class MessageQueue:
     def cancel_job(self, job: MessageJob, reason: str) -> str:
         """Remove a non-repair job from live work while retaining its anti-duplicate record."""
         cancellation = f"Cancelled by policy. {str(reason or 'Terminal job cancelled.')}"
-        self.db.set_status(job.id, "skipped", last_error=cancellation)
+        if not self.db.set_status(
+            job.id,
+            "skipped",
+            last_error=cancellation,
+            **self._lease_kwargs(job),
+        ):
+            return cancellation
         self.release3.finish_telemetry(job.id, stage="skipped")
         row = self.db.query_one("SELECT source_chat_id FROM messages WHERE id = ?", (job.id,))
         if row:
@@ -338,7 +437,8 @@ class MessageQueue:
             if not self.is_repair_job(job):
                 self.cancel_job(job, f"Final automatic retry failed. {error}")
                 return "cancelled"
-            self.db.set_status(job.id, "failed", last_error=error)
+            if not self.db.set_status(job.id, "failed", last_error=error, **self._lease_kwargs(job)):
+                return "lease_lost"
             self.release3.finish_telemetry(job.id, stage="failed")
             parent_job_id = self.release3.fail_repair_job(job.id, error)
             row = self.db.query_one(
@@ -350,7 +450,14 @@ class MessageQueue:
             return "failed"
         backoff = self._backoff_for_attempt(attempts)
         next_retry = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat(timespec="seconds")
-        self.db.set_status(job.id, "pending", last_error=error, next_retry_at=next_retry)
+        if not self.db.set_status(
+            job.id,
+            "pending",
+            last_error=error,
+            next_retry_at=next_retry,
+            **self._lease_kwargs(job),
+        ):
+            return "lease_lost"
         self.release3.update_telemetry(job.id, stage="pending")
         return "pending"
 
@@ -364,7 +471,14 @@ class MessageQueue:
         backoff = self._backoff_for_attempt(attempts)
         next_retry = (datetime.now(timezone.utc) + timedelta(seconds=backoff)).isoformat(timespec="seconds")
         reason = f"Download connection interrupted; retrying automatically. {error}"
-        self.db.set_status(job.id, "pending", last_error=reason, next_retry_at=next_retry)
+        if not self.db.set_status(
+            job.id,
+            "pending",
+            last_error=reason,
+            next_retry_at=next_retry,
+            **self._lease_kwargs(job),
+        ):
+            return reason
         self.release3.update_telemetry(job.id, stage="pending")
         return reason
 
@@ -374,7 +488,8 @@ class MessageQueue:
             "Upload connection interrupted; destination result is unknown. "
             f"Verify destination before retrying manually. {error}"
         )
-        self.db.set_status(job.id, "failed", last_error=reason)
+        if not self.db.set_status(job.id, "failed", last_error=reason, **self._lease_kwargs(job)):
+            return reason
         self.release3.finish_telemetry(job.id, stage="failed")
         parent_job_id = self.release3.fail_repair_job(job.id, reason)
         row = self.db.query_one(

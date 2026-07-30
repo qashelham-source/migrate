@@ -61,6 +61,7 @@ def worker_config(tmp_path: Path) -> object:
             retry_backoff_seconds=[1, 2, 3],
         ),
         downloads=SimpleNamespace(root=tmp_path / "downloads"),
+        batch=SimpleNamespace(size=10, pause_between_batches_seconds=0),
     )
 
 
@@ -94,13 +95,21 @@ def test_claim_is_exclusive_and_interrupted_upload_is_held_for_review(tmp_path: 
         db_two.initialize()
         queue_two = MessageQueue(db_two, make_config(tmp_path))  # type: ignore[arg-type]
 
-        claimed = queue_one.claim_due(10)
+        claimed = queue_one.claim_due(10, worker_id="worker-one", lease_seconds=60)
         assert len(claimed) == 2
         assert {job.status for job in claimed} == {"downloading"}
         assert {job.attempts for job in claimed} == {1}
-        assert queue_two.claim_due(10) == []
+        assert queue_two.claim_due(10, worker_id="worker-two", lease_seconds=60) == []
 
-        queue_one.set_phase(claimed[0].id, "uploading")
+        assert queue_one.set_phase(claimed[0], "uploading", lease_seconds=60)
+        active_recovery = queue_two.recover_in_progress()
+        assert active_recovery.requeued_downloads == 0
+        assert active_recovery.held_uploads == 0
+
+        db_two.execute(
+            "UPDATE messages SET lease_expires_at = ? WHERE id IN (?, ?)",
+            ("2000-01-01T00:00:00+00:00", claimed[0].id, claimed[1].id),
+        )
         recovery = queue_two.recover_in_progress()
         assert recovery.requeued_downloads == 1
         assert recovery.held_uploads == 1
@@ -116,6 +125,85 @@ def test_claim_is_exclusive_and_interrupted_upload_is_held_for_review(tmp_path: 
         if db_two is not None:
             db_two.close()
         db_one.close()
+
+
+def test_legacy_unleased_job_waits_for_heartbeat_grace_before_recovery(tmp_path: Path) -> None:
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, make_config(tmp_path))  # type: ignore[arg-type]
+        assert enqueue(
+            queue,
+            source_message_id=12,
+            file_unique_key="legacy-no-lease",
+            status="downloading",
+        )
+
+        # A rolling upgrade must not reclaim work that a pre-lease worker may
+        # still be heartbeating.
+        assert queue.recover_in_progress().requeued_downloads == 0
+
+        db.execute(
+            "UPDATE messages SET updated_at = ? WHERE source_message_id = ?",
+            ("2000-01-01T00:00:00+00:00", 12),
+        )
+        assert queue.recover_in_progress().requeued_downloads == 1
+    finally:
+        db.close()
+
+
+def test_expired_worker_cannot_change_a_reclaimed_job_phase(tmp_path: Path) -> None:
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, make_config(tmp_path))  # type: ignore[arg-type]
+        assert enqueue(queue, source_message_id=12, file_unique_key="lease-fence")
+        old_job = queue.claim_due(1, worker_id="old-worker", lease_seconds=60)[0]
+        db.execute(
+            "UPDATE messages SET lease_expires_at = ? WHERE id = ?",
+            ("2000-01-01T00:00:00+00:00", old_job.id),
+        )
+        assert queue.recover_in_progress().requeued_downloads == 1
+        new_job = queue.claim_due(1, worker_id="new-worker", lease_seconds=60)[0]
+
+        assert not queue.set_phase(old_job, "uploading", lease_seconds=60)
+        row = db.query_one(
+            "SELECT status, worker_id, lease_token FROM messages WHERE id = ?",
+            (old_job.id,),
+        )
+        assert row is not None
+        assert row["status"] == "downloading"
+        assert row["worker_id"] == "new-worker"
+        assert int(row["lease_token"]) == new_job.lease_token
+    finally:
+        db.close()
+
+
+def test_worker_claims_one_job_at_a_time_before_processing(tmp_path: Path) -> None:
+    config = worker_config(tmp_path)
+    db = Database(config.queue.db_path)
+    db.initialize()
+    observed: list[str] = []
+
+    class StopAfterFirst:
+        async def process(self, _job, stop_event, _on_phase):
+            row = db.query_one("SELECT status FROM messages WHERE source_message_id = ?", (11,))
+            assert row is not None
+            observed.append(str(row["status"]))
+            stop_event.set()
+            return SimpleNamespace(status="skipped", reason="test stop")
+
+    try:
+        queue = MessageQueue(db, config)  # type: ignore[arg-type]
+        assert enqueue(queue, source_message_id=10, file_unique_key="first")
+        assert enqueue(queue, source_message_id=11, file_unique_key="second")
+
+        stop_event = asyncio.Event()
+        asyncio.run(Worker(config, queue, StopAfterFirst()).run(stop_event))  # type: ignore[arg-type]
+
+        assert observed == ["pending"]
+    finally:
+        db.close()
 
 
 def test_config_save_does_not_leave_plaintext_backup(tmp_path: Path) -> None:
