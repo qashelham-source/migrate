@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import suppress
 import os
 import random
 import signal
@@ -145,6 +146,32 @@ def install_stop_handlers(stop_event: asyncio.Event) -> None:
             signal.signal(sig, request_stop)
         except (ValueError, OSError, AttributeError):
             continue
+
+
+async def start_client_with_floodwait(
+    client: Client,
+    *,
+    label: str,
+    logger: Any | None = None,
+) -> None:
+    """Start a Pyrogram client without converting Telegram's required wait into a restart loop."""
+    while True:
+        try:
+            await client.start()
+            return
+        except FloodWait as exc:
+            wait_seconds = max(1, int(exc.value)) + 1
+            if logger:
+                logger.warning(
+                    "Telegram asked %s to wait %ss during startup; keeping this service alive",
+                    label,
+                    wait_seconds,
+                )
+            # A failed start can leave a partial connection behind. Clean it up
+            # before waiting, but never let cleanup hide the original FloodWait.
+            with suppress(Exception):
+                await client.stop()
+            await asyncio.sleep(wait_seconds)
 
 
 def make_user_client(config: AppConfig) -> Client:
