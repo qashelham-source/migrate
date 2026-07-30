@@ -464,8 +464,8 @@ class MessageQueue:
         self.release3.pause_destination(job.dest_chat_id, reason, error)
         self.release3.recompute_source_state(job.source_chat_id)
 
-    def resume_destination(self, dest_chat_id: int | str) -> None:
-        self.release3.resume_destination(dest_chat_id)
+    def resume_destination(self, dest_chat_id: int | str) -> bool:
+        return self.release3.resume_destination(dest_chat_id)
 
     def log_repair(
         self,

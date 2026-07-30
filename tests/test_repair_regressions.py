@@ -19,7 +19,7 @@ from app.queue import MessageJob, MessageQueue
 from app.scanner import Scanner
 from app.telegram_client import save_accounts
 from app.upload import UploadResult, Uploader
-from main import choose_writer_for_destinations
+from main import _resume_healthy_destinations, choose_writer_for_destinations
 
 
 def _write_config(
@@ -121,6 +121,90 @@ class _ResolvableClient:
         if str(chat) not in self.destinations:
             raise RuntimeError(f"unavailable: {chat}")
         return SimpleNamespace(id=len(str(chat)), title=str(chat), username=None)
+
+
+class _PostableClient:
+    def __init__(self, *, can_post: bool) -> None:
+        self.can_post = can_post
+
+    async def get_me(self) -> SimpleNamespace:
+        return SimpleNamespace(id=777)
+
+    async def get_chat(self, chat: str) -> SimpleNamespace:
+        return SimpleNamespace(id=len(str(chat)), title=str(chat), username=None)
+
+    async def get_chat_member(self, _chat_id: int, _member_id: int) -> SimpleNamespace:
+        return SimpleNamespace(
+            status="administrator",
+            privileges=SimpleNamespace(can_post_messages=self.can_post),
+        )
+
+
+def test_permission_paused_destination_only_resumes_after_post_permission_check(tmp_path: Path) -> None:
+    config = load_config(
+        _write_config(
+            tmp_path / "config.yaml",
+            migration={"sources": [], "destinations": ["destination"]},
+        )
+    )
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, config)
+        assert queue.enqueue(
+            source_chat_id="-1001",
+            source_message_id=1,
+            dest_chat_id=str(len("destination")),
+            file_unique_key="permission-paused",
+            source_message_ids=[1],
+            source_topic_id=None,
+            dest_topic_id=None,
+            media_group_id=None,
+            media_type="document",
+            file_size=1,
+            caption=None,
+        )
+        job = queue.claim_due(1)[0]
+        queue.pause_destination(job, "Destination access/permission failed", "ChatWriteForbidden")
+        assert queue.release3.is_destination_paused(job.dest_chat_id)
+
+        asyncio.run(
+            _resume_healthy_destinations(config, queue, _PostableClient(can_post=False), _DirectLimiter())
+        )
+        assert queue.release3.is_destination_paused(job.dest_chat_id)
+
+        asyncio.run(
+            _resume_healthy_destinations(config, queue, _PostableClient(can_post=True), _DirectLimiter())
+        )
+        assert not queue.release3.is_destination_paused(job.dest_chat_id)
+    finally:
+        db.close()
+
+
+def test_schema_initialization_removes_legacy_destination_pause_trigger(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        MessageQueue(db, config)
+        db.execute(
+            """
+            CREATE TRIGGER trg_keep_permission_destination_paused
+            BEFORE UPDATE OF paused ON destination_health
+            BEGIN
+                SELECT RAISE(IGNORE);
+            END;
+            """
+        )
+
+        MessageQueue(db, config)
+
+        assert db.query_one(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = ?",
+            ("trg_keep_permission_destination_paused",),
+        ) is None
+    finally:
+        db.close()
 
 
 def test_writer_fallback_requires_the_same_client_to_resolve_every_destination(tmp_path: Path) -> None:
