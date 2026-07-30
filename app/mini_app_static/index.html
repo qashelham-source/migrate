@@ -115,6 +115,8 @@
 
     .status.active .dot { background: var(--good); box-shadow: 0 0 0 4px color-mix(in srgb, var(--good) 18%, transparent); }
     .status.waiting .dot { background: var(--warn); }
+    .status.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 55%, var(--line)); }
+    .status.danger .dot { background: var(--danger); box-shadow: 0 0 0 4px color-mix(in srgb, var(--danger) 18%, transparent); }
 
     .metrics {
       display: grid;
@@ -376,7 +378,7 @@
         $("notice").classList.add("hidden");
 
         const status = $("state");
-        status.className = "status " + (payload.state.active ? "active" : "waiting");
+        status.className = "status " + (payload.state.tone || (payload.state.active ? "active" : "waiting"));
         status.innerHTML = '<span class="dot"></span><span>' + escapeHtml(payload.state.label) + '</span>';
 
         const summary = payload.summary;
