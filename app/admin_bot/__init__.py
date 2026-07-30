@@ -45,6 +45,8 @@ from app.destination_manager import (
 )
 from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
 from app.queue import MessageQueue
+from app.telegram_client import start_client_with_floodwait
+from app.logging import setup_logging
 
 _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
 _CHANNEL_CACHE: dict[int, list[dict[str, Any]]] = {}
@@ -1016,6 +1018,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
     if not config.telegram.bot_enabled or not config.telegram.bot_token:
         raise ValueError("Uploader bot must be enabled before starting the control panel")
     path = Path(config_path).resolve()
+    logger = setup_logging(config.logging)
     app = Client(name="manager_admin", api_id=config.telegram.api_id, api_hash=config.telegram.api_hash, bot_token=config.telegram.bot_token, in_memory=True)
 
     async def edit(query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
@@ -1523,7 +1526,11 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             if user_id is not None:
                 start_live(user_id, sent)
 
-    await app.start()
+    await start_client_with_floodwait(
+        app,
+        label="admin bot",
+        logger=logger,
+    )
     try:
         await idle()
     finally:
