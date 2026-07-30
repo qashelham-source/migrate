@@ -420,6 +420,16 @@ async def choose_writer_for_destinations(
     return writer, False
 
 
+def _member_can_post(member: Any) -> bool:
+    status = str(getattr(member, "status", "") or "").lower().rsplit(".", 1)[-1]
+    if status in {"owner", "creator"}:
+        return True
+    if status != "administrator":
+        return False
+    privileges = getattr(member, "privileges", None)
+    return getattr(privileges, "can_post_messages", None) is not False
+
+
 async def _resume_healthy_destinations(
     config: AppConfig,
     queue: MessageQueue,
@@ -427,10 +437,32 @@ async def _resume_healthy_destinations(
     limiter: TelegramLimiter,
     logger: Any | None = None,
 ) -> None:
+    """Resume only destinations the currently selected writer can post to."""
+    try:
+        me = await limiter.call("read", client.get_me)
+    except Exception as exc:
+        if logger:
+            logger.warning("Could not verify writer identity before resuming destinations: %s", exc)
+        return
+
     for spec in _configured_destinations(config):
         try:
             resolved = await resolve_chat(client, limiter, spec)
-            queue.resume_destination(resolved.chat_id)
+            member = await limiter.call(
+                "resolve",
+                client.get_chat_member,
+                resolved.chat_id,
+                int(me.id),
+            )
+            if not _member_can_post(member):
+                if logger:
+                    logger.info(
+                        "Destination %s remains paused because the selected writer cannot post there",
+                        spec.chat,
+                    )
+                continue
+            if queue.resume_destination(resolved.chat_id) and logger:
+                logger.info("Destination %s resumed after a successful permission check", resolved.chat_id)
         except Exception as exc:
             if logger:
                 logger.debug("Destination %s remains unavailable: %s", spec.chat, exc)
