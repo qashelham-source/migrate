@@ -69,7 +69,8 @@ class Database:
                 media_type TEXT,
                 file_size INTEGER,
                 caption TEXT,
-                verified_at TEXT
+                verified_at TEXT,
+                activity_phase TEXT
             );
 
             DROP INDEX IF EXISTS idx_messages_unique_job;
@@ -111,6 +112,18 @@ class Database:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (source_chat_id, source_topic_key)
             );
+            """
+        )
+        columns = {
+            str(row["name"])
+            for row in self.conn.execute("PRAGMA table_info(messages)")
+        }
+        if "activity_phase" not in columns:
+            self.conn.execute("ALTER TABLE messages ADD COLUMN activity_phase TEXT")
+        self.conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_messages_activity
+                ON messages(status, activity_phase, updated_at)
             """
         )
         self.conn.commit()
@@ -231,7 +244,7 @@ class Database:
     ) -> None:
         if status not in STATUSES:
             raise ValueError(f"Invalid message status: {status}")
-        fields = ["status = ?", "updated_at = ?"]
+        fields = ["status = ?", "updated_at = ?", "activity_phase = NULL"]
         values: list[Any] = [status, utc_now()]
         if last_error is not None:
             fields.append("last_error = ?")
@@ -247,6 +260,41 @@ class Database:
             values.append(verified_at)
         values.append(job_id)
         self.execute(f"UPDATE messages SET {', '.join(fields)} WHERE id = ?", values)
+
+    def start_verification(self, job_id: int) -> bool:
+        cursor = self.execute(
+            """
+            UPDATE messages
+            SET activity_phase = 'verifying', updated_at = ?
+            WHERE id = ? AND status = 'copied'
+            """,
+            (utc_now(), int(job_id)),
+        )
+        return cursor.rowcount > 0
+
+    def clear_activity_phase(self, job_id: int) -> bool:
+        cursor = self.execute(
+            """
+            UPDATE messages
+            SET activity_phase = NULL, updated_at = ?
+            WHERE id = ? AND activity_phase IS NOT NULL
+            """,
+            (utc_now(), int(job_id)),
+        )
+        return cursor.rowcount > 0
+
+    def touch_active_job(self, job_id: int) -> bool:
+        """Refresh a live-job heartbeat without reviving completed work."""
+        cursor = self.execute(
+            """
+            UPDATE messages
+            SET updated_at = ?
+            WHERE id = ?
+              AND (status IN ('downloading', 'uploading') OR activity_phase = 'verifying')
+            """,
+            (utc_now(), int(job_id)),
+        )
+        return cursor.rowcount > 0
 
     def increment_attempt(self, job_id: int) -> int:
         now = utc_now()

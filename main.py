@@ -929,15 +929,18 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
         if command == "recover":
             recovery = queue.recover_in_progress()
             cache_mismatches = queue.recover_cached_file_id_mismatches()
+            cancelled = queue.cancel_terminal_issues()
             print(f"Recovered {recovery.requeued_downloads} interrupted download job(s) to pending")
             print(
                 f"Held {recovery.held_uploads} interrupted upload job(s) for manual destination verification"
             )
             print(f"Requeued {cache_mismatches} cached media-type mismatch job(s)")
+            print(f"Cancelled {cancelled} terminal migration job(s) from the live queue")
             return
 
         recovery = queue.recover_in_progress()
         cache_mismatches = queue.recover_cached_file_id_mismatches()
+        cancelled = queue.cancel_terminal_issues()
         if recovery.total and logger:
             logger.warning(
                 "Recovered interrupted queue state: downloads=%s uploads_held=%s",
@@ -949,6 +952,8 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
                 "Requeued %s job(s) after discarding cached media-type mismatches",
                 cache_mismatches,
             )
+        if cancelled and logger:
+            logger.info("Cancelled %s terminal migration job(s) from the live queue", cancelled)
 
         clear_stop(config)
         write_status(

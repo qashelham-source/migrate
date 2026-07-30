@@ -118,6 +118,8 @@ def _state_label(phase: str) -> str:
         "processing": "Memproses",
         "downloading": "Memuat turun",
         "uploading": "Memuat naik",
+        "verifying": "Mengesahkan media",
+        "job_stalled": "Job Stalled",
         "batch_pause": "Rehat antara batch",
         "waiting_retry": "Menunggu cuba semula",
         "stopping": "Sedang berhenti",
@@ -240,22 +242,35 @@ def dashboard_payload(config: AppConfig, config_path: str | Path) -> dict[str, A
         telemetry = snapshot["telemetry"]
         storage = snapshot["storage"]
         phase = str(status.get("phase") or "idle").strip().lower()
+        health = snapshot["health"]
+        stalled_jobs = list(health.get("stalled_jobs") or [])
+        if stalled_jobs:
+            state = {
+                "phase": "job_stalled",
+                "label": _state_label("job_stalled"),
+                "active": False,
+                "tone": "danger",
+            }
+        else:
+            state = {
+                "phase": phase,
+                "label": _state_label(phase),
+                "active": is_active_phase(phase),
+                "tone": "active" if is_active_phase(phase) else "waiting",
+            }
         eta = format_eta(telemetry.get("eta_seconds"))
         if eta == "not enough data":
             eta = "Belum cukup data"
 
         return {
             "updated_at": status.get("updated_at"),
-            "state": {
-                "phase": phase,
-                "label": _state_label(phase),
-                "active": is_active_phase(phase),
-            },
+            "state": state,
             "summary": {
                 "pending": int(queue.get("pending") or 0),
                 "active": int(telemetry.get("active") or 0),
                 "copied": int(queue.get("copied") or 0),
                 "issues": len(issues),
+                "stalled": len(stalled_jobs),
                 "speed": format_bytes(float(telemetry.get("speed_bps") or 0)) + "/s",
                 "eta": eta,
                 "storage_free": format_bytes(storage.free_bytes),

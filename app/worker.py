@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+from contextlib import suppress
 from typing import Any
 
 from pyrogram import Client
@@ -20,6 +21,9 @@ from app.telegram_client import (
 )
 from app.telemetry import StoragePolicy, storage_snapshot
 from app.upload import Uploader
+
+
+JOB_HEARTBEAT_SECONDS = 30
 
 
 class Worker:
@@ -199,6 +203,23 @@ class Worker:
                 **self._status_details(job, **common),
             )
 
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(JOB_HEARTBEAT_SECONDS)
+                if not self.queue.touch_active_job(job.id):
+                    return
+                message = {
+                    "downloading": "Downloading restricted media.",
+                    "uploading": "Uploading to the destination.",
+                }.get(phase, "Processing migration job.")
+                write_status(
+                    self.config,
+                    phase,
+                    message=message,
+                    **self._status_details(job, **common),
+                )
+
+        heartbeat_task = asyncio.create_task(heartbeat())
         try:
             result = await self.uploader.process(job, stop_event, set_phase)
             if result.status == "copied":
@@ -227,21 +248,27 @@ class Worker:
             else:
                 raise RuntimeError(f"Unknown upload result status: {result.status}")
         except PermanentJobError as exc:
-            self.queue.mark_skipped(job.id, compact_error(exc))
+            error = compact_error(exc)
+            if self.queue.is_repair_job(job):
+                self.queue.mark_skipped(job.id, error)
+                outcome = "skipped"
+            else:
+                error = self.queue.cancel_job(job, error)
+                outcome = "cancelled"
             self.queue.log_repair(
                 action="permanent_skip",
                 job=job,
-                reason=compact_error(exc),
-                outcome="skipped",
+                reason=error,
+                outcome=outcome,
             )
             if self.logger:
-                self.logger.warning("Job %s skipped permanently: %s", job.id, exc)
+                self.logger.warning("Job %s %s after permanent error: %s", job.id, outcome, exc)
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} was skipped because of a permanent error.",
-                last_result="skipped",
-                last_error=compact_error(exc),
+                message=f"Job #{job.id} was {outcome} after a permanent error.",
+                last_result=outcome,
+                last_error=error,
                 **self._status_details(job, **common),
             )
         except RetryableJobError as exc:
@@ -251,7 +278,11 @@ class Worker:
                 message = f"Job #{job.id} was returned to pending."
             else:
                 status = self.queue.mark_failure(job, compact_error(exc), attempts)
-                message = f"Job #{job.id} will be retried."
+                message = (
+                    f"Job #{job.id} was cancelled after its final failed attempt."
+                    if status == "cancelled"
+                    else f"Job #{job.id} will be retried."
+                )
             self.queue.log_repair(
                 action="retry_with_backoff",
                 job=job,
@@ -272,7 +303,10 @@ class Worker:
         except (ChannelPrivate, ChannelInvalid, ChatWriteForbidden) as exc:
             error = compact_error(exc)
             self.queue.pause_destination(job, "Destination access/permission failed", error)
-            self.queue.mark_skipped(job.id, error)
+            if self.queue.is_repair_job(job):
+                self.queue.mark_skipped(job.id, error)
+            else:
+                error = self.queue.cancel_job(job, error)
             self.queue.log_repair(
                 action="pause_destination",
                 job=job,
@@ -305,7 +339,11 @@ class Worker:
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} had a media error and will go through recovery.",
+                message=(
+                    f"Job #{job.id} was cancelled after its final failed attempt."
+                    if status == "cancelled"
+                    else f"Job #{job.id} had a media error and will go through recovery."
+                ),
                 last_result=status,
                 last_error=error,
                 **self._status_details(job, **common),
@@ -372,7 +410,11 @@ class Worker:
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} failed and recovery was recorded.",
+                message=(
+                    f"Job #{job.id} was cancelled after its final failed attempt."
+                    if status == "cancelled"
+                    else f"Job #{job.id} failed and recovery was recorded."
+                ),
                 last_result=status,
                 last_error=error,
                 **self._status_details(job, **common),
@@ -392,11 +434,19 @@ class Worker:
             write_status(
                 self.config,
                 "processing",
-                message=f"Job #{job.id} failed and recovery was recorded.",
+                message=(
+                    f"Job #{job.id} was cancelled after its final failed attempt."
+                    if status == "cancelled"
+                    else f"Job #{job.id} failed and recovery was recorded."
+                ),
                 last_result=status,
                 last_error=error,
                 **self._status_details(job, **common),
             )
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
 
 
 class Verifier:
@@ -417,6 +467,23 @@ class Verifier:
         self.limiter = limiter
         self.logger = logger
         self.source_chat_id = source_chat_id
+
+    def _status_details(self, job: MessageJob) -> dict[str, Any]:
+        counts = self.queue.counts_by_status(self.source_chat_id)
+        return {
+            "pending": counts.get("pending", 0),
+            "downloading": counts.get("downloading", 0),
+            "uploading": counts.get("uploading", 0),
+            "copied": counts.get("copied", 0),
+            "failed": counts.get("failed", 0),
+            "skipped": counts.get("skipped", 0),
+            "job_id": job.id,
+            "source_chat": job.source_chat_id,
+            "destination_chat": job.dest_chat_id,
+            "source_message_id": job.source_message_id,
+            "media_type": job.media_type,
+            "media_size_bytes": job.file_size,
+        }
 
     async def run(self, stop_event: asyncio.Event) -> None:
         while not stop_event.is_set():
@@ -447,7 +514,36 @@ class Verifier:
                 return
             await sleep_or_stop(stop_event, self.config.batch.pause_between_batches_seconds)
 
+    async def _verification_heartbeat(self, job: MessageJob) -> None:
+        while True:
+            await asyncio.sleep(JOB_HEARTBEAT_SECONDS)
+            if not self.queue.touch_active_job(job.id):
+                return
+            write_status(
+                self.config,
+                "verifying",
+                message="Verifying destination media.",
+                **self._status_details(job),
+            )
+
     async def _verify_one(self, job: MessageJob) -> None:
+        self.queue.begin_verification(job.id)
+        write_status(
+            self.config,
+            "verifying",
+            message="Verifying destination media.",
+            **self._status_details(job),
+        )
+        heartbeat_task = asyncio.create_task(self._verification_heartbeat(job))
+        try:
+            await self._verify_one_inner(job)
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+            self.queue.clear_activity_phase(job.id)
+
+    async def _verify_one_inner(self, job: MessageJob) -> None:
         source_result = await self.limiter.call(
             "verify",
             self.reader.get_messages,

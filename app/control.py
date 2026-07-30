@@ -15,6 +15,7 @@ ACTIVE_PHASES = {
     "processing",
     "downloading",
     "uploading",
+    "verifying",
     "batch_pause",
     "waiting_retry",
     "stopping",

@@ -9,6 +9,7 @@ from pyrogram import Client
 from app.advanced import save_health_report
 from app.config import AppConfig
 from app.control import write_status
+from app.job_health import find_stalled_jobs, stalled_job_message
 from app.queue import MessageQueue
 from app.telegram_client import TelegramLimiter, message_is_empty, resolve_chat
 
@@ -163,6 +164,14 @@ async def run_health_check(
             f"failed={counts.get('failed', 0)}, skipped={counts.get('skipped', 0)}"
         ),
         counts=counts,
+    )
+
+    stalled = find_stalled_jobs(queue.db)
+    add(
+        "stalled_jobs",
+        "warn" if stalled else "pass",
+        stalled_job_message(stalled[0]) if stalled else "No stalled jobs detected.",
+        count=len(stalled),
     )
 
     overall = "fail" if any(item["status"] == "fail" for item in checks) else "warn" if any(

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from app.db import Database
+from app.job_health import find_stalled_jobs, stalled_job_message
 from app.skip_policy import expected_skip_reason_sql
 
 
@@ -283,6 +284,21 @@ def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]
                 "eta_seconds": None if row["eta_seconds"] is None else float(row["eta_seconds"]),
             }
 
+    stalled = find_stalled_jobs(db)
+    health = {
+        "status": "job_stalled" if stalled else "healthy",
+        "stalled_jobs": [
+            {
+                "id": job.id,
+                "phase": job.phase,
+                "age_seconds": job.age_seconds,
+                "threshold_seconds": job.threshold_seconds,
+                "updated_at": job.updated_at,
+            }
+            for job in stalled
+        ],
+    }
+
     return {
         "queue": queue,
         "sources": sources,
@@ -291,6 +307,7 @@ def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]
         "verification": verification,
         "review": review,
         "telemetry": telemetry,
+        "health": health,
         "storage": storage_snapshot(storage_path),
     }
 
@@ -299,6 +316,22 @@ def issue_center(db: Database, limit: int = 20) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     issue_job_ids: set[int] = set()
     expected_skip = expected_skip_reason_sql("last_error")
+
+    for job in find_stalled_jobs(db):
+        issue_job_ids.add(job.id)
+        issues.append(
+            {
+                "kind": "stalled",
+                "id": job.id,
+                "source_chat_id": job.source_chat_id,
+                "dest_chat_id": job.dest_chat_id,
+                "source_message_id": job.source_message_id,
+                "media_type": job.media_type,
+                "status": "Job Stalled",
+                "error": stalled_job_message(job),
+                "updated_at": job.updated_at,
+            }
+        )
 
     for row in db.query(
         f"""
@@ -400,6 +433,7 @@ def issue_center(db: Database, limit: int = 20) -> list[dict[str, Any]]:
             )
 
     issues.sort(key=lambda item: item.get("updated_at", ""), reverse=True)
+    issues.sort(key=lambda item: item.get("kind") != "stalled")
     return issues[: max(1, int(limit))]
 
 
