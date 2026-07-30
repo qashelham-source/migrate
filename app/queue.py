@@ -283,6 +283,7 @@ class MessageQueue:
                 source_chat_id=source_chat_id,
                 worker_id=owner,
                 lease_seconds=lease_seconds,
+                excluded_source_chat_ids=getattr(self.config, "source_blacklist", []),
             )
         ]
         for job in jobs:

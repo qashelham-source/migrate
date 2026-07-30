@@ -52,6 +52,7 @@ COMMANDS = (
     "list-destinations",
     "add-destination",
     "remove-destination",
+    "purge-source",
 )
 
 
@@ -111,6 +112,21 @@ def handle_destination_command(args: argparse.Namespace) -> bool:
             raise SystemExit("Usage: python3 main.py remove-destination <number>")
         removed = remove_destination(int(args.values[0]), args.config)
         print(f"Removed destination: {removed}")
+        return True
+
+    if args.command == "purge-source":
+        if len(args.values) != 1:
+            raise SystemExit("Usage: python3 main.py purge-source <chat_id>")
+        config = load_config(args.config)
+        db = Database(config.queue.db_path)
+        try:
+            result = MessageQueue(db, config).purge_source_jobs(args.values[0])
+        finally:
+            db.close()
+        print(
+            f"Purged {result['jobs']} job(s) and "
+            f"{result['checkpoints']} checkpoint(s) for {args.values[0]}"
+        )
         return True
 
     return False

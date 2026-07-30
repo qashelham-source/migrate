@@ -28,3 +28,9 @@ backups/
 .deploy.lock/
 *.zip
 *.zip.zip
+
+data/*.log.*
+data/run_mode
+data/run_now
+data/runtime_status.json
+data/health_report.json

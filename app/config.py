@@ -267,6 +267,7 @@ class AppConfig:
     logging: LoggingConfig
     sources: list[ChatSpec] = field(default_factory=list)
     destinations: list[ChatSpec] = field(default_factory=list)
+    source_blacklist: list[str] = field(default_factory=list)
 
     def ensure_directories(self) -> None:
         self.telegram.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -367,6 +368,14 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
 
     sources = [ChatSpec.from_config(item) for item in migration.get("sources", [])]
     destinations = [ChatSpec.from_config(item) for item in migration.get("destinations", [])]
+    source_blacklist = [
+        chat
+        for chat in (
+            str(item.get("chat") if isinstance(item, dict) else item).strip()
+            for item in migration.get("source_blacklist", []) or []
+        )
+        if chat
+    ]
     if any(source.topic_id is not None for source in sources):
         raise ValueError(
             "migration.sources topic_id is not supported; refusing to scan an entire forum by accident"
@@ -476,4 +485,5 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         ),
         sources=sources,
         destinations=destinations,
+        source_blacklist=source_blacklist,
     )

@@ -462,8 +462,14 @@ class Database:
         *,
         worker_id: str,
         lease_seconds: int | float,
+        excluded_source_chat_ids: Iterable[str] | None = None,
     ) -> list[sqlite3.Row]:
-        """Atomically claim due jobs with a worker owner and expiring lease."""
+        """Atomically claim due jobs with a worker owner and expiring lease.
+
+        Sources listed in ``excluded_source_chat_ids`` are never claimed. A
+        blacklisted source must stop delivering work even when jobs it queued
+        earlier are still pending.
+        """
         now = utc_now()
         lease_until = lease_deadline(lease_seconds)
         limit = max(1, int(limit))
@@ -472,6 +478,15 @@ class Database:
         if source_chat_id is not None:
             source_clause = " AND m.source_chat_id = ?"
             source_params = (str(source_chat_id),)
+        excluded = [
+            str(value).strip().lower()
+            for value in (excluded_source_chat_ids or [])
+            if str(value).strip()
+        ]
+        exclude_clause = ""
+        if excluded:
+            marks = ", ".join("?" for _ in excluded)
+            exclude_clause = f" AND LOWER(m.source_chat_id) NOT IN ({marks})"
         try:
             self.conn.execute("BEGIN IMMEDIATE")
             rows = list(
@@ -483,11 +498,11 @@ class Database:
                     WHERE m.status = 'pending'
                       AND (m.next_retry_at IS NULL OR m.next_retry_at <= ?)
                       AND COALESCE(dh.paused, 0) = 0
-                      {source_clause}
+                      {source_clause}{exclude_clause}
                     ORDER BY m.updated_at ASC, m.id ASC
                     LIMIT ?
                     """,
-                    (now, *source_params, limit),
+                    (now, *source_params, *excluded, limit),
                 )
             )
             ids = [int(row["id"]) for row in rows]
