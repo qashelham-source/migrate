@@ -335,8 +335,9 @@ class MessageQueue:
         if isinstance(job, MessageJob):
             return self.db.touch_active_job(
                 job.id,
+                worker_id=job.worker_id,
+                lease_token=job.lease_token,
                 lease_seconds=lease_seconds,
-                **self._lease_kwargs(job),
             )
         return self.db.touch_active_job(job)
 
