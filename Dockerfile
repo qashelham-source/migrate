@@ -38,6 +38,7 @@ COPY --from=builder /opt/venv /opt/venv
 COPY --chown=migration:migration . .
 
 RUN mkdir -p /app/data /app/sessions /app/downloads/active /app/downloads/failed /app/downloads/completed \
+    && touch /app/config.yaml \
     && chown -R migration:migration /app
 
 USER migration:migration
