@@ -6,6 +6,7 @@ EXPECTED_SKIP_REASON_MARKERS: tuple[str, ...] = (
     "above configured bot upload limit",
     "forwarding_only is enabled",
     "text message was empty",
+    "cancelled by policy",
 )
 
 
