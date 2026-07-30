@@ -742,3 +742,81 @@ def test_recover_cached_file_id_mismatches_requeues_without_cache(tmp_path: Path
         assert queue.get_media_cache("cache-type-mismatch") is None
     finally:
         db.close()
+
+
+def test_terminal_nonrepair_failure_is_cancelled_and_hidden_from_issue_center(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, config)
+        assert queue.enqueue(
+            source_chat_id="-1001",
+            source_message_id=99,
+            dest_chat_id="-1002",
+            file_unique_key="terminal:99",
+            source_message_ids=[99],
+            source_topic_id=None,
+            dest_topic_id=None,
+            media_group_id=None,
+            media_type="document",
+            file_size=1,
+            caption=None,
+        )
+        row = db.query_one("SELECT * FROM messages WHERE source_message_id = 99")
+        assert row is not None
+        job = MessageJob.from_row(row)
+
+        assert queue.mark_failure(job, "Telegram rejected the upload", config.queue.max_attempts) == "cancelled"
+        saved = db.query_one("SELECT status, last_error FROM messages WHERE id = ?", (job.id,))
+        assert saved is not None
+        assert saved["status"] == "skipped"
+        assert "Cancelled by policy" in str(saved["last_error"])
+        assert issue_center(db) == []
+    finally:
+        db.close()
+
+
+def test_startup_cleanup_cancels_old_terminal_jobs_but_keeps_uncertain_uploads(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    db = Database(tmp_path / "migration.sqlite3")
+    db.initialize()
+    try:
+        queue = MessageQueue(db, config)
+        base = {
+            "source_chat_id": "-1001",
+            "dest_chat_id": "-1002",
+            "source_topic_id": None,
+            "dest_topic_id": None,
+            "media_group_id": None,
+            "media_type": "document",
+            "file_size": 1,
+            "caption": None,
+        }
+        assert queue.enqueue(
+            **base,
+            source_message_id=100,
+            file_unique_key="old-terminal:100",
+            source_message_ids=[100],
+            status="failed",
+            last_error="Telegram rejected the upload",
+        )
+        assert queue.enqueue(
+            **base,
+            source_message_id=101,
+            file_unique_key="uncertain-upload:101",
+            source_message_ids=[101],
+            status="failed",
+            last_error="Interrupted during upload; destination result is unknown. Verify first.",
+        )
+
+        assert queue.cancel_terminal_issues() == 1
+        cancelled = db.query_one("SELECT status, last_error FROM messages WHERE source_message_id = 100")
+        uncertain = db.query_one("SELECT status FROM messages WHERE source_message_id = 101")
+        assert cancelled is not None
+        assert cancelled["status"] == "skipped"
+        assert "Cancelled by policy" in str(cancelled["last_error"])
+        assert uncertain is not None
+        assert uncertain["status"] == "failed"
+    finally:
+        db.close()
