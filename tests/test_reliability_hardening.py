@@ -11,6 +11,7 @@ import yaml
 
 import main as migration_main
 from app.advanced import classify_repair_error, requeue_retryable_repairs, resolve_uncertain_upload
+from app.control import read_status, write_status
 from app.db import Database
 from app.destination_manager import set_destinations
 from app.queue import MessageQueue
@@ -466,3 +467,76 @@ def test_failed_primary_upload_still_holds_the_source_for_manual_review() -> Non
     )
 
     assert outcome.state == "blocked"
+
+
+
+def test_review_only_source_completion_status_never_crashes_or_blocks_queue(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = make_config(tmp_path)
+    state = {
+        "pending_jobs": 0,
+        "active_jobs": 0,
+        "delayed_jobs": 0,
+        "paused_jobs": 0,
+        "failed_jobs": 1,
+        "skipped_issue_jobs": 0,
+        "review_items": 2,
+        "review_job_id": 42,
+        "review_kind": "verification",
+        "last_error": "Destination media failed strict verification",
+        "verification_pending_jobs": 0,
+        "verification_failed_jobs": 1,
+        "verification_repairing_jobs": 0,
+    }
+    outcome = migration_main._source_outcome(
+        {
+            **state,
+            "primary_failed_jobs": 0,
+            "repair_failed_jobs": 1,
+            "primary_skipped_issue_jobs": 0,
+            "repair_skipped_issue_jobs": 0,
+            "runnable_jobs": 0,
+        },
+        source_chat_id=-100111,
+        source_index=1,
+        source_total=4,
+    )
+    recorded: dict[str, object] = {}
+
+    def record_status(config_arg, phase: str, **details) -> None:
+        assert config_arg is config
+        recorded["phase"] = phase
+        recorded["details"] = details
+
+    monkeypatch.setattr(migration_main, "write_status", record_status)
+
+    migration_main._write_source_complete_status(
+        config,
+        state=state,
+        outcome=outcome,
+        source="VVIP 02",
+        source_chat_id=-100111,
+        source_index=1,
+        source_total=4,
+    )
+
+    assert recorded["phase"] == "source_complete"
+    details = recorded["details"]
+    assert isinstance(details, dict)
+    assert details["review_job_id"] == 42
+    assert details["review_summary"] == "Destination media failed strict verification"
+    assert details["review_items"] == 2
+    assert "moving to the next source" in str(details["message"])
+
+
+def test_unserializable_status_detail_keeps_the_last_known_status(tmp_path: Path) -> None:
+    config = make_config(tmp_path)
+
+    write_status(config, "watching", message="Known good status")
+    write_status(config, "processing", unsafe_detail=object())
+
+    saved = read_status(config)
+    assert saved["phase"] == "watching"
+    assert saved["message"] == "Known good status"
