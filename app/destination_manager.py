@@ -228,6 +228,21 @@ def blacklist_source(chat: str | int, config_path: str | Path = "config.yaml") -
     return normalised
 
 
+def unblacklist_source(chat: str | int, config_path: str | Path = "config.yaml") -> str:
+    """Remove a source from the blacklist so it can be added to the queue again."""
+    normalised = normalize_chat(chat)
+    with _CONFIG_LOCK:
+        path, data = _load_yaml(config_path)
+        migration = data.setdefault("migration", {})
+        blacklisted = _normalised_chats(migration.get("source_blacklist") or [])
+        migration["source_blacklist"] = [
+            item for item in blacklisted
+            if item.lower() != normalised.lower()
+        ]
+        _save_yaml(path, data)
+    return normalised
+
+
 def list_destinations(config_path: str | Path = "config.yaml") -> list[dict[str, Any]]:
     with _CONFIG_LOCK:
         _, data = _load_yaml(config_path)

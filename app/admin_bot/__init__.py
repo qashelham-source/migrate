@@ -42,6 +42,7 @@ from app.destination_manager import (
     list_destinations,
     set_destinations,
     set_sources,
+    unblacklist_source,
 )
 from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
 from app.queue import MessageQueue
@@ -929,8 +930,10 @@ def _source_menu(user_id: int, path: Path, page: int = 0) -> InlineKeyboardMarku
         nav.append(("➡️", f"sources:page:{page + 1}"))
     if nav:
         rows.append(nav)
+    blacklist = get_source_blacklist(path)
     rows += [
         [("🛠 Manage Queue", "sources:queue"), ("🔄 Scan / Refresh", "sources:scan")],
+        [("🚫 Blacklist (%d)" % len(blacklist), "sources:blacklist_view")],
         [("✅ Save & Start Queue", "sources:save")],
         [("🎯 Manage Destinations", "destinations:view"), ("⬅️ Dashboard", "menu")],
     ]
@@ -969,6 +972,34 @@ def _source_queue_menu(user_id: int, path: Path) -> InlineKeyboardMarkup:
         [("⬅️ Source Queue", "sources:view")],
         [("✅ Save & Start Queue", "sources:save")],
     ]
+    return _buttons(rows)
+
+
+def _blacklist_text(user_id: int, path: Path) -> str:
+    blacklist = get_source_blacklist(path)
+    if not blacklist:
+        return "\n".join([
+            "🚫 Source Blacklist",
+            "",
+            "No sources are blacklisted.",
+            "",
+            "Blacklisted sources are permanently skipped by the migration engine.",
+        ])
+    lines = ["🚫 Source Blacklist", "", f"{len(blacklist)} source(s) blocked:"]
+    for i, chat in enumerate(blacklist, 1):
+        title = _channel_title(user_id, chat, path)[:48]
+        lines.append(f"{i}. {title}")
+    lines += ["", "Tap a source below to unblacklist it and allow it to run again."]
+    return "\n".join(lines)
+
+
+def _blacklist_menu(user_id: int, path: Path) -> InlineKeyboardMarkup:
+    blacklist = get_source_blacklist(path)
+    rows: list[list[tuple[str, str]]] = []
+    for chat in blacklist:
+        label = _channel_title(user_id, chat, path)[:38]
+        rows.append([(f"✅ Unblacklist: {label}"[:52], f"sources:unblacklist:{chat}")])
+    rows.append([("⬅️ Source Queue", "sources:view")])
     return _buttons(rows)
 
 
@@ -1178,6 +1209,24 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             page = _source_page(_source_channels(user_id, path), source_index // _PAGE_SIZE)
             with suppress(Exception):
                 await edit(query, _source_text(user_id, path, page), _source_menu(user_id, path, page))
+            return
+        if data == "sources:blacklist_view":
+            await edit(query, _blacklist_text(user_id, path), _blacklist_menu(user_id, path))
+            await query.answer()
+            return
+        if data.startswith("sources:unblacklist:"):
+            chat = data[len("sources:unblacklist:"):]
+            try:
+                unblacklist_source(chat, path)
+            except Exception as exc:
+                await query.answer(
+                    f"Could not unblacklist: {exc.__class__.__name__}: {exc}"[:190],
+                    show_alert=True,
+                )
+                return
+            title = _channel_title(user_id, chat, path)[:48]
+            await query.answer(f"✅ Unblacklisted: {title}", show_alert=True)
+            await edit(query, _blacklist_text(user_id, path), _blacklist_menu(user_id, path))
             return
         if data.startswith("destinations:toggle:"):
             index = int(data.rsplit(":", 1)[1])
