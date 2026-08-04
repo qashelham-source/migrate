@@ -1,3 +1,5 @@
+attached_assets/
+.replit
 __pycache__/
 *.py[cod]
 .pytest_cache/
