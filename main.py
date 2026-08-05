@@ -266,13 +266,19 @@ def _source_outcome(
             message="An automatic retry has been scheduled for this source.",
             **common,
         )
-    if int(state["verification_pending_jobs"]):
-        return CycleOutcome(
-            "retry",
-            retry_after_seconds=60,
-            message="Waiting to retry verification before moving to the next source.",
-            **common,
-        )
+    # NOTE: verification_pending_jobs must NOT block queue advancement.
+    #
+    # The Verifier already ran before _source_outcome is called.  When it
+    # cannot verify a job (network error, source message deleted, native copy
+    # with no stored dest_message_ids), the job keeps verified_at=NULL and
+    # gets no verification_results row.  Treating that as a hard "retry" here
+    # creates an infinite 60-second loop: every cycle rescans source 1, finds
+    # 0 pending, runs the verifier again, fails again — sources 2 and 3 are
+    # never reached.
+    #
+    # Instead, unverified copied jobs are folded into review_items so the user
+    # can inspect them in Issue Center, but they do NOT prevent the next
+    # source from starting.
     if int(state["runnable_jobs"]):
         return CycleOutcome(
             "retry",
@@ -291,7 +297,10 @@ def _source_outcome(
             message="Repair verification is still running and will continue automatically.",
             **common,
         )
-    review_items = int(state.get("review_items", state["verification_failed_jobs"]))
+    review_items = (
+        int(state.get("review_items", state["verification_failed_jobs"]))
+        + int(state["verification_pending_jobs"])
+    )
     if review_items:
         review_job_id = state.get("review_job_id")
         return CycleOutcome(

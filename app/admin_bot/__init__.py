@@ -359,7 +359,18 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
     # ── Headline ──────────────────────────────────────────────────────────
     if stalled_jobs:
         headline = "🚨 Job stalled — open Smart Center › Recovery Tools"
-    elif phase in {"downloading", "uploading", "processing", "scanning", "scan_complete", "source_complete"}:
+    elif phase == "source_complete":
+        si = status.get("source_index")
+        st = status.get("source_total")
+        try:
+            si_i, st_i = int(si), int(st)
+            if si_i < st_i:
+                headline = f"✅ Source {si_i}/{st_i} done — moving to source {si_i + 1}"
+            else:
+                headline = f"✅ All {st_i} source(s) done"
+        except (TypeError, ValueError):
+            headline = "✅ Source done — moving to next"
+    elif phase in {"downloading", "uploading", "processing", "scanning", "scan_complete"}:
         si = status.get("source_index")
         st = status.get("source_total")
         try:
@@ -383,6 +394,7 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
 
     # ── Per-source status list ────────────────────────────────────────────
     source_progress = data["source_progress"]
+    source_total_in_status = int(status.get("source_total") or 0)
     if source_progress:
         lines.append("")
         for i, item in enumerate(source_progress, 1):
@@ -390,6 +402,10 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
             label = _source_state_label(item, current_chat, phase, status)
             lines.append(f"{i}. {title}")
             lines.append(f"   {label}")
+        # Show count of sources that haven't been scanned yet in this run
+        waiting = source_total_in_status - len(source_progress)
+        if waiting > 0:
+            lines.append(f"   📋 +{waiting} more source(s) waiting in queue")
 
     # ── Loud errors ───────────────────────────────────────────────────────
     if dest_count == 0 and phase not in {"stopped", "stopping", "watching"}:
