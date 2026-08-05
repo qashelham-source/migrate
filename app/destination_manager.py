@@ -308,10 +308,12 @@ def remove_destination(index: int, config_path: str | Path = "config.yaml") -> d
 
 # ---------------------------------------------------------------------------
 # Per-run content-type filter  (SUBTRACTIVE — stores EXCLUDED types)
-# Stored as content_filter.json next to config.yaml.  Format v2:
+# Stored as data/content_filter.json so the setting survives container restarts.
+# Format v2:
 #   {"v": 2, "excluded": ["photo"]}
 # Absent file  →  no filter  →  scanner uses config flags (backward-compat).
 # Empty excluded list  →  filter active, nothing excluded  →  everything passes.
+# A legacy file next to config.yaml is read as a migration fallback.
 # ---------------------------------------------------------------------------
 
 _ALL_CONTENT_TYPES: frozenset[str] = frozenset({"video", "photo", "text"})
@@ -319,20 +321,27 @@ _CONTENT_FILTER_NAME = "content_filter.json"
 
 
 def _content_filter_path(config_path: str | Path) -> Path:
+    return Path(config_path).resolve().parent / "data" / _CONTENT_FILTER_NAME
+
+
+def _legacy_content_filter_path(config_path: str | Path) -> Path:
     return Path(config_path).resolve().parent / _CONTENT_FILTER_NAME
 
 
-def save_content_filter(config_path: str | Path, excluded: set[str] | list[str]) -> None:
-    """Persist the subtractive content-type filter (excluded types) next to config.yaml.
+def _content_filter_paths(config_path: str | Path) -> tuple[Path, Path]:
+    return (_content_filter_path(config_path), _legacy_content_filter_path(config_path))
 
-    Pass an empty set/list to clear (reverts to config-flag behaviour).
+
+def save_content_filter(config_path: str | Path, excluded: set[str] | list[str]) -> None:
+    """Persist the subtractive content-type filter in the shared data directory.
+
+    An empty set/list is an explicit active filter that allows every content
+    type through.  Use clear_content_filter() to revert to config-flag behaviour.
     Types not in _ALL_CONTENT_TYPES are silently ignored.
     """
     excluded_known = sorted(t for t in excluded if t in _ALL_CONTENT_TYPES)
-    if not excluded_known:
-        _content_filter_path(config_path).unlink(missing_ok=True)
-        return
     path = _content_filter_path(config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
         json.dump({"v": 2, "excluded": excluded_known}, fh)
 
@@ -348,21 +357,29 @@ def load_content_filter(config_path: str | Path) -> frozenset[str] | None:
     v1 format (plain list of included types) is deliberately ignored so stale
     files from the old inclusive model never silently misconfigure a run.
     """
-    path = _content_filter_path(config_path)
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            data = json.load(fh)
-        # v1 format was a plain list (included types) — ignore it.
-        if isinstance(data, list):
-            return None
-        if isinstance(data, dict) and data.get("v") == 2:
-            excluded = frozenset(str(t) for t in data.get("excluded", []) if t in _ALL_CONTENT_TYPES)
-            return excluded   # may be empty frozenset = filter active, nothing excluded
-    except (OSError, json.JSONDecodeError, ValueError):
-        pass
+    for path in _content_filter_paths(config_path):
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            # v1 format was a plain list (included types) — ignore it.
+            if isinstance(data, list):
+                return None
+            if isinstance(data, dict) and data.get("v") == 2:
+                excluded = frozenset(
+                    str(t) for t in data.get("excluded", []) if t in _ALL_CONTENT_TYPES
+                )
+                return excluded   # may be empty frozenset = filter active, nothing excluded
+        except (OSError, json.JSONDecodeError, ValueError):
+            continue
     return None
 
 
 def clear_content_filter(config_path: str | Path) -> None:
-    """Remove the content-type filter file (reverts to config-flag behaviour)."""
-    _content_filter_path(config_path).unlink(missing_ok=True)
+    """Remove the filter files (reverts to config-flag behaviour)."""
+    for path in _content_filter_paths(config_path):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
