@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import errno
+import json
 import os
 import re
 import tempfile
@@ -303,3 +304,52 @@ def remove_destination(index: int, config_path: str | Path = "config.yaml") -> d
             data.setdefault("migration", {})["destinations"] = []
             _save_yaml(path, data)
     return removed
+
+
+# ---------------------------------------------------------------------------
+# Per-run content-type filter
+# Stored as content_filter.json next to config.yaml.
+# Absence of the file (or an empty list) means "include all types".
+# ---------------------------------------------------------------------------
+
+_ALL_CONTENT_TYPES: frozenset[str] = frozenset({"video", "photo", "text"})
+_CONTENT_FILTER_NAME = "content_filter.json"
+
+
+def _content_filter_path(config_path: str | Path) -> Path:
+    return Path(config_path).resolve().parent / _CONTENT_FILTER_NAME
+
+
+def save_content_filter(config_path: str | Path, types: set[str] | list[str]) -> None:
+    """Persist the per-run content-type filter next to config.yaml.
+
+    Pass an empty set / list to clear the filter (same effect as remove).
+    """
+    chosen = sorted(t for t in types if t in _ALL_CONTENT_TYPES)
+    path = _content_filter_path(config_path)
+    with path.open("w", encoding="utf-8") as fh:
+        json.dump(chosen, fh)
+
+
+def load_content_filter(config_path: str | Path) -> frozenset[str] | None:
+    """Return the active content-type filter, or *None* when all types pass.
+
+    None means "no filter active — include everything" so callers that do not
+    need per-type gating can skip the check entirely.
+    """
+    path = _content_filter_path(config_path)
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, list):
+            chosen = frozenset(str(t) for t in data if t in _ALL_CONTENT_TYPES)
+            # Empty list in the file also means "all included"
+            return chosen if chosen and chosen != _ALL_CONTENT_TYPES else None
+    except (OSError, json.JSONDecodeError, ValueError):
+        pass
+    return None
+
+
+def clear_content_filter(config_path: str | Path) -> None:
+    """Remove the content-type filter file (reverts to migrating all types)."""
+    _content_filter_path(config_path).unlink(missing_ok=True)

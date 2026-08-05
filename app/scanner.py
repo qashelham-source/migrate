@@ -11,7 +11,7 @@ from pyrogram.types import Message
 
 from app.config import AppConfig, ChatSpec
 from app.control import write_status
-from app.destination_manager import is_source_blacklisted
+from app.destination_manager import is_source_blacklisted, load_content_filter
 from app.queue import MessageQueue
 from app.telegram_client import (
     ResolvedChat,
@@ -114,6 +114,10 @@ class Scanner:
             else None
         )
         self.config_path = Path(config_path) if config_path is not None else None
+        # Load once per scan cycle so every message check is O(1).
+        self._content_filter = (
+            load_content_filter(self.config_path) if self.config_path is not None else None
+        )
 
     def _source_was_removed(self, source: ChatSpec, source_chat_id: int | str) -> bool:
         if self.config_path is None:
@@ -662,6 +666,10 @@ class Scanner:
 
     def _message_should_process(self, message: Message) -> bool:
         media_type = message_media_type(message)
+        # Per-run content-type filter set via the bot UI overrides config flags.
+        if self._content_filter is not None:
+            return media_type in self._content_filter
+        # Fall through to static config flags (backward-compatible default).
         if media_type == "video":
             return self.config.transfer.include_videos
         if media_type == "photo":

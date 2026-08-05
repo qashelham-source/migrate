@@ -37,9 +37,12 @@ from app.dashboard_v2 import active_source_progress, dashboard_snapshot, format_
 from app.db import Database
 from app.destination_manager import (
     blacklist_source,
+    clear_content_filter,
     get_source_blacklist,
     get_sources,
     list_destinations,
+    load_content_filter,
+    save_content_filter,
     set_destinations,
     set_sources,
     unblacklist_source,
@@ -53,8 +56,16 @@ _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
 _CHANNEL_CACHE: dict[int, list[dict[str, Any]]] = {}
 _SOURCE_TITLE_CACHE: dict[Path, dict[str, str]] = {}
 _SELECTIONS: dict[int, dict[str, list[str]]] = {}
+_CONTENT_TYPES: dict[int, set[str]] = {}
 _FINDER_INPUTS: set[int] = set()
 _PAGE_SIZE = 8
+
+_ALL_CONTENT_TYPES: tuple[str, ...] = ("video", "photo", "text")
+_CONTENT_TYPE_LABELS: dict[str, str] = {
+    "video": "📹 Video",
+    "photo": "📷 Photo",
+    "text": "📝 Text",
+}
 
 CATEGORY_LABELS = {
     "media_empty": "MEDIA_EMPTY",
@@ -110,6 +121,75 @@ def _menu(config: AppConfig | None = None) -> InlineKeyboardMarkup:
 
 def _back(target: str = "menu", label: str = "⬅️ Dashboard") -> InlineKeyboardMarkup:
     return _buttons([[(label, target)]])
+
+
+# ---------------------------------------------------------------------------
+# Content-type filter helpers
+# ---------------------------------------------------------------------------
+
+def _content_types_for(user_id: int) -> set[str]:
+    if user_id not in _CONTENT_TYPES:
+        _CONTENT_TYPES[user_id] = set(_ALL_CONTENT_TYPES)
+    return _CONTENT_TYPES[user_id]
+
+
+def _toggle_content_type(user_id: int, type_name: str) -> None:
+    types = _content_types_for(user_id)
+    if type_name in types:
+        # Always keep at least one type selected
+        if len(types) > 1:
+            types.discard(type_name)
+    else:
+        types.add(type_name)
+
+
+def _content_type_text(user_id: int) -> str:
+    selected = _content_types_for(user_id)
+    all_selected = selected == set(_ALL_CONTENT_TYPES)
+    lines = [
+        "📦 Select Content Types",
+        "",
+        "Choose what to migrate. Tap a type to toggle it on/off.",
+        "",
+    ]
+    for t in _ALL_CONTENT_TYPES:
+        icon = "✅" if t in selected else "☐"
+        lines.append(f"{icon} {_CONTENT_TYPE_LABELS[t]}")
+    lines += [""]
+    if all_selected:
+        lines.append("All types selected — everything will be migrated.")
+    else:
+        labels = " · ".join(_CONTENT_TYPE_LABELS[t] for t in _ALL_CONTENT_TYPES if t in selected)
+        lines.append(f"Only migrating: {labels}")
+    return "\n".join(lines)
+
+
+def _content_type_menu(user_id: int) -> InlineKeyboardMarkup:
+    selected = _content_types_for(user_id)
+    rows: list[list[tuple[str, str]]] = []
+    for t in _ALL_CONTENT_TYPES:
+        icon = "✅" if t in selected else "☐"
+        label = f"{icon} {_CONTENT_TYPE_LABELS[t]}"
+        rows.append([(label, f"sources:ctype_toggle:{t}")])
+    rows += [
+        [("▶️ Start Migration", "sources:ctype_confirm")],
+        [("⬅️ Source Queue", "sources:view")],
+    ]
+    return _buttons(rows)
+
+
+def _active_filter_line(path: Path) -> str:
+    """Return a one-line summary of the active content filter, or empty string."""
+    try:
+        active = load_content_filter(path)
+        if active is None:
+            return ""
+        labels = " · ".join(
+            _CONTENT_TYPE_LABELS[t] for t in _ALL_CONTENT_TYPES if t in active
+        )
+        return f"📦 Types: {labels}"
+    except Exception:
+        return ""
 
 
 def _smart_menu() -> InlineKeyboardMarkup:
@@ -206,7 +286,7 @@ def _media_label(value: Any) -> str:
     return labels.get(str(value or "").lower(), str(value or "Media").title())
 
 
-def _dashboard_text(config: AppConfig) -> str:
+def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
     db = _database(config)
     try:
         data = dashboard_snapshot(db, config.queue.db_path)
@@ -293,6 +373,10 @@ def _dashboard_text(config: AppConfig) -> str:
         lines.append(speed_line)
     if status.get("media_type"):
         lines.append(f"📎 Now processing: {_media_label(status['media_type'])}")
+    if config_path is not None:
+        filter_line = _active_filter_line(config_path)
+        if filter_line:
+            lines.append(filter_line)
 
     error = status.get("last_error") or status.get("error")
     if error and phase in {"blocked", "waiting_retry", "error"}:
@@ -1086,7 +1170,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
         last: str | None = None
         try:
             while _LIVE_TASKS.get(user_id) is asyncio.current_task():
-                text = _dashboard_text(config)
+                text = _dashboard_text(config, path)
                 if text != last:
                     with suppress(MessageNotModified):
                         await message.edit_text(text, reply_markup=_menu(config))
@@ -1109,7 +1193,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await reject(message=message)
             return
         assert user_id is not None
-        sent = await message.reply_text(_dashboard_text(config), reply_markup=_menu(config))
+        sent = await message.reply_text(_dashboard_text(config, path), reply_markup=_menu(config))
         start_live(user_id, sent)
 
     @app.on_callback_query()
@@ -1126,7 +1210,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             _FINDER_INPUTS.discard(user_id)
 
         if data in {"menu", "dashboard:view"}:
-            await edit(query, _dashboard_text(config), _menu(config))
+            await edit(query, _dashboard_text(config, path), _menu(config))
             start_live(user_id, query.message)
             await query.answer("Updated" if data == "dashboard:view" else None)
             return
@@ -1326,7 +1410,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 f"Removed {cleared['jobs']} old job(s). {title} will now migrate new posts only.",
                 show_alert=True,
             )
-            await edit(query, _dashboard_text(config), _menu(config))
+            await edit(query, _dashboard_text(config, path), _menu(config))
             start_live(user_id, query.message)
             return
         if data.startswith("sources:delete:"):
@@ -1384,7 +1468,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 f"Removed {deleted['jobs']} saved job(s) for {title}. Starting the next source.",
                 show_alert=True,
             )
-            await edit(query, _dashboard_text(config), _menu(config))
+            await edit(query, _dashboard_text(config, path), _menu(config))
             start_live(user_id, query.message)
             return
         if data.startswith("sources:remove:"):
@@ -1410,11 +1494,31 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             if set(selected["sources"]) & set(destinations):
                 await query.answer("The source and destination cannot be the same channel.", show_alert=True)
                 return
+            # Show content-type selection before starting; reset to all-on each time
+            _CONTENT_TYPES.pop(user_id, None)
+            await edit(query, _content_type_text(user_id), _content_type_menu(user_id))
+            await query.answer()
+            return
+        if data.startswith("sources:ctype_toggle:"):
+            type_name = data[len("sources:ctype_toggle:"):]
+            if type_name in _ALL_CONTENT_TYPES:
+                _toggle_content_type(user_id, type_name)
+            await edit(query, _content_type_text(user_id), _content_type_menu(user_id))
+            await query.answer()
+            return
+        if data == "sources:ctype_confirm":
+            selected = _selection_for(user_id, path)
+            chosen = _content_types_for(user_id)
+            if chosen == set(_ALL_CONTENT_TYPES):
+                clear_content_filter(path)
+            else:
+                save_content_filter(path, chosen)
             set_sources(selected["sources"], path)
             _persist_scanned_source_titles(config, path, _CHANNEL_CACHE.get(user_id, []))
             _request_mode(config, "run")
-            await query.answer("Source queue saved and started in order.", show_alert=True)
-            await edit(query, _dashboard_text(config), _menu(config))
+            filter_note = "" if chosen == set(_ALL_CONTENT_TYPES) else f" ({', '.join(_CONTENT_TYPE_LABELS[t] for t in _ALL_CONTENT_TYPES if t in chosen)})"
+            await query.answer(f"Source queue saved and started{filter_note}.", show_alert=True)
+            await edit(query, _dashboard_text(config, path), _menu(config))
             start_live(user_id, query.message)
             return
         if data == "destinations:save":
@@ -1562,7 +1666,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await query.answer(msg[:200], show_alert=True)
             if recovery.total:
                 _request_mode(config, "process")
-            await edit(query, _dashboard_text(config), _menu(config))
+            await edit(query, _dashboard_text(config, path), _menu(config))
             start_live(user_id, query.message)
             return
         if data == "advanced:delete_active_migration":
@@ -1616,7 +1720,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 f"Deleted {deleted['jobs']} job(s) for {source_title}. Starting next source.",
                 show_alert=True,
             )
-            await edit(query, _dashboard_text(config), _menu(config))
+            await edit(query, _dashboard_text(config, path), _menu(config))
             start_live(user_id, query.message)
             return
         if data in {"advanced:resume", "advanced:full", "advanced:sync", "run:now"}:
@@ -1628,6 +1732,8 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 if {item["chat"] for item in sources} & {item["chat"] for item in destinations}:
                     await query.answer("Sources and destinations overlap. Fix them in their respective menus.", show_alert=True)
                     return
+                # Direct start clears any saved content filter → migrate everything
+                clear_content_filter(path)
             mode = {"advanced:resume": "process", "advanced:full": "run", "advanced:sync": "sync", "run:now": "sync"}[data]
             _request_mode(config, mode)
             await query.answer("Command scheduled.", show_alert=True)
@@ -1639,7 +1745,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 await query.answer("Stop request sent.", show_alert=True)
             else:
                 await query.answer("No active migration.", show_alert=True)
-            await edit(query, _dashboard_text(config), _menu(config))
+            await edit(query, _dashboard_text(config, path), _menu(config))
             start_live(user_id, query.message)
             return
         await query.answer()
@@ -1661,7 +1767,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await message.reply_text(_finder_result_text(text, match), reply_markup=_finder_menu())
             return
         if not text.startswith("/start"):
-            sent = await message.reply_text(_dashboard_text(config), reply_markup=_menu(config))
+            sent = await message.reply_text(_dashboard_text(config, path), reply_markup=_menu(config))
             if user_id is not None:
                 start_live(user_id, sent)
 
