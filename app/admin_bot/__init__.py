@@ -459,7 +459,7 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
 
     # ── Footer ────────────────────────────────────────────────────────────
     dest_label = "destination" if dest_count == 1 else "destinations"
-    ts = time.strftime("%H:%M:%S")
+    ts = time.strftime("%H:%M:%S UTC", time.gmtime())
     lines += ["", f"🕐 {ts} · {dest_count} {dest_label} · ↻ auto-updates"]
 
     return "\n".join(lines)[:3900]
