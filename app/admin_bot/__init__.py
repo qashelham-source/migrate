@@ -482,15 +482,45 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
     source_total_in_status = int(status.get("source_total") or 0)
     if source_progress:
         lines.append("")
-        for i, item in enumerate(source_progress, 1):
+
+        def _source_is_complete(item: dict) -> bool:
+            """True when a source has nothing left to do (100 % copied or all filtered)."""
+            eligible = int(item.get("eligible_items") or 0)
+            total    = int(item.get("total_items")    or 0)
+            # All-filtered: scanner ran, nothing matched the content-type filter
+            if eligible == 0 and total > 0:
+                return True
+            # Normal completion: every eligible item copied, nothing blocked/active
+            return (
+                eligible > 0
+                and int(item.get("percent")         or 0) == 100
+                and int(item.get("remaining_items") or 0) == 0
+                and int(item.get("blocked_items")   or 0) == 0
+            )
+
+        active_sources = [s for s in source_progress if not _source_is_complete(s)]
+        done_sources   = [s for s in source_progress if     _source_is_complete(s)]
+
+        # Active / in-progress sources — full detail, one entry each
+        for i, item in enumerate(active_sources, 1):
             title = str(item["title"])[:38]
             label = _source_state_label(item, current_chat, phase, status)
             lines.append(f"{i}. {title}")
             lines.append(f"   {label}")
-        # Show count of sources that haven't been scanned yet in this run
+
+        # Sources not yet scanned (configured but not started)
         waiting = source_total_in_status - len(source_progress)
         if waiting > 0:
             lines.append(f"   📋 +{waiting} more source(s) waiting in queue")
+
+        # Completed sources — single summary line, not repeated individually
+        if done_sources:
+            done_item_count = sum(int(s.get("copied_items") or 0) for s in done_sources)
+            n = len(done_sources)
+            source_word = "source" if n == 1 else "sources"
+            if active_sources or waiting:
+                lines.append("")
+            lines.append(f"✅ {n} {source_word} complete · {done_item_count:,} items")
 
     # ── Loud errors ───────────────────────────────────────────────────────
     if dest_count == 0 and phase not in {"stopped", "stopping", "watching"}:
