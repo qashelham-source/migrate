@@ -268,6 +268,9 @@ class AppConfig:
     sources: list[ChatSpec] = field(default_factory=list)
     destinations: list[ChatSpec] = field(default_factory=list)
     source_blacklist: list[str] = field(default_factory=list)
+    # Owner's local UTC offset in whole hours (e.g. 8 for UTC+8 / Malaysia).
+    # Set via config.yaml:  display: { timezone_hours: 8 }
+    display_timezone_hours: int = 8
 
     def ensure_directories(self) -> None:
         self.telegram.sessions_dir.mkdir(parents=True, exist_ok=True)
@@ -365,6 +368,15 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     logging_level = str(logging_cfg.get("level", "INFO")).upper()
     if logging_level not in {"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"}:
         raise ValueError("logging.level must be CRITICAL, ERROR, WARNING, INFO, or DEBUG")
+
+    display_cfg = raw.get("display") or {}
+    display_tz_raw = display_cfg.get("timezone_hours", 8)
+    try:
+        display_timezone_hours = int(display_tz_raw)
+    except (TypeError, ValueError):
+        raise ValueError("display.timezone_hours must be an integer (e.g. 8 for UTC+8)")
+    if not (-12 <= display_timezone_hours <= 14):
+        raise ValueError("display.timezone_hours must be between -12 and +14")
 
     sources = [ChatSpec.from_config(item) for item in migration.get("sources", [])]
     destinations = [ChatSpec.from_config(item) for item in migration.get("destinations", [])]
@@ -486,4 +498,5 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
         sources=sources,
         destinations=destinations,
         source_blacklist=source_blacklist,
+        display_timezone_hours=display_timezone_hours,
     )

@@ -5,7 +5,7 @@ import sqlite3
 import tempfile
 import time
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -459,8 +459,12 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
 
     # ── Footer ────────────────────────────────────────────────────────────
     dest_label = "destination" if dest_count == 1 else "destinations"
-    ts = time.strftime("%H:%M:%S UTC", time.gmtime())
-    lines += ["", f"🕐 {ts} · {dest_count} {dest_label} · ↻ auto-updates"]
+    tz_hours = getattr(config, "display_timezone_hours", 8)
+    local_tz = timezone(timedelta(hours=tz_hours))
+    ts = datetime.now(tz=local_tz).strftime("%H:%M")
+    tz_sign = "+" if tz_hours >= 0 else ""
+    tz_label = f"UTC{tz_sign}{tz_hours}"
+    lines += ["", f"🕐 Updated {ts} ({tz_label}) · {dest_count} {dest_label} · ↻ auto-updates"]
 
     return "\n".join(lines)[:3900]
 
