@@ -1,1 +1,0 @@
-- [Queue advancement bug](queue-advancement-bug.md) — verification_pending_jobs was a hard retry-blocker in _source_outcome; correct fix is to fold into review_items.
