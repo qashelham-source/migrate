@@ -262,9 +262,25 @@ def dashboard_snapshot(db: Database, storage_path: str | Path) -> dict[str, Any]
               )
             """,
         ),
+        "migration_failed": _count(
+            db,
+            f"""
+            SELECT COUNT(*) FROM messages
+            WHERE file_unique_key NOT LIKE 'repair:%'
+              AND (
+                    status = 'failed'
+                 OR (status = 'skipped'
+                     AND NOT {expected_skip})
+              )
+            """,
+        ),
         "verification_failed": int(verification["failed"]),
     }
-    review["total"] = review["repair_failed"] + review["verification_failed"]
+    review["total"] = (
+        review["repair_failed"]
+        + review["migration_failed"]
+        + review["verification_failed"]
+    )
 
     telemetry = {"active": 0, "speed_bps": 0.0, "eta_seconds": None}
     if _table_exists(db, "job_telemetry"):
