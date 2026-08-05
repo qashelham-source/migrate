@@ -1004,6 +1004,36 @@ async def _run_live_service(
                     break
                 command, reason = next_trigger
                 continue
+            # ── Auto-advance: run next queued source without user tap ──────
+            # After every completed cycle, reload config and check if any
+            # configured source has never been scanned (no checkpoint) and
+            # has no jobs in the queue.  If found, start a new cycle
+            # immediately so the owner never has to tap Start between sources.
+            # The content filter is already persisted in content_filter.json
+            # and is re-read at scan time — nothing extra needed here.
+            _auto_config = load_config(config_path)
+            _should_auto_advance = False
+            for _spec in _configured_sources(_auto_config):
+                try:
+                    _r = await resolve_chat(reader, limiter, _spec)
+                    _ckpt = queue.get_scan_checkpoint(int(_r.chat_id))
+                    _st = queue.source_work_state(int(_r.chat_id))
+                    if _ckpt is None and int(_st.get("total_items") or 0) == 0:
+                        _should_auto_advance = True
+                        if logger:
+                            logger.info(
+                                "Auto-advance: unscanned source %s found — "
+                                "starting next cycle without user tap",
+                                _r.title or _r.chat_id,
+                            )
+                        break
+                except Exception as _exc:
+                    if logger:
+                        logger.debug("Auto-advance check skipped for %s: %s", _spec.chat, _exc)
+            if _should_auto_advance and not stop_event.is_set():
+                command, reason = "run", "auto_advance"
+                continue
+            # ────────────────────────────────────────────────────────────────
             write_status(
                 config,
                 "watching",
