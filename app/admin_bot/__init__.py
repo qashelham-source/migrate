@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import time
 from contextlib import suppress
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -86,31 +87,12 @@ def _buttons(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
 
 
 def _menu(config: AppConfig | None = None) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton("📚 Source Queue", callback_data="sources:view"),
-         InlineKeyboardButton("🎯 Destinations", callback_data="destinations:view")],
-        [InlineKeyboardButton("🧠 Smart Center", callback_data="smart:menu"),
-         InlineKeyboardButton("⚙️ Settings", callback_data="settings:view")],
-        [InlineKeyboardButton("▶️ Start Queue", callback_data="run:now"),
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton("▶️ Start", callback_data="run:now"),
          InlineKeyboardButton("⏹ Stop", callback_data="stop:current")],
-        [InlineKeyboardButton("🔄 Refresh", callback_data="dashboard:view")],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="dashboard:view"),
+         InlineKeyboardButton("⋯ More", callback_data="menu:more")],
     ]
-    # When a source is blocked (stuck jobs with no live worker), surface a
-    # one-tap shortcut to delete the migration directly from the dashboard.
-    if config:
-        try:
-            _status = read_status(config)
-            _phase = str(_status.get("phase") or "").lower()
-            if _phase == "blocked" and _status.get("source_chat"):
-                rows.insert(
-                    -1,
-                    [InlineKeyboardButton(
-                        "🗑 Delete Active Migration",
-                        callback_data="advanced:delete_active_migration",
-                    )],
-                )
-        except Exception:
-            pass
     if config and config.mini_app.enabled:
         rows.insert(
             0,
@@ -121,6 +103,73 @@ def _menu(config: AppConfig | None = None) -> InlineKeyboardMarkup:
 
 def _back(target: str = "menu", label: str = "⬅️ Dashboard") -> InlineKeyboardMarkup:
     return _buttons([[(label, target)]])
+
+
+def _source_state_label(
+    item: dict,
+    current_chat: str,
+    phase: str,
+    status: dict,
+) -> str:
+    """Return a short, honest status line for one source based on DB + runtime state."""
+    chat_id = str(item["source_chat_id"])
+    total = int(item.get("total_items") or 0)
+    eligible = int(item["eligible_items"])
+    copied = int(item["copied_items"])
+    active = int(item["active_items"])
+    blocked = int(item["blocked_items"])
+    remaining = int(item["remaining_items"])
+    percent = int(item["percent"])
+    is_current = bool(current_chat and current_chat == chat_id)
+
+    if is_current:
+        if phase == "scanning":
+            scan_cur = status.get("current")
+            scan_tot = status.get("total")
+            if scan_cur is not None and scan_tot is not None:
+                try:
+                    return f"🔎 Scanning {int(scan_cur):,}/{int(scan_tot):,}"
+                except (TypeError, ValueError):
+                    pass
+            return "🔎 Scanning…"
+        if phase in {"downloading", "uploading", "processing"}:
+            if eligible:
+                if active:
+                    return f"⚡ {copied:,}/{eligible:,} · {active} active"
+                return f"⚡ {copied:,}/{eligible:,} sending"
+            return "⚡ Processing…"
+        if phase == "blocked":
+            if eligible:
+                return f"⛔ Blocked — {copied:,}/{eligible:,} done"
+            return "⛔ Blocked"
+        if phase == "waiting_retry":
+            return f"🔄 Retry pending — {copied:,}/{eligible:,}"
+
+    # DB-derived state (not currently active, or phase not recognised above)
+    if eligible == 0 and total > 0:
+        return "✅ All filtered (0 match content type)"
+    if eligible == 0:
+        return "⏳ Not yet scanned"
+    if percent == 100 and remaining == 0 and blocked == 0:
+        return f"✅ {copied:,}/{eligible:,} done"
+    if blocked > 0 and active == 0 and copied == 0:
+        return f"⛔ {blocked:,} items blocked — open Issue Center"
+    if active > 0:
+        bar = _progress_bar(percent, width=6)
+        return f"⚡ {bar} {copied:,}/{eligible:,}"
+    if blocked > 0:
+        return f"⚠️ {copied:,}/{eligible:,} · {blocked} need review"
+    if copied > 0 or remaining > 0:
+        return f"⏳ {copied:,}/{eligible:,} queued"
+    return "⏳ Queued"
+
+
+def _more_menu() -> InlineKeyboardMarkup:
+    return _buttons([
+        [("📚 Source Queue", "sources:view"), ("🎯 Destinations", "destinations:view")],
+        [("🧠 Smart Center", "smart:menu"), ("⚙️ Settings", "settings:view")],
+        [("⬅️ Dashboard", "menu")],
+    ])
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +222,7 @@ def _content_type_menu(user_id: int) -> InlineKeyboardMarkup:
         rows.append([(label, f"sources:ctype_toggle:{t}")])
     rows += [
         [("▶️ Start Migration", "sources:ctype_confirm")],
-        [("⬅️ Source Queue", "sources:view")],
+        [("⬅️ Dashboard", "menu")],
     ]
     return _buttons(rows)
 
@@ -293,112 +342,97 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
     finally:
         db.close()
     status = read_status(config)
-    q, s, d, t, review, storage = (
-        data["queue"],
-        data["sources"],
-        data["destinations"],
-        data["telemetry"],
-        data["review"],
-        data["storage"],
-    )
+
     phase = str(status.get("phase") or "idle").lower()
-    current_source = active_source_progress(status, data["source_progress"])
-    headline, subline = _phase_summary(phase, current_source)
+    current_chat = str(status.get("source_chat") or "").strip()
+    error = str(status.get("last_error") or status.get("error") or "").strip()
     stalled_jobs = list(data["health"].get("stalled_jobs") or [])
+    telemetry = data["telemetry"]
+    review_total = int(data["review"]["total"])
+    storage = data["storage"]
+
+    # Destination count from config.yaml — same source the sender uses.
+    dest_count = len(list_destinations(config_path)) if config_path else int(data["destinations"]["total"])
+
+    # ── Headline ──────────────────────────────────────────────────────────
     if stalled_jobs:
-        headline = "🚨 Job Stalled"
-        subline = "A job has stopped showing activity and needs attention before restart."
-    active_jobs = q["downloading"] + q["uploading"]
-
-    lines = ["🏠 Migration Dashboard", "", headline, subline]
-
-    if current_source:
-        title = str(current_source["title"])[:52]
-        eligible = int(current_source["eligible_items"])
-        copied = int(current_source["copied_items"])
-        remaining = int(current_source["remaining_items"])
-        in_progress = int(current_source["active_items"])
-        blocked = int(current_source["blocked_items"])
-        percent = int(current_source["percent"])
-        lines += ["", "🎯 Active Migration", title]
-        if eligible:
-            lines += [
-                f"{_progress_bar(percent)}  {percent}%",
-                f"{copied:,} / {eligible:,} posts/albums",
-            ]
-            details: list[str] = []
-            if remaining:
-                details.append(f"{remaining:,} remaining")
-            if in_progress:
-                details.append(f"⚡ {in_progress:,} active")
-            if details:
-                lines.append(" · ".join(details))
-            if blocked:
-                lines.append(f"⚠️ {blocked:,} items need review")
-        else:
-            lines.append("No items match the current filter settings.")
-    else:
-        source_name = str(status.get("source") or status.get("source_chat") or "").strip()
-        if source_name and phase not in {"watching", "idle", "stopped", "source_complete"}:
-            lines += ["", "🎯 Current Source", source_name[:52]]
-        if phase == "scanning" and status.get("current") is not None and status.get("total") is not None:
-            try:
-                scanned = max(0, int(status["current"]))
-                total = max(0, int(status["total"]))
-                percent = round((scanned / total) * 100) if total else 0
-                lines.append(f"{_progress_bar(percent)}  Scan {scanned:,}/{total:,}")
-            except (TypeError, ValueError):
-                pass
-        elif phase in {"downloading", "uploading", "processing"} and active_jobs:
-            lines += ["", f"⚡ {active_jobs:,} active job(s)"]
-
-    if status.get("source_index") is not None and status.get("source_total") is not None:
+        headline = "🚨 Job stalled — open Smart Center › Recovery Tools"
+    elif phase in {"downloading", "uploading", "processing", "scanning", "scan_complete", "source_complete"}:
+        si = status.get("source_index")
+        st = status.get("source_total")
         try:
-            source_index = int(status["source_index"])
-            source_total = int(status["source_total"])
-            destination_label = "destination" if int(d["total"]) == 1 else "destinations"
-            lines += ["", f"📦 Source queue {source_index}/{source_total} · {d['total']} {destination_label}"]
+            headline = f"⚡ Running — source {int(si)}/{int(st)}"
         except (TypeError, ValueError):
-            pass
+            headline = "⚡ Running"
+    elif phase == "blocked":
+        headline = "⛔ Blocked — action needed (see below)"
+    elif phase == "waiting_retry":
+        headline = "🔄 Retry scheduled — will resume automatically"
+    elif phase in {"stopping", "stopped"}:
+        headline = "⏹ Stopped"
+    elif phase == "watching":
+        headline = "🛰 Watching for new posts"
+    elif phase in {"waiting", "idle"} or dest_count == 0:
+        headline = "⚙️ Not started — configure source and destination first"
     else:
-        source_label = "source" if int(s["total"]) == 1 else "sources"
-        destination_label = "destination" if int(d["total"]) == 1 else "destinations"
-        lines += ["", f"📦 {s['total']} {source_label} · {d['total']} {destination_label}"]
+        headline = "🟢 Ready — tap ▶️ Start"
 
-    speed = float(t["speed_bps"] or 0)
+    lines = ["🤖 Migration Bot", "", headline]
+
+    # ── Per-source status list ────────────────────────────────────────────
+    source_progress = data["source_progress"]
+    if source_progress:
+        lines.append("")
+        for i, item in enumerate(source_progress, 1):
+            title = str(item["title"])[:38]
+            label = _source_state_label(item, current_chat, phase, status)
+            lines.append(f"{i}. {title}")
+            lines.append(f"   {label}")
+
+    # ── Loud errors ───────────────────────────────────────────────────────
+    if dest_count == 0 and phase not in {"stopped", "stopping", "watching"}:
+        lines += [
+            "",
+            "⚠️ No destination configured.",
+            "→ Tap ⋯ More › Destinations to add one.",
+        ]
+    elif error and phase in {"blocked", "waiting_retry", "error"}:
+        lines += ["", f"⚠️ {str(error).replace(chr(10), ' ')[:250]}"]
+        if phase == "blocked":
+            lines.append("→ Fix the issue above, then tap ▶️ Start.")
+
+    if stalled_jobs:
+        lines += [
+            "",
+            f"🚨 {len(stalled_jobs)} job(s) not responding.",
+            "→ Tap ⋯ More › Smart Center › Recovery Tools.",
+        ]
+
+    if review_total:
+        lines += ["", f"⚠️ {review_total} item(s) in Issue Center (tap ⋯ More › Smart Center)"]
+
+    # ── Speed / filter / storage ──────────────────────────────────────────
+    speed = float(telemetry["speed_bps"] or 0)
     if speed > 0:
         speed_line = f"🚀 {format_bytes(speed)}/s"
-        if t["eta_seconds"] is not None:
-            speed_line += f" · ETA {format_eta(t['eta_seconds'])}"
+        if telemetry["eta_seconds"] is not None:
+            speed_line += f" · ETA {format_eta(telemetry['eta_seconds'])}"
         lines.append(speed_line)
-    if status.get("media_type"):
-        lines.append(f"📎 Now processing: {_media_label(status['media_type'])}")
+
     if config_path is not None:
         filter_line = _active_filter_line(config_path)
         if filter_line:
             lines.append(filter_line)
 
-    error = status.get("last_error") or status.get("error")
-    if error and phase in {"blocked", "waiting_retry", "error"}:
-        lines += ["", f"⚠️ {str(error).replace(chr(10), ' ')[:220]}"]
-    if phase == "blocked" and status.get("review_job_id") is not None:
-        lines.append(f"🔒 Blocking job: #{status['review_job_id']}")
-    if int(review["total"]):
-        lines += [
-            "",
-            f"⚠️ {int(review['total'])} item(s) saved in Issue Center.",
-            "The source queue continues automatically while they wait for review.",
-        ]
-    if stalled_jobs:
-        lines += [
-            "",
-            f"🚨 {len(stalled_jobs)} job(s) tidak menunjukkan aktiviti.",
-            "Buka Issue Center untuk semak status dengan selamat.",
-        ]
     if storage.percent_used >= 80:
         level = "🚨 Critical storage" if storage.percent_used >= 90 else "⚠️ Low storage"
-        lines += ["", level, f"Free: {format_bytes(storage.free_bytes)}"]
-    lines += ["", "↻ Updates automatically"]
+        lines.append(f"{level} — {format_bytes(storage.free_bytes)} free")
+
+    # ── Footer ────────────────────────────────────────────────────────────
+    dest_label = "destination" if dest_count == 1 else "destinations"
+    ts = time.strftime("%H:%M:%S")
+    lines += ["", f"🕐 {ts} · {dest_count} {dest_label} · ↻ auto-updates"]
+
     return "\n".join(lines)[:3900]
 
 def _settings_text(path: Path) -> str:
@@ -1513,11 +1547,18 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 clear_content_filter(path)
             else:
                 save_content_filter(path, chosen)
-            set_sources(selected["sources"], path)
-            _persist_scanned_source_titles(config, path, _CHANNEL_CACHE.get(user_id, []))
+            # Only update sources list when the user came through the Source Queue
+            # selection flow (session has sources). When initiated from ▶️ Start on
+            # the dashboard the sources are already saved in config — don't overwrite.
+            if selected["sources"]:
+                try:
+                    set_sources(selected["sources"], path)
+                    _persist_scanned_source_titles(config, path, _CHANNEL_CACHE.get(user_id, []))
+                except Exception:
+                    pass
             _request_mode(config, "run")
             filter_note = "" if chosen == set(_ALL_CONTENT_TYPES) else f" ({', '.join(_CONTENT_TYPE_LABELS[t] for t in _ALL_CONTENT_TYPES if t in chosen)})"
-            await query.answer(f"Source queue saved and started{filter_note}.", show_alert=True)
+            await query.answer(f"Migration started{filter_note}.", show_alert=True)
             await edit(query, _dashboard_text(config, path), _menu(config))
             start_live(user_id, query.message)
             return
@@ -1723,18 +1764,32 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await edit(query, _dashboard_text(config, path), _menu(config))
             start_live(user_id, query.message)
             return
-        if data in {"advanced:resume", "advanced:full", "advanced:sync", "run:now"}:
-            if data == "run:now":
-                sources, destinations = get_sources(path), list_destinations(path)
-                if not sources or not destinations:
-                    await query.answer("Set up Source Queue and Destinations first.", show_alert=True)
-                    return
-                if {item["chat"] for item in sources} & {item["chat"] for item in destinations}:
-                    await query.answer("Sources and destinations overlap. Fix them in their respective menus.", show_alert=True)
-                    return
-                # Direct start clears any saved content filter → migrate everything
-                clear_content_filter(path)
-            mode = {"advanced:resume": "process", "advanced:full": "run", "advanced:sync": "sync", "run:now": "sync"}[data]
+        if data == "run:now":
+            sources, destinations = get_sources(path), list_destinations(path)
+            if not sources:
+                await query.answer("Add sources in Source Queue (⋯ More) first.", show_alert=True)
+                return
+            if not destinations:
+                await query.answer("Add a destination in Destinations (⋯ More) first.", show_alert=True)
+                return
+            if {item["chat"] for item in sources} & {item["chat"] for item in destinations}:
+                await query.answer("A source and destination are the same channel — fix in ⋯ More.", show_alert=True)
+                return
+            # Always show content-type selection; preload with any existing filter
+            existing = load_content_filter(path)
+            if existing is not None:
+                _CONTENT_TYPES[user_id] = set(existing)
+            else:
+                _CONTENT_TYPES.pop(user_id, None)
+            await edit(query, _content_type_text(user_id), _content_type_menu(user_id))
+            await query.answer()
+            return
+        if data == "menu:more":
+            await edit(query, "⋯ More options", _more_menu())
+            await query.answer()
+            return
+        if data in {"advanced:resume", "advanced:full", "advanced:sync"}:
+            mode = {"advanced:resume": "process", "advanced:full": "run", "advanced:sync": "sync"}[data]
             _request_mode(config, mode)
             await query.answer("Command scheduled.", show_alert=True)
             return
