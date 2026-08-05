@@ -374,14 +374,42 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
                 headline = f"✅ All {int(st)} source(s) done"
             except (TypeError, ValueError):
                 headline = "✅ All sources done"
-    elif phase in {"downloading", "uploading", "processing", "scanning",
+    elif phase == "scanning":
+        si = status.get("source_index")
+        st = status.get("source_total")
+        scan_cur = status.get("current")
+        scan_tot = status.get("total")
+        try:
+            si_txt = f"source {int(si)}/{int(st)}"
+        except (TypeError, ValueError):
+            si_txt = None
+        try:
+            prog = f"{int(scan_cur):,}/{int(scan_tot):,} scanned"
+        except (TypeError, ValueError):
+            prog = None
+        parts: list[str] = ["🔎 Scanning"]
+        if si_txt:
+            parts.append(si_txt)
+        if prog:
+            parts.append(prog)
+        headline = " — ".join(parts)
+    elif phase in {"downloading", "uploading", "processing",
                    "scan_complete", "verifying", "starting"}:
         si = status.get("source_index")
         st = status.get("source_total")
         try:
-            headline = f"⚡ Running — source {int(si)}/{int(st)}"
+            si_txt = f"source {int(si)}/{int(st)}"
         except (TypeError, ValueError):
-            headline = "⚡ Running"
+            si_txt = None
+        _phase_icon = {
+            "downloading": "⬇️ Downloading",
+            "uploading":   "⬆️ Copying",
+            "processing":  "⬆️ Copying",
+            "scan_complete": "⚡ Running",
+            "verifying":   "🔍 Verifying",
+            "starting":    "⚡ Starting",
+        }.get(phase, "⚡ Running")
+        headline = f"{_phase_icon} — {si_txt}" if si_txt else _phase_icon
     elif phase == "batch_pause":
         si = status.get("source_index")
         st = status.get("source_total")
@@ -427,6 +455,26 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
                 headline = f"⚡ Running — source {int(si)}/{int(st)}"
             except (TypeError, ValueError):
                 headline = "⚡ Running"
+
+    # ── FloodWait headline override ───────────────────────────────────────
+    # Rate-limit is the most useful thing to show — always wins the headline
+    # when Telegram is making us wait, regardless of the underlying phase.
+    _fw = get_floodwait()
+    _fw_remaining = 0
+    if _fw:
+        _fw_remaining = max(
+            (v.get("cooldown_remaining_seconds", 0)
+             for v in _fw.get("floodwait_operations", {}).values()),
+            default=0,
+        )
+    if _fw_remaining > 0:
+        _fw_si = status.get("source_index")
+        _fw_st = status.get("source_total")
+        try:
+            _fw_src = f" — source {int(_fw_si)}/{int(_fw_st)}"
+        except (TypeError, ValueError):
+            _fw_src = ""
+        headline = f"⏳ Rate limited — resumes in ~{_fw_remaining}s{_fw_src}"
 
     lines = ["🤖 Migration Bot", "", headline]
 
@@ -483,16 +531,17 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
         level = "🚨 Critical storage" if storage.percent_used >= 90 else "⚠️ Low storage"
         lines.append(f"{level} — {format_bytes(storage.free_bytes)} free")
 
-    # ── FloodWait (Telegram rate-limit) ───────────────────────────────────
-    fw = get_floodwait()
-    if fw:
-        fw_remaining = max(
-            (v.get("cooldown_remaining_seconds", 0)
-             for v in fw.get("floodwait_operations", {}).values()),
-            default=0,
-        )
-        if fw_remaining > 0:
-            lines.append(f"⏳ Telegram rate limit — paused ~{fw_remaining}s, then resumes automatically")
+    # ── FloodWait detail (headline already overridden above when active) ──
+    # Show per-operation breakdown only when multiple ops are throttled, so
+    # the user can see which operation is waiting (read vs upload, etc.).
+    if _fw_remaining > 0:
+        ops = _fw.get("floodwait_operations", {}) or {}
+        throttled = {op: v for op, v in ops.items()
+                     if int(v.get("cooldown_remaining_seconds", 0)) > 0}
+        if len(throttled) > 1:
+            for op, v in sorted(throttled.items()):
+                rem = int(v["cooldown_remaining_seconds"])
+                lines.append(f"   ↳ {op}: ~{rem}s")
 
     # ── Footer ────────────────────────────────────────────────────────────
     dest_label = "destination" if dest_count == 1 else "destinations"
@@ -501,7 +550,7 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
     ts = datetime.now(tz=local_tz).strftime("%H:%M")
     tz_sign = "+" if tz_hours >= 0 else ""
     tz_label = f"UTC{tz_sign}{tz_hours}"
-    lines += ["", f"🕐 Updated {ts} ({tz_label}) · {dest_count} {dest_label} · ↻ auto-updates"]
+    lines += ["", f"🕐 Last edit: {ts} ({tz_label}) · {dest_count} {dest_label} · ↻ auto"]
 
     return "\n".join(lines)[:3900]
 
