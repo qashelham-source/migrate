@@ -50,6 +50,7 @@ from app.destination_manager import (
 )
 from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
 from app.queue import MessageQueue
+from app.shared_state import get_floodwait
 from app.telegram_client import start_client_with_floodwait
 from app.logging import setup_logging
 
@@ -177,47 +178,48 @@ def _more_menu() -> InlineKeyboardMarkup:
 # ---------------------------------------------------------------------------
 
 def _content_types_for(user_id: int) -> set[str]:
+    """Return the set of EXCLUDED types for this user (default: exclude nothing)."""
     if user_id not in _CONTENT_TYPES:
-        _CONTENT_TYPES[user_id] = set(_ALL_CONTENT_TYPES)
+        _CONTENT_TYPES[user_id] = set()
     return _CONTENT_TYPES[user_id]
 
 
 def _toggle_content_type(user_id: int, type_name: str) -> None:
-    types = _content_types_for(user_id)
-    if type_name in types:
-        # Always keep at least one type selected
-        if len(types) > 1:
-            types.discard(type_name)
+    """Toggle type_name in the excluded-types set: add to exclude, remove to un-exclude."""
+    excluded = _content_types_for(user_id)
+    if type_name in excluded:
+        excluded.discard(type_name)   # un-exclude: allow this type through
     else:
-        types.add(type_name)
+        excluded.add(type_name)       # exclude: skip this type
 
 
 def _content_type_text(user_id: int) -> str:
-    selected = _content_types_for(user_id)
-    all_selected = selected == set(_ALL_CONTENT_TYPES)
+    excluded = _content_types_for(user_id)
     lines = [
-        "📦 Select Content Types",
+        "📦 Content-type filter",
         "",
-        "Choose what to migrate. Tap a type to toggle it on/off.",
+        "✅ = will migrate   ·   ☐ = will be skipped",
+        "Tap a type to toggle it.",
         "",
     ]
     for t in _ALL_CONTENT_TYPES:
-        icon = "✅" if t in selected else "☐"
+        icon = "☐" if t in excluded else "✅"
         lines.append(f"{icon} {_CONTENT_TYPE_LABELS[t]}")
-    lines += [""]
-    if all_selected:
-        lines.append("All types selected — everything will be migrated.")
+    lines.append("")
+    if not excluded:
+        lines.append("Everything will migrate (including files, GIFs, voice, audio).")
     else:
-        labels = " · ".join(_CONTENT_TYPE_LABELS[t] for t in _ALL_CONTENT_TYPES if t in selected)
-        lines.append(f"Only migrating: {labels}")
+        skipped = " · ".join(_CONTENT_TYPE_LABELS[t] for t in _ALL_CONTENT_TYPES if t in excluded)
+        lines.append(f"Will skip: {skipped}")
+        lines.append("All other types (files, GIFs, voice, audio, etc.) will still migrate.")
     return "\n".join(lines)
 
 
 def _content_type_menu(user_id: int) -> InlineKeyboardMarkup:
-    selected = _content_types_for(user_id)
+    excluded = _content_types_for(user_id)
     rows: list[list[tuple[str, str]]] = []
     for t in _ALL_CONTENT_TYPES:
-        icon = "✅" if t in selected else "☐"
+        icon = "☐" if t in excluded else "✅"
         label = f"{icon} {_CONTENT_TYPE_LABELS[t]}"
         rows.append([(label, f"sources:ctype_toggle:{t}")])
     rows += [
@@ -228,15 +230,15 @@ def _content_type_menu(user_id: int) -> InlineKeyboardMarkup:
 
 
 def _active_filter_line(path: Path) -> str:
-    """Return a one-line summary of the active content filter, or empty string."""
+    """Return a one-line summary of excluded types, or empty string when nothing excluded."""
     try:
-        active = load_content_filter(path)
-        if active is None:
+        excluded = load_content_filter(path)
+        if not excluded:   # None or empty frozenset → no exclusions
             return ""
         labels = " · ".join(
-            _CONTENT_TYPE_LABELS[t] for t in _ALL_CONTENT_TYPES if t in active
+            _CONTENT_TYPE_LABELS.get(t, t) for t in _ALL_CONTENT_TYPES if t in excluded
         )
-        return f"📦 Types: {labels}"
+        return f"🚫 Excluding: {labels}"
     except Exception:
         return ""
 
@@ -427,6 +429,17 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
     if storage.percent_used >= 80:
         level = "🚨 Critical storage" if storage.percent_used >= 90 else "⚠️ Low storage"
         lines.append(f"{level} — {format_bytes(storage.free_bytes)} free")
+
+    # ── FloodWait (Telegram rate-limit) ───────────────────────────────────
+    fw = get_floodwait()
+    if fw:
+        fw_remaining = max(
+            (v.get("cooldown_remaining_seconds", 0)
+             for v in fw.get("floodwait_operations", {}).values()),
+            default=0,
+        )
+        if fw_remaining > 0:
+            lines.append(f"⏳ Telegram rate limit — paused ~{fw_remaining}s, then resumes automatically")
 
     # ── Footer ────────────────────────────────────────────────────────────
     dest_label = "destination" if dest_count == 1 else "destinations"
@@ -1542,11 +1555,9 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             return
         if data == "sources:ctype_confirm":
             selected = _selection_for(user_id, path)
-            chosen = _content_types_for(user_id)
-            if chosen == set(_ALL_CONTENT_TYPES):
-                clear_content_filter(path)
-            else:
-                save_content_filter(path, chosen)
+            excluded = _content_types_for(user_id)  # set of excluded types
+            # save_content_filter clears the file when excluded is empty
+            save_content_filter(path, excluded)
             # Only update sources list when the user came through the Source Queue
             # selection flow (session has sources). When initiated from ▶️ Start on
             # the dashboard the sources are already saved in config — don't overwrite.
@@ -1557,7 +1568,11 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 except Exception:
                     pass
             _request_mode(config, "run")
-            filter_note = "" if chosen == set(_ALL_CONTENT_TYPES) else f" ({', '.join(_CONTENT_TYPE_LABELS[t] for t in _ALL_CONTENT_TYPES if t in chosen)})"
+            if excluded:
+                skipped = ", ".join(_CONTENT_TYPE_LABELS.get(t, t) for t in _ALL_CONTENT_TYPES if t in excluded)
+                filter_note = f" (skipping {skipped})"
+            else:
+                filter_note = ""
             await query.answer(f"Migration started{filter_note}.", show_alert=True)
             await edit(query, _dashboard_text(config, path), _menu(config))
             start_live(user_id, query.message)

@@ -13,6 +13,7 @@ from typing import Any, Awaitable, Callable
 
 from pyrogram import Client
 from pyrogram.errors import FloodWait, PhoneCodeExpired, PhoneCodeInvalid, SessionPasswordNeeded
+from app.shared_state import record_floodwait
 from pyrogram.types import Message
 
 from app.config import AppConfig, ChatSpec
@@ -112,6 +113,7 @@ class TelegramLimiter:
                     self._floodwait_seconds_by_operation[operation] = (
                         self._floodwait_seconds_by_operation.get(operation, 0) + wait
                     )
+                record_floodwait(self.floodwait_snapshot())
                 if self.logger:
                     self.logger.warning(
                         "FloodWait from Telegram during %s: pausing only %s operations for %ss",
@@ -308,20 +310,37 @@ async def resolve_chat(client: Client, limiter: TelegramLimiter, spec: ChatSpec)
 
 
 def message_media_type(message: Message) -> str:
+    """Return a canonical media-type string for the message.
+
+    Classification rules (in order):
+    - Compressed video/photo → "video" / "photo" (Telegram fields)
+    - Uncompressed file (document): inspect MIME type to reclassify
+      video/* → "video", image/* → "photo", everything else → "document"
+    - GIF/animation and round video-notes count as "video"
+    - Standalone text (no media) → "text"
+    - Everything else → "unsupported"
+    """
     if message.video:
         return "video"
     if message.photo:
         return "photo"
     if message.document:
+        mime = (message.document.mime_type or "").lower()
+        if mime.startswith("video/"):
+            return "video"
+        if mime.startswith("image/"):
+            return "photo"
         return "document"
     if message.animation:
-        return "animation"
+        # Telegram GIFs / animations → treat as video so Video filter covers them
+        return "video"
     if message.audio:
         return "audio"
     if message.voice:
         return "voice"
     if message.video_note:
-        return "video_note"
+        # Round video messages → video category
+        return "video"
     if message.text or message.caption:
         return "text"
     return "unsupported"

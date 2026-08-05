@@ -307,9 +307,11 @@ def remove_destination(index: int, config_path: str | Path = "config.yaml") -> d
 
 
 # ---------------------------------------------------------------------------
-# Per-run content-type filter
-# Stored as content_filter.json next to config.yaml.
-# Absence of the file (or an empty list) means "include all types".
+# Per-run content-type filter  (SUBTRACTIVE — stores EXCLUDED types)
+# Stored as content_filter.json next to config.yaml.  Format v2:
+#   {"v": 2, "excluded": ["photo"]}
+# Absent file  →  no filter  →  scanner uses config flags (backward-compat).
+# Empty excluded list  →  filter active, nothing excluded  →  everything passes.
 # ---------------------------------------------------------------------------
 
 _ALL_CONTENT_TYPES: frozenset[str] = frozenset({"video", "photo", "text"})
@@ -320,36 +322,47 @@ def _content_filter_path(config_path: str | Path) -> Path:
     return Path(config_path).resolve().parent / _CONTENT_FILTER_NAME
 
 
-def save_content_filter(config_path: str | Path, types: set[str] | list[str]) -> None:
-    """Persist the per-run content-type filter next to config.yaml.
+def save_content_filter(config_path: str | Path, excluded: set[str] | list[str]) -> None:
+    """Persist the subtractive content-type filter (excluded types) next to config.yaml.
 
-    Pass an empty set / list to clear the filter (same effect as remove).
+    Pass an empty set/list to clear (reverts to config-flag behaviour).
+    Types not in _ALL_CONTENT_TYPES are silently ignored.
     """
-    chosen = sorted(t for t in types if t in _ALL_CONTENT_TYPES)
+    excluded_known = sorted(t for t in excluded if t in _ALL_CONTENT_TYPES)
+    if not excluded_known:
+        _content_filter_path(config_path).unlink(missing_ok=True)
+        return
     path = _content_filter_path(config_path)
     with path.open("w", encoding="utf-8") as fh:
-        json.dump(chosen, fh)
+        json.dump({"v": 2, "excluded": excluded_known}, fh)
 
 
 def load_content_filter(config_path: str | Path) -> frozenset[str] | None:
-    """Return the active content-type filter, or *None* when all types pass.
+    """Return the set of EXCLUDED types, or *None* if no filter file exists.
 
-    None means "no filter active — include everything" so callers that do not
-    need per-type gating can skip the check entirely.
+    Semantics (SUBTRACTIVE):
+      None               → no filter active → scanner uses config flags
+      frozenset()        → filter active, nothing excluded → everything passes
+      frozenset({"photo"}) → exclude photo; all other types pass unconditionally
+
+    v1 format (plain list of included types) is deliberately ignored so stale
+    files from the old inclusive model never silently misconfigure a run.
     """
     path = _content_filter_path(config_path)
     try:
         with path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
+        # v1 format was a plain list (included types) — ignore it.
         if isinstance(data, list):
-            chosen = frozenset(str(t) for t in data if t in _ALL_CONTENT_TYPES)
-            # Empty list in the file also means "all included"
-            return chosen if chosen and chosen != _ALL_CONTENT_TYPES else None
+            return None
+        if isinstance(data, dict) and data.get("v") == 2:
+            excluded = frozenset(str(t) for t in data.get("excluded", []) if t in _ALL_CONTENT_TYPES)
+            return excluded   # may be empty frozenset = filter active, nothing excluded
     except (OSError, json.JSONDecodeError, ValueError):
         pass
     return None
 
 
 def clear_content_filter(config_path: str | Path) -> None:
-    """Remove the content-type filter file (reverts to migrating all types)."""
+    """Remove the content-type filter file (reverts to config-flag behaviour)."""
     _content_filter_path(config_path).unlink(missing_ok=True)

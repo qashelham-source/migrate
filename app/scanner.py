@@ -533,9 +533,15 @@ class Scanner:
             media_type = self._group_media_type(queued_messages)
             source_message_ids = [msg.id for msg in queued_messages]
             file_size = sum(message_file_size(msg) or 0 for msg in queued_messages) or None
-            caption = message_caption(first)
-            if caption and len(caption) > 1000:
-                caption = caption[:1000]
+            # Carry the caption from the original full group.  When the item
+            # that bears the album caption was filtered out (e.g. the first
+            # message is a photo and Photo is excluded), the caption would
+            # otherwise be silently lost.  Walk the whole group so the text
+            # is always forwarded to whichever item survives.
+            raw_caption = next(
+                (message_caption(msg) for msg in group if message_caption(msg)), None
+            )
+            caption = raw_caption[:1000] if raw_caption and len(raw_caption) > 1000 else raw_caption
             # Retain Telegram's native album copy only for a complete album.
             # A filtered subset is copied/uploaded item-by-item by the uploader.
             media_group_id = first.media_group_id if processable and len(selected) == len(group) else None
@@ -666,10 +672,12 @@ class Scanner:
 
     def _message_should_process(self, message: Message) -> bool:
         media_type = message_media_type(message)
-        # Per-run content-type filter set via the bot UI overrides config flags.
+        # Subtractive filter set via the bot UI: _content_filter is a frozenset
+        # of EXCLUDED types.  Anything not in the set passes unconditionally,
+        # bypassing the static config flags so every non-excluded type migrates.
         if self._content_filter is not None:
-            return media_type in self._content_filter
-        # Fall through to static config flags (backward-compatible default).
+            return media_type not in self._content_filter
+        # No filter file → fall through to static config flags (backward-compat).
         if media_type == "video":
             return self.config.transfer.include_videos
         if media_type == "photo":
