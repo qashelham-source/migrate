@@ -40,3 +40,5 @@ data/content_filter.json
 data/floodwait.json
 data/floodwait.json.*
 data/.floodwait.json.*
+.agents/
+.config-fix-validation*
