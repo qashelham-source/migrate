@@ -36,3 +36,6 @@ data/run_mode
 data/run_now
 data/runtime_status.json
 data/health_report.json
+data/content_filter.json
+data/floodwait.json
+data/floodwait.json.*
