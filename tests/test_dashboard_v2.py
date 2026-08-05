@@ -68,6 +68,8 @@ def test_issue_center_and_delivery_matrix(tmp_path: Path) -> None:
         issues = issue_center(db)
         assert any(item["kind"] == "job" and item["status"] == "failed" for item in issues)
         assert any(item["kind"] == "destination" and item["status"] == "paused" for item in issues)
+        snapshot = dashboard_snapshot(db, tmp_path)
+        assert snapshot["review"]["total"] == 1
         matrix = delivery_matrix(db)
         assert matrix[0]["dest_chat_id"] == "-200"
         assert matrix[0]["copied"] == 1

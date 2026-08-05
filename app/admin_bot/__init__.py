@@ -459,7 +459,7 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
     # ── FloodWait headline override ───────────────────────────────────────
     # Rate-limit is the most useful thing to show — always wins the headline
     # when Telegram is making us wait, regardless of the underlying phase.
-    _fw = get_floodwait()
+    _fw = get_floodwait(config.base_dir / "data" / "floodwait.json")
     _fw_remaining = 0
     if _fw:
         _fw_remaining = max(

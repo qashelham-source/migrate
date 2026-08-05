@@ -65,22 +65,24 @@ class TelegramLimiter:
     def floodwait_snapshot(self) -> dict[str, Any]:
         """Return lightweight limiter telemetry for status pages and diagnostics."""
         now = time.monotonic()
+        wall_now = time.time()
         operations = sorted(
             set(self._floodwait_until_by_operation)
             | set(self._floodwait_events_by_operation)
             | set(self._floodwait_seconds_by_operation)
         )
-        details = {
-            operation: {
+        details: dict[str, dict[str, Any]] = {}
+        for operation in operations:
+            cooldown_remaining = max(
+                0.0,
+                self._floodwait_until_by_operation.get(operation, 0.0) - now,
+            )
+            details[operation] = {
                 "events": self._floodwait_events_by_operation.get(operation, 0),
                 "total_wait_seconds": self._floodwait_seconds_by_operation.get(operation, 0),
-                "cooldown_remaining_seconds": max(
-                    0,
-                    int(self._floodwait_until_by_operation.get(operation, 0.0) - now),
-                ),
+                "cooldown_remaining_seconds": int(cooldown_remaining),
+                "cooldown_until_epoch": wall_now + cooldown_remaining,
             }
-            for operation in operations
-        }
         return {
             "floodwait_events": sum(item["events"] for item in details.values()),
             "floodwait_total_seconds": sum(item["total_wait_seconds"] for item in details.values()),
@@ -113,7 +115,10 @@ class TelegramLimiter:
                     self._floodwait_seconds_by_operation[operation] = (
                         self._floodwait_seconds_by_operation.get(operation, 0) + wait
                     )
-                record_floodwait(self.floodwait_snapshot())
+                record_floodwait(
+                    self.floodwait_snapshot(),
+                    self.config.base_dir / "data" / "floodwait.json",
+                )
                 if self.logger:
                     self.logger.warning(
                         "FloodWait from Telegram during %s: pausing only %s operations for %ss",
