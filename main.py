@@ -240,13 +240,12 @@ def _source_outcome(
     primary_skipped_issue_jobs = int(
         state.get("primary_skipped_issue_jobs", state["skipped_issue_jobs"])
     )
-    terminal_issues = primary_failed_jobs + primary_skipped_issue_jobs
-    if terminal_issues:
-        return CycleOutcome(
-            "blocked",
-            message="A source upload failed and needs manual review before it can be retried safely.",
-            **common,
-        )
+    # NOTE: failed and problem-skipped jobs are no longer hard blockers.
+    # With sources of thousands of posts, individual upload failures are
+    # normal.  Blocking the whole queue for a single failed job forces the
+    # owner to intervene constantly.  Instead, these jobs are collected as
+    # review_items (visible in Issue Center) and the queue advances.
+    # Only block for conditions that genuinely prevent ALL further work.
     if int(state["paused_jobs"]):
         return CycleOutcome(
             "blocked",
@@ -300,6 +299,8 @@ def _source_outcome(
     review_items = (
         int(state.get("review_items", state["verification_failed_jobs"]))
         + int(state["verification_pending_jobs"])
+        + primary_failed_jobs
+        + primary_skipped_issue_jobs
     )
     if review_items:
         review_job_id = state.get("review_job_id")
@@ -901,6 +902,18 @@ async def _run_live_service(
             trigger.source_ids = await _resolved_source_ids(config, queue, reader, limiter, logger)
 
             if command is None:
+                # Heal stale in-progress jobs BEFORE evaluating state so a crash
+                # doesn't leave sources looking blocked at startup — the owner
+                # should never have to tap Start just to trigger recovery.
+                _startup_recovery = queue.recover_in_progress()
+                if _startup_recovery.total and logger:
+                    logger.warning(
+                        "Startup recovery: reset %s interrupted job(s) "
+                        "(downloads_reset=%s, uploads_held=%s)",
+                        _startup_recovery.total,
+                        _startup_recovery.requeued_downloads,
+                        _startup_recovery.held_uploads,
+                    )
                 initial_outcome = await _write_initial_wait_status(
                     config,
                     queue,

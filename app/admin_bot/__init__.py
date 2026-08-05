@@ -369,14 +369,33 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
             else:
                 headline = f"✅ All {st_i} source(s) done"
         except (TypeError, ValueError):
-            headline = "✅ Source done — moving to next"
-    elif phase in {"downloading", "uploading", "processing", "scanning", "scan_complete"}:
+            # si absent = called after ALL sources finished (source_total written, no source_index)
+            try:
+                headline = f"✅ All {int(st)} source(s) done"
+            except (TypeError, ValueError):
+                headline = "✅ All sources done"
+    elif phase in {"downloading", "uploading", "processing", "scanning",
+                   "scan_complete", "verifying", "starting"}:
         si = status.get("source_index")
         st = status.get("source_total")
         try:
             headline = f"⚡ Running — source {int(si)}/{int(st)}"
         except (TypeError, ValueError):
             headline = "⚡ Running"
+    elif phase == "batch_pause":
+        si = status.get("source_index")
+        st = status.get("source_total")
+        try:
+            headline = f"⏸ Paused between batches — source {int(si)}/{int(st)} — resumes on its own"
+        except (TypeError, ValueError):
+            headline = "⏸ Paused between batches — resumes on its own"
+    elif phase == "queued":
+        si = status.get("source_index")
+        st = status.get("source_total")
+        try:
+            headline = f"⏸ Scan done, source {int(si)}/{int(st)} — tap ▶️ Start to upload"
+        except (TypeError, ValueError):
+            headline = "⏸ Scan done — tap ▶️ Start to upload"
     elif phase == "blocked":
         headline = "⛔ Blocked — action needed (see below)"
     elif phase == "waiting_retry":
@@ -390,10 +409,28 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
     else:
         headline = "🟢 Ready — tap ▶️ Start"
 
+    # ── DB safety net ─────────────────────────────────────────────────────
+    # The headline is derived from status.json (phase), which can lag or miss
+    # phases.  If the DB shows jobs actively in flight for any source, the
+    # headline must never say "Ready" — that contradicts what the list shows.
+    source_progress = data["source_progress"]
+    if headline in {"🟢 Ready — tap ▶️ Start",
+                    "⚙️ Not started — configure source and destination first"}:
+        any_active = any(
+            int(item.get("active_items") or 0) > 0
+            for item in source_progress
+        )
+        if any_active:
+            si = status.get("source_index")
+            st = status.get("source_total")
+            try:
+                headline = f"⚡ Running — source {int(si)}/{int(st)}"
+            except (TypeError, ValueError):
+                headline = "⚡ Running"
+
     lines = ["🤖 Migration Bot", "", headline]
 
     # ── Per-source status list ────────────────────────────────────────────
-    source_progress = data["source_progress"]
     source_total_in_status = int(status.get("source_total") or 0)
     if source_progress:
         lines.append("")
