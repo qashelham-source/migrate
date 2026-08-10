@@ -3,16 +3,19 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import time
 from pathlib import Path
 from urllib.parse import urlencode
 
 import pytest
 
 from app.admin_bot import _menu
+from app.bot_token_recovery import bot_id_from_token, load_runtime_bot_token, save_runtime_bot_token
 from app.config import load_config
 from app.db import Database
 from app.destination_manager import get_sources
-from app.mini_app import MiniAppAuthError, dashboard_payload, move_source, validate_init_data
+import app.mini_app as mini_app
+from app.mini_app import MiniAppAuthError, dashboard_payload, move_source, replace_bot_token, validate_init_data
 from app.queue import MessageQueue
 
 
@@ -29,6 +32,7 @@ telegram:
   api_id: 1
   api_hash: "test-hash"
   user_session: "user"
+  admin_ids: [1234]
   bot:
     enabled: true
     token: "{BOT_TOKEN}"
@@ -49,14 +53,14 @@ downloads:
     return path
 
 
-def _init_data(*, auth_date: int, user_id: int = 1234) -> str:
+def _init_data(*, auth_date: int, user_id: int = 1234, token: str = BOT_TOKEN) -> str:
     values = {
         "auth_date": str(auth_date),
         "query_id": "AAEAAAE",
         "user": json.dumps({"id": user_id, "first_name": "Admin"}, separators=(",", ":")),
     }
     check = "\n".join(f"{key}={values[key]}" for key in sorted(values))
-    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode("utf-8"), hashlib.sha256).digest()
+    secret = hmac.new(b"WebAppData", token.encode("utf-8"), hashlib.sha256).digest()
     values["hash"] = hmac.new(secret, check.encode("utf-8"), hashlib.sha256).hexdigest()
     return urlencode(values)
 
@@ -71,6 +75,47 @@ def test_validate_init_data_accepts_valid_and_rejects_tampering() -> None:
 
     with pytest.raises(MiniAppAuthError):
         validate_init_data(init_data, BOT_TOKEN, 60, now=10_100)
+
+
+def test_runtime_token_override_is_used_on_next_config_load(tmp_path: Path) -> None:
+    path = _write_config(tmp_path)
+    replacement = "123456:replacement-token-123456"
+
+    save_runtime_bot_token(tmp_path / "sessions", replacement)
+
+    loaded = load_config(path)
+    assert loaded.telegram.bot_token == replacement
+    assert load_runtime_bot_token(loaded.telegram.sessions_dir) == replacement
+    assert bot_id_from_token(replacement) == 123456
+
+
+def test_token_recovery_requires_same_bot_and_authorized_mini_app(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = _write_config(tmp_path)
+    config = load_config(path)
+    replacement = "123456:replacement-token-123456"
+    checked: list[tuple[str, int]] = []
+
+    monkeypatch.setattr(
+        mini_app,
+        "_verify_bot_token_with_telegram",
+        lambda token, bot_id: checked.append((token, bot_id)),
+    )
+
+    replace_bot_token(
+        config,
+        token=replacement,
+        init_data=_init_data(auth_date=int(time.time()), token=replacement),
+    )
+
+    assert checked == [(replacement, 123456)]
+    assert load_runtime_bot_token(config.telegram.sessions_dir) == replacement
+
+    with pytest.raises(mini_app.BotTokenRecoveryError, match="bukan milik"):
+        replace_bot_token(
+            config,
+            token="654321:replacement-token-123456",
+            init_data=_init_data(auth_date=int(time.time()), token=replacement),
+        )
 
 
 def test_mini_app_requires_a_public_https_url(tmp_path: Path) -> None:

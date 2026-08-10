@@ -104,6 +104,23 @@ python main.py login --session user
 
 The session is stored under `sessions/`. Never commit or share session files.
 
+## Recover a revoked bot token without SSH
+
+When the control bot token is revoked or expires, the migration worker and web
+dashboard stay separate. Open the existing **Open Mini Dashboard** button in
+the bot chat, then use **Masukkan token bot baharu**. The dashboard accepts a
+replacement only after it verifies all of the following:
+
+- Telegram accepts the token via `getMe`;
+- the token belongs to the same configured bot; and
+- the Mini App was opened by an authorized admin Telegram account.
+
+The validated replacement is kept in the protected shared `sessions` volume,
+so the crash-looping `migration-admin` container picks it up automatically on
+its next restart. The token is never returned by the dashboard. This recovery
+flow requires the Mini App to be enabled and reachable over its configured
+HTTPS URL.
+
 ## Commands
 
 ```bash
