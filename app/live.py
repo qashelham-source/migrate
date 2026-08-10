@@ -93,6 +93,28 @@ class LiveTrigger:
                 continue
         return None
 
+    async def wait_for_resume(
+        self,
+        config: AppConfig,
+        stop_event: asyncio.Event,
+    ) -> tuple[str, str] | None:
+        """Wait only for an explicit admin Start while the service is paused."""
+        while not stop_event.is_set():
+            requested = consume_run_request(config)
+            if requested:
+                # Ignore source posts that arrived while paused; Start is the
+                # explicit signal that determines the next cycle.
+                self.event.clear()
+                return requested, "admin"
+            try:
+                await asyncio.wait_for(
+                    stop_event.wait(),
+                    timeout=self.settings.poll_seconds,
+                )
+            except asyncio.TimeoutError:
+                continue
+        return None
+
     async def wait_for_retry(
         self,
         config: AppConfig,
