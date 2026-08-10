@@ -12,7 +12,17 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from pyrogram import Client
-from pyrogram.errors import FloodWait, PhoneCodeExpired, PhoneCodeInvalid, SessionPasswordNeeded
+from pyrogram.errors import (
+    AuthKeyInvalid,
+    AuthKeyUnregistered,
+    FloodWait,
+    PhoneCodeExpired,
+    PhoneCodeInvalid,
+    SessionPasswordNeeded,
+    SessionRevoked,
+    UserDeactivated,
+    UserDeactivatedBan,
+)
 from app.shared_state import record_floodwait
 from pyrogram.types import Message
 
@@ -144,6 +154,22 @@ class TelegramLimiter:
         return await self._call_with_retry(operation, fn, *args, **kwargs)
 
 
+class SessionInvalidError(RuntimeError):
+    """Raised when a Telegram session is permanently revoked or otherwise invalid.
+
+    Callers should treat this as a hard stop — write the error to the status
+    store, sleep to suppress Docker's rapid-restart loop, then exit cleanly.
+    """
+
+    def __init__(self, session_name: str, original: Exception) -> None:
+        self.session_name = session_name
+        self.original = original
+        super().__init__(
+            f"Session '{session_name}' is invalid ({original.__class__.__name__}). "
+            f"Re-login with: python main.py login --session {session_name}"
+        )
+
+
 def install_stop_handlers(stop_event: asyncio.Event) -> None:
     def request_stop(*_: object) -> None:
         stop_event.set()
@@ -161,7 +187,12 @@ async def start_client_with_floodwait(
     label: str,
     logger: Any | None = None,
 ) -> None:
-    """Start a Pyrogram client without converting Telegram's required wait into a restart loop."""
+    """Start a Pyrogram client without converting Telegram's required wait into a restart loop.
+
+    Raises SessionInvalidError immediately (without retrying) when the session
+    is permanently revoked or otherwise dead, so the caller can handle it
+    gracefully instead of crashing and triggering a Docker restart loop.
+    """
     while True:
         try:
             await client.start()
@@ -179,6 +210,29 @@ async def start_client_with_floodwait(
             with suppress(Exception):
                 await client.stop()
             await asyncio.sleep(wait_seconds)
+        except (
+            SessionRevoked,
+            AuthKeyUnregistered,
+            AuthKeyInvalid,
+            UserDeactivated,
+            UserDeactivatedBan,
+        ) as exc:
+            # These errors are permanent — retrying makes things worse.
+            # Raise a typed exception so the caller can write a clear status
+            # and sleep before exiting, avoiding a rapid Docker restart loop.
+            session_name = str(getattr(client, "name", label))
+            if logger:
+                logger.critical(
+                    "Session '%s' has been revoked or invalidated by Telegram (%s). "
+                    "Container will sleep before exiting to avoid restart storm. "
+                    "Fix: python main.py login --session %s",
+                    session_name,
+                    exc.__class__.__name__,
+                    session_name,
+                )
+            with suppress(Exception):
+                await client.stop()
+            raise SessionInvalidError(session_name, exc) from exc
 
 
 def make_user_client(config: AppConfig) -> Client:

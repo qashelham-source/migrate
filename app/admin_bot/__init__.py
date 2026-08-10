@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import tempfile
 import time
@@ -902,7 +903,12 @@ def _toggle_selection(selected: list[str], chat: str) -> bool:
 
 
 def _snapshot_session_database(source: Path, destination: Path) -> None:
-    """Create an isolated SQLite snapshot without locking the live Telegram session."""
+    """Create an isolated SQLite snapshot without locking the live Telegram session.
+
+    Kept for compatibility but no longer called by _scan_channels or
+    _latest_source_position — those now use the shared channel cache and
+    the local database respectively, avoiding concurrent auth-key usage.
+    """
     if not source.is_file():
         raise RuntimeError("Telegram session was not found. Run login first.")
 
@@ -927,62 +933,34 @@ def _snapshot_session_database(source: Path, destination: Path) -> None:
 
 
 async def _scan_channels(config: AppConfig, user_id: int) -> list[dict[str, Any]]:
-    sessions_dir = config.telegram.sessions_dir
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    source_session = sessions_dir / f"{config.telegram.user_session}.session"
+    """Return the channel list from the shared cache written by migration-manager.
 
-    with tempfile.TemporaryDirectory(prefix="channel-scan-", dir=str(sessions_dir)) as temp_dir:
-        workdir = Path(temp_dir)
-        session_name = f"channel-scan-{user_id}"
-        await asyncio.to_thread(
-            _snapshot_session_database,
-            source_session,
-            workdir / f"{session_name}.session",
-        )
-        client = Client(
-            name=session_name,
-            api_id=config.telegram.api_id,
-            api_hash=config.telegram.api_hash,
-            workdir=str(workdir),
-            no_updates=True,
-            max_concurrent_transmissions=1,
-        )
-        channels: list[dict[str, Any]] = []
-        started = False
-        try:
-            await client.start()
-            started = True
-            async for dialog in client.get_dialogs():
-                chat = dialog.chat
-                kind = str(getattr(chat, "type", "")).lower()
-                if not any(value in kind for value in ("channel", "group", "supergroup")):
-                    continue
-                chat_id = str(chat.id)
-                username = str(chat.username or "").strip() or None
-                title = str(chat.title or username or chat.id)
-                can_destination = False
-                access = "🟢 Ready"
-                try:
-                    member = await client.get_chat_member(chat.id, "me")
-                    status = str(getattr(member, "status", "")).lower()
-                    can_destination = "owner" in status or "administrator" in status
-                except Exception:
-                    access = "🟡 Limited"
-                channels.append({
-                    "chat": chat_id,
-                    "title": title,
-                    "username": username,
-                    "kind": "Channel" if "channel" in kind else "Group",
-                    "can_source": True,
-                    "can_destination": can_destination,
-                    "access": access,
-                })
-        finally:
-            if started:
-                await client.stop()
+    The manager exports this file at startup (via _dump_channel_cache in main.py)
+    so the admin bot never needs to open a second Pyrogram client with the same
+    auth key, which was the structural cause of SESSION_REVOKED loops.
 
-    channels.sort(key=lambda item: (item["title"].lower(), item["chat"]))
-    return channels
+    Raises RuntimeError if the cache file is missing (manager has not run yet)
+    or unreadable.
+    """
+    cache_path = config.queue.db_path.parent / "channel_cache.json"
+    if not cache_path.is_file():
+        raise RuntimeError(
+            "Channel list not available yet.\n\n"
+            "The migration manager writes this cache at startup. "
+            "Start the manager once, wait a few seconds, then tap Scan again."
+        )
+    try:
+        data = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise RuntimeError(
+            f"Could not read channel cache ({exc}). "
+            "Restart the migration manager to regenerate it."
+        ) from exc
+    if not isinstance(data, list):
+        raise RuntimeError(
+            "Channel cache format is invalid. Restart the migration manager."
+        )
+    return data
 
 
 async def _latest_source_position(
@@ -990,40 +968,55 @@ async def _latest_source_position(
     user_id: int,
     chat: str | int,
 ) -> tuple[int, int]:
-    """Read the current source tip from an isolated user-session snapshot."""
-    sessions_dir = config.telegram.sessions_dir
-    sessions_dir.mkdir(parents=True, exist_ok=True)
-    source_session = sessions_dir / f"{config.telegram.user_session}.session"
+    """Return (source_chat_id, latest_message_id) using only the local database.
 
-    with tempfile.TemporaryDirectory(prefix="source-tip-", dir=str(sessions_dir)) as temp_dir:
-        workdir = Path(temp_dir)
-        session_name = f"source-tip-{user_id}"
-        await asyncio.to_thread(
-            _snapshot_session_database,
-            source_session,
-            workdir / f"{session_name}.session",
+    Replaces the old approach of copying the user session and opening a second
+    Pyrogram client, which caused concurrent auth-key usage and SESSION_REVOKED.
+
+    The latest message ID is taken from the scan checkpoint (the last message
+    the scanner reached), which is the correct anchor for 'New Posts Only'.
+    Falls back to the highest source_message_id already in the messages table,
+    then to 0 (start from beginning) if the source has never been scanned.
+    """
+    chat_str = str(chat).strip()
+    db = _database(config)
+    try:
+        # Resolve numeric chat ID from source_registry
+        source_id: int | None = None
+        rows = db.query(
+            "SELECT source_chat_id FROM source_registry WHERE source_chat_id = ? LIMIT 1",
+            (chat_str,),
         )
-        client = Client(
-            name=session_name,
-            api_id=config.telegram.api_id,
-            api_hash=config.telegram.api_hash,
-            workdir=str(workdir),
-            no_updates=True,
-            max_concurrent_transmissions=1,
+        if rows:
+            source_id = int(rows[0]["source_chat_id"])
+        else:
+            # Fallback: treat the value as a raw integer chat ID
+            try:
+                source_id = int(chat_str)
+            except ValueError:
+                source_id = None
+
+        if source_id is None:
+            raise RuntimeError(
+                f"Source '{chat}' not found in the local registry. "
+                "Run a full scan first so the source is registered."
+            )
+
+        # Prefer the scan checkpoint — it is the last message the scanner reached
+        checkpoint_row = db.get_scan_checkpoint(source_id)
+        if checkpoint_row is not None:
+            latest = int(checkpoint_row["last_scanned_message_id"] or 0)
+            return source_id, latest
+
+        # Fallback: highest source_message_id already queued
+        row = db.query_one(
+            "SELECT MAX(source_message_id) AS latest FROM messages WHERE source_chat_id = ?",
+            (str(source_id),),
         )
-        started = False
-        try:
-            await client.start()
-            started = True
-            source = await client.get_chat(chat)
-            latest = 0
-            async for message in client.get_chat_history(source.id, limit=1):
-                latest = int(getattr(message, "id", 0) or 0)
-                break
-            return int(source.id), latest
-        finally:
-            if started:
-                await client.stop()
+        latest = int(row["latest"] or 0) if row and row["latest"] is not None else 0
+        return source_id, latest
+    finally:
+        db.close()
 
 
 def _stored_source_titles(path: Path) -> dict[str, str]:

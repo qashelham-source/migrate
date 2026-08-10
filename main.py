@@ -5,7 +5,9 @@ import asyncio
 from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+import json
 from pathlib import Path
+import time
 from typing import Any
 
 from pyrogram import Client
@@ -24,6 +26,7 @@ from app.release3_uploader import Release3Uploader
 from app.scanner import Scanner
 from app.source_registry import refresh_source_registry
 from app.telegram_client import (
+    SessionInvalidError,
     TelegramLimiter,
     install_stop_handlers,
     interactive_login,
@@ -331,6 +334,65 @@ def _retry_wait_seconds(outcome: CycleOutcome) -> float:
         except (TypeError, ValueError):
             pass
     return 30.0
+
+
+async def _dump_channel_cache(
+    config: AppConfig,
+    reader: "Client",
+    stop_event: asyncio.Event,
+    logger: Any | None = None,
+) -> None:
+    """Export all user dialogs to a shared JSON file so the admin bot never needs its own session.
+
+    Runs as a background task immediately after startup.  The admin bot reads
+    this file instead of copying the user session and opening a concurrent
+    Pyrogram client — which was a structural cause of SESSION_REVOKED loops.
+
+    can_destination is set True for every entry (optimistic) because determining
+    admin status requires one API call per channel, which is too slow for
+    background export.  The migration worker will surface a clear error if the
+    user picks a channel they cannot post to.
+    """
+    cache_path = config.queue.db_path.parent / "channel_cache.json"
+    channels: list[dict[str, Any]] = []
+    try:
+        async for dialog in reader.get_dialogs():
+            if stop_event.is_set():
+                break
+            chat = getattr(dialog, "chat", None)
+            if chat is None:
+                continue
+            kind = str(getattr(chat, "type", "")).lower()
+            if not any(v in kind for v in ("channel", "group", "supergroup")):
+                continue
+            username = str(getattr(chat, "username", "") or "").strip() or None
+            title = str(getattr(chat, "title", None) or username or chat.id)
+            channels.append({
+                "chat": str(chat.id),
+                "title": title,
+                "username": username,
+                "kind": "Channel" if "channel" in kind else "Group",
+                "can_source": True,
+                "can_destination": True,
+                "access": "🟢 Ready",
+                "cached_at": int(time.time()),
+            })
+    except Exception as exc:
+        if logger:
+            logger.warning("Channel cache export stopped early: %s", exc)
+        if not channels:
+            return  # keep existing cache rather than overwriting with empty
+
+    channels.sort(key=lambda c: (c["title"].lower(), c["chat"]))
+    tmp = cache_path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(channels, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(cache_path)
+        if logger:
+            logger.info("Channel cache written: %d channels → %s", len(channels), cache_path)
+    except OSError as exc:
+        if logger:
+            logger.warning("Could not write channel cache: %s", exc)
 
 
 async def warm_dialog_cache(
@@ -1108,6 +1170,12 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
             logger.info("Reader session: %s (%s)", me.first_name, me.id)
 
             await warm_dialog_cache(config, reader, stop_event, logger)
+            # Export all dialogs to a shared file so the admin bot can show the
+            # channel picker without opening a second concurrent Pyrogram client.
+            asyncio.create_task(
+                _dump_channel_cache(config, reader, stop_event, logger),
+                name="channel-cache-dump",
+            )
 
             bot = make_bot_client(config)
             writer_me = me
@@ -1164,6 +1232,30 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
                     paused=paused,
                     **queue.counts_by_status(),
                 )
+    except SessionInvalidError as exc:
+        # Session is permanently dead — do NOT re-raise, which would crash the
+        # process and let Docker restart it every few seconds with the same
+        # broken session.  Instead: write a clear status, sleep 30 minutes so
+        # the restart loop is at most 2×/hour, then exit cleanly.
+        write_status(
+            config,
+            "session_invalid",
+            message=(
+                f"⛔ Session revoked — re-login required. "
+                f"Run: python main.py login --session {exc.session_name}"
+            ),
+            error=str(exc)[:500],
+            **queue.counts_by_status(),
+        )
+        if logger:
+            logger.critical(
+                "Session permanently invalid (%s). "
+                "Sleeping 30 min to suppress Docker restart storm. "
+                "Fix: python main.py login --session %s",
+                exc.original.__class__.__name__,
+                exc.session_name,
+            )
+        await asyncio.sleep(1800)  # 30 min — Docker restart interval, not a retry
     except Exception as exc:
         write_status(
             config,
