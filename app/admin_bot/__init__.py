@@ -33,7 +33,15 @@ from app.advanced import (
 )
 from app.admin_auth import authorized_ids as _authorized_ids, is_authorized as _is_authorized
 from app.config import AppConfig, load_config
-from app.control import clear_stop, is_active_phase, read_status, request_stop, write_status
+from app.control import (
+    clear_pause,
+    clear_stop,
+    is_stoppable_phase,
+    read_status,
+    request_pause,
+    request_stop,
+    write_status,
+)
 from app.dashboard_v2 import active_source_progress, dashboard_snapshot, format_bytes, format_eta, issue_center
 from app.db import Database
 from app.destination_manager import (
@@ -284,6 +292,7 @@ def _queue_counts(config: AppConfig) -> dict[str, int]:
 
 
 def _request_mode(config: AppConfig, mode: str) -> None:
+    clear_pause(config)
     clear_stop(config)
     request_run_mode(config, mode)
 
@@ -1945,10 +1954,16 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await query.answer("Command scheduled.", show_alert=True)
             return
         if data == "stop:current":
-            if is_active_phase(read_status(config).get("phase")):
+            if is_stoppable_phase(read_status(config).get("phase")):
+                request_pause(config)
                 request_stop(config)
-                write_status(config, "stopping", message="Stop request sent. Waiting for the current operation to finish.")
-                await query.answer("Stop request sent.", show_alert=True)
+                write_status(
+                    config,
+                    "stopping",
+                    message="Stop request sent. Migration will stay paused until Start is pressed.",
+                    paused=True,
+                )
+                await query.answer("Stopped and paused. Press Start to resume.", show_alert=True)
             else:
                 await query.answer("No active migration.", show_alert=True)
             await edit(query, _dashboard_text(config, path), _menu(config))
