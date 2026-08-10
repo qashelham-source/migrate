@@ -4,10 +4,14 @@ import asyncio
 from types import SimpleNamespace
 
 from app.control import (
+    clear_pause,
     clear_stop,
     is_active_phase,
+    is_pause_requested,
     is_stop_requested,
+    is_stoppable_phase,
     read_status,
+    request_pause,
     request_stop,
     watch_stop_request,
     write_status,
@@ -33,20 +37,37 @@ def test_status_round_trip(tmp_path):
     assert status["updated_at"]
 
 
-def test_stop_marker_and_phase_helpers(tmp_path):
+def test_stop_and_pause_markers_and_phase_helpers(tmp_path):
     config = make_config(tmp_path)
 
     clear_stop(config)
+    clear_pause(config)
     assert not is_stop_requested(config)
+    assert not is_pause_requested(config)
+
+    runtime = tmp_path / "data"
+    runtime.mkdir(parents=True, exist_ok=True)
+    (runtime / "run_now").touch()
+    (runtime / "run_mode").write_text("run", encoding="utf-8")
 
     request_stop(config)
     assert is_stop_requested(config)
+    assert not (runtime / "run_now").exists()
+    assert not (runtime / "run_mode").exists()
+
+    request_pause(config)
+    assert is_pause_requested(config)
     assert is_active_phase("scanning")
     assert is_active_phase("uploading")
+    assert is_stoppable_phase("watching")
     assert not is_active_phase("idle")
 
     clear_stop(config)
     assert not is_stop_requested(config)
+    assert is_pause_requested(config)
+
+    clear_pause(config)
+    assert not is_pause_requested(config)
 
 
 def test_stop_watcher_sets_event(tmp_path):
