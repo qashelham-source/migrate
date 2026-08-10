@@ -36,6 +36,7 @@ from app.config import AppConfig, load_config
 from app.control import (
     clear_pause,
     clear_stop,
+    is_active_phase,
     is_stoppable_phase,
     read_status,
     request_pause,
