@@ -12,7 +12,7 @@ from pyrogram import Client
 
 from app.admin_bot import run_admin_bot
 from app.config import AppConfig, load_config
-from app.control import clear_stop, watch_stop_request, write_status
+from app.control import clear_stop, is_pause_requested, watch_stop_request, write_status
 from app.db import Database
 from app.destination_manager import add_destination, list_destinations, remove_destination
 from app.health import run_health_check
@@ -902,6 +902,22 @@ async def _run_live_service(
             trigger.source_ids = await _resolved_source_ids(config, queue, reader, limiter, logger)
 
             if command is None:
+                if is_pause_requested(config):
+                    write_status(
+                        config,
+                        "stopped",
+                        message="Migration is paused. Tap Start to resume.",
+                        paused=True,
+                        live_watcher=True,
+                        watched_sources=len(trigger.source_ids),
+                        **queue.counts_by_status(),
+                    )
+                    next_trigger = await trigger.wait_for_resume(config, stop_event)
+                    if next_trigger is None:
+                        break
+                    command, reason = next_trigger
+                    continue
+
                 # Heal stale in-progress jobs BEFORE evaluating state so a crash
                 # doesn't leave sources looking blocked at startup — the owner
                 # should never have to tap Start just to trigger recovery.
@@ -1136,10 +1152,16 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
                 )
 
             if stop_event.is_set():
+                paused = is_pause_requested(config)
                 write_status(
                     config,
                     "stopped",
-                    message="Migration stopped safely.",
+                    message=(
+                        "Migration is paused. Tap Start to resume."
+                        if paused
+                        else "Migration stopped safely."
+                    ),
+                    paused=paused,
                     **queue.counts_by_status(),
                 )
     except Exception as exc:
