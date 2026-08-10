@@ -23,7 +23,7 @@ from pyrogram.errors import (
     UserDeactivated,
     UserDeactivatedBan,
 )
-from app.shared_state import record_floodwait
+from app.shared_state import get_floodwait, record_floodwait
 from pyrogram.types import Message
 
 from app.config import AppConfig, ChatSpec
@@ -54,6 +54,49 @@ class TelegramLimiter:
         self._floodwait_until_by_operation: dict[str, float] = {}
         self._floodwait_events_by_operation: dict[str, int] = {}
         self._floodwait_seconds_by_operation: dict[str, int] = {}
+        self._restore_persisted_floodwait()
+
+    def _restore_persisted_floodwait(self) -> None:
+        """Honour an active Telegram cooldown after a manager restart.
+
+        The shared snapshot uses a wall-clock deadline so the admin container
+        can display it.  The limiter uses monotonic time, therefore a new
+        process must translate the remaining wall-clock duration before it
+        makes any Telegram call.  Without this, restarting a container during
+        a FloodWait immediately retries the same operation and can extend the
+        Telegram penalty.
+        """
+        snapshot = get_floodwait(self.config.base_dir / "data" / "floodwait.json")
+        operations = snapshot.get("floodwait_operations")
+        if not isinstance(operations, dict):
+            return
+
+        now = time.monotonic()
+        restored: list[str] = []
+        for raw_operation, raw_details in operations.items():
+            if not isinstance(raw_details, dict):
+                continue
+            operation = str(raw_operation).strip()
+            if not operation:
+                continue
+            try:
+                events = max(0, int(raw_details.get("events") or 0))
+                total_wait = max(0, int(raw_details.get("total_wait_seconds") or 0))
+                remaining = max(0, int(raw_details.get("cooldown_remaining_seconds") or 0))
+            except (TypeError, ValueError):
+                continue
+
+            self._floodwait_events_by_operation[operation] = events
+            self._floodwait_seconds_by_operation[operation] = total_wait
+            if remaining > 0:
+                self._floodwait_until_by_operation[operation] = now + remaining
+                restored.append(f"{operation} ({remaining}s)")
+
+        if restored and self.logger:
+            self.logger.warning(
+                "Restored active Telegram FloodWait cooldown(s) after restart: %s",
+                ", ".join(restored),
+            )
 
     async def wait(self, operation: str) -> None:
         while True:
