@@ -336,6 +336,15 @@ def _retry_wait_seconds(outcome: CycleOutcome) -> float:
     return 30.0
 
 
+async def _wait_for_stop_or_delay(stop_event: asyncio.Event, delay_seconds: float) -> bool:
+    """Wait for a retry delay, returning True when shutdown was requested first."""
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=max(0.0, delay_seconds))
+    except asyncio.TimeoutError:
+        return False
+    return True
+
+
 async def _dump_channel_cache(
     config: AppConfig,
     reader: "Client",
@@ -354,45 +363,64 @@ async def _dump_channel_cache(
     user picks a channel they cannot post to.
     """
     cache_path = config.queue.db_path.parent / "channel_cache.json"
-    channels: list[dict[str, Any]] = []
-    try:
-        async for dialog in reader.get_dialogs():
-            if stop_event.is_set():
-                break
-            chat = getattr(dialog, "chat", None)
-            if chat is None:
-                continue
-            kind = str(getattr(chat, "type", "")).lower()
-            if not any(v in kind for v in ("channel", "group", "supergroup")):
-                continue
-            username = str(getattr(chat, "username", "") or "").strip() or None
-            title = str(getattr(chat, "title", None) or username or chat.id)
-            channels.append({
-                "chat": str(chat.id),
-                "title": title,
-                "username": username,
-                "kind": "Channel" if "channel" in kind else "Group",
-                "can_source": True,
-                "can_destination": True,
-                "access": "🟢 Ready",
-                "cached_at": int(time.time()),
-            })
-    except Exception as exc:
-        if logger:
-            logger.warning("Channel cache export stopped early: %s", exc)
-        if not channels:
-            return  # keep existing cache rather than overwriting with empty
+    retry_number = 0
 
-    channels.sort(key=lambda c: (c["title"].lower(), c["chat"]))
-    tmp = cache_path.with_suffix(".json.tmp")
-    try:
-        tmp.write_text(json.dumps(channels, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(cache_path)
-        if logger:
-            logger.info("Channel cache written: %d channels → %s", len(channels), cache_path)
-    except OSError as exc:
-        if logger:
-            logger.warning("Could not write channel cache: %s", exc)
+    while not stop_event.is_set():
+        channels: list[dict[str, Any]] = []
+        try:
+            async for dialog in reader.get_dialogs():
+                if stop_event.is_set():
+                    return
+                chat = getattr(dialog, "chat", None)
+                if chat is None:
+                    continue
+                kind = str(getattr(chat, "type", "")).lower()
+                if not any(v in kind for v in ("channel", "group", "supergroup")):
+                    continue
+                username = str(getattr(chat, "username", "") or "").strip() or None
+                title = str(getattr(chat, "title", None) or username or chat.id)
+                channels.append({
+                    "chat": str(chat.id),
+                    "title": title,
+                    "username": username,
+                    "kind": "Channel" if "channel" in kind else "Group",
+                    "can_source": True,
+                    "can_destination": True,
+                    "access": "🟢 Ready",
+                    "cached_at": int(time.time()),
+                })
+        except OSError as exc:
+            # Pyrogram has its own short TCP retry loop. If that loop is exhausted,
+            # keep this background task alive and try a fresh dialog request later.
+            # A transient Telegram/DC reset must not leave the control panel without
+            # a channel picker until the whole container is manually restarted.
+            retry_number += 1
+            delay_seconds = min(60, 5 * (2 ** min(retry_number - 1, 4)))
+            if logger:
+                logger.warning(
+                    "Channel cache export lost its Telegram connection (%s); retrying in %ss",
+                    exc,
+                    delay_seconds,
+                )
+            if await _wait_for_stop_or_delay(stop_event, delay_seconds):
+                return
+            continue
+        except Exception as exc:
+            if logger:
+                logger.warning("Channel cache export stopped early: %s", exc)
+            return  # preserve an existing cache rather than replacing it with a bad result
+
+        channels.sort(key=lambda c: (c["title"].lower(), c["chat"]))
+        tmp = cache_path.with_suffix(".json.tmp")
+        try:
+            tmp.write_text(json.dumps(channels, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(cache_path)
+            if logger:
+                logger.info("Channel cache written: %d channels → %s", len(channels), cache_path)
+        except OSError as exc:
+            if logger:
+                logger.warning("Could not write channel cache: %s", exc)
+        return
 
 
 async def warm_dialog_cache(

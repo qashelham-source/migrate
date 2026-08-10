@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
 from app.config import ChatSpec
 from app.db import Database
-from main import choose_writer_for_destinations, warm_dialog_cache
+import main as migration_main
+from main import _dump_channel_cache, choose_writer_for_destinations, warm_dialog_cache
 
 
 class DummyLimiter:
@@ -34,6 +36,22 @@ class DummyDialogClient:
         self.calls += 1
         for chat_id in self.chat_ids:
             yield SimpleNamespace(chat=SimpleNamespace(id=chat_id))
+
+
+class FlakyDialogClient(DummyDialogClient):
+    async def get_dialogs(self):  # type: ignore[no-untyped-def]
+        self.calls += 1
+        if self.calls == 1:
+            raise ConnectionResetError("Connection lost")
+        for chat_id in self.chat_ids:
+            yield SimpleNamespace(
+                chat=SimpleNamespace(
+                    id=chat_id,
+                    type="channel",
+                    username=None,
+                    title=f"Channel {chat_id}",
+                )
+            )
 
 
 def test_writer_falls_back_to_reader_for_private_destination() -> None:
@@ -98,6 +116,32 @@ def test_dialog_cache_warmup_can_be_disabled(tmp_path: Path) -> None:
     assert reader.calls == 0
     assert loaded == 0
     assert found == set()
+
+
+def test_channel_cache_retries_after_a_transient_connection_reset(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def no_wait_for_stop(event: asyncio.Event, timeout: float) -> bool:
+        return False
+
+    monkeypatch.setattr(migration_main, "_wait_for_stop_or_delay", no_wait_for_stop)
+    reader = FlakyDialogClient([-1003941419294])
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    config = SimpleNamespace(queue=SimpleNamespace(db_path=data_dir / "migration.sqlite3"))
+
+    asyncio.run(
+        _dump_channel_cache(
+            config,  # type: ignore[arg-type]
+            reader,  # type: ignore[arg-type]
+            asyncio.Event(),
+        )
+    )
+
+    cache = json.loads((data_dir / "channel_cache.json").read_text(encoding="utf-8"))
+    assert reader.calls == 2
+    assert cache[0]["chat"] == "-1003941419294"
 
 
 def test_peer_id_failures_are_returned_to_pending(tmp_path: Path) -> None:
