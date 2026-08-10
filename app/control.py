@@ -36,6 +36,10 @@ def _stop_path(config: AppConfig) -> Path:
     return _runtime_dir(config) / "stop_requested"
 
 
+def _pause_path(config: AppConfig) -> Path:
+    return _runtime_dir(config) / "paused"
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -73,9 +77,25 @@ def read_status(config: AppConfig) -> dict[str, Any]:
     return {"phase": "idle", "updated_at": None, "message": "No active cycle yet."}
 
 
+def request_pause(config: AppConfig) -> None:
+    _pause_path(config).touch()
+
+
+def clear_pause(config: AppConfig) -> None:
+    _pause_path(config).unlink(missing_ok=True)
+
+
+def is_pause_requested(config: AppConfig) -> bool:
+    return _pause_path(config).exists()
+
+
 def request_stop(config: AppConfig) -> None:
-    path = _stop_path(config)
-    path.touch()
+    _stop_path(config).touch()
+    # A Stop request must invalidate a queued Start request. Otherwise a
+    # restart can consume the stale command and immediately run again.
+    runtime = _runtime_dir(config)
+    for name in ("run_now", "run_mode"):
+        (runtime / name).unlink(missing_ok=True)
 
 
 def clear_stop(config: AppConfig) -> None:
@@ -90,6 +110,10 @@ def is_active_phase(phase: str | None) -> bool:
     return str(phase or "").lower() in ACTIVE_PHASES
 
 
+def is_stoppable_phase(phase: str | None) -> bool:
+    return str(phase or "").lower() in (ACTIVE_PHASES | {"watching"})
+
+
 async def watch_stop_request(
     config: AppConfig,
     stop_event: asyncio.Event,
@@ -101,6 +125,7 @@ async def watch_stop_request(
                 config,
                 "stopping",
                 message="Stop request received. Waiting for the current Telegram operation to finish.",
+                paused=True,
             )
             stop_event.set()
             return
