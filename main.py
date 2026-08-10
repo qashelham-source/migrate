@@ -36,6 +36,7 @@ from app.telegram_client import (
     start_client_with_floodwait,
     update_account_cache,
 )
+from app.temp_cleanup import reap_abandoned_active_job_dirs
 from app.worker import Verifier, Worker
 
 
@@ -1162,6 +1163,13 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
         recovery = queue.recover_in_progress()
         cache_mismatches = queue.recover_cached_file_id_mismatches()
         cancelled = queue.cancel_terminal_issues()
+        if command == "serve":
+            # The normal uploader deletes active/job-<id> in a finally block.
+            # A force-stop skips that cleanup, so run this only after recovery
+            # has released every interrupted database lease at manager startup.
+            temp_cleanup = reap_abandoned_active_job_dirs(config.downloads.active_dir, logger)
+        else:
+            temp_cleanup = None
         if recovery.total and logger:
             logger.warning(
                 "Recovered interrupted queue state: downloads=%s uploads_held=%s",
@@ -1175,6 +1183,11 @@ async def run_with_clients(config: AppConfig, command: str, config_path: str | P
             )
         if cancelled and logger:
             logger.info("Cancelled %s terminal migration job(s) from the live queue", cancelled)
+        if temp_cleanup and temp_cleanup.failed and logger:
+            logger.warning(
+                "Startup temp cleanup left %s directory/directories for manual review",
+                temp_cleanup.failed,
+            )
 
         clear_stop(config)
         write_status(
