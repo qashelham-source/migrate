@@ -9,9 +9,16 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlsplit
+from urllib.error import HTTPError, URLError
+from urllib.parse import parse_qsl, quote, urlsplit
+from urllib.request import Request, urlopen
 
 from app.admin_auth import is_authorized
+from app.bot_token_recovery import (
+    bot_id_from_token,
+    effective_bot_token,
+    save_runtime_bot_token,
+)
 from app.config import AppConfig
 from app.control import is_active_phase, read_status
 from app.dashboard_v2 import (
@@ -29,6 +36,10 @@ from app.queue import MessageQueue
 
 class MiniAppAuthError(ValueError):
     """Raised when Telegram Mini App launch data cannot be trusted."""
+
+
+class BotTokenRecoveryError(ValueError):
+    """Raised for a safe, user-facing bot-token recovery failure."""
 
 
 _CHAT_ID_PATTERN = re.compile(r"(?<!\w)-100\d{5,}")
@@ -93,6 +104,68 @@ def validate_init_data(
         raise MiniAppAuthError("Telegram launch data is missing a valid user")
     user["id"] = user_id
     return user
+
+
+def _verify_bot_token_with_telegram(token: str, expected_bot_id: int) -> None:
+    """Ensure a submitted token is live and belongs to the configured bot.
+
+    ``initData`` validation alone cannot validate a newly supplied secret: a
+    caller that knows an arbitrary string could manufacture an HMAC for it.
+    Telegram's getMe response proves that the token is real before we accept
+    its initData signature.
+    """
+    endpoint = "https://api.telegram.org/bot" + quote(token, safe=":") + "/getMe"
+    request = Request(endpoint, headers={"Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=12) as response:  # noqa: S310 - fixed Telegram API origin
+            raw = response.read(65_537)
+    except (HTTPError, URLError, TimeoutError, OSError):
+        raise BotTokenRecoveryError("Token bot tidak dapat disahkan dengan Telegram.") from None
+
+    if len(raw) > 65_536:
+        raise BotTokenRecoveryError("Token bot tidak dapat disahkan dengan Telegram.")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+        actual_bot_id = int(payload["result"]["id"])
+    except (TypeError, ValueError, KeyError, UnicodeDecodeError, json.JSONDecodeError):
+        raise BotTokenRecoveryError("Token bot tidak sah atau telah dibatalkan.") from None
+    if payload.get("ok") is not True or actual_bot_id != expected_bot_id:
+        raise BotTokenRecoveryError("Token itu bukan milik bot kawalan ini.")
+
+
+def replace_bot_token(
+    config: AppConfig,
+    *,
+    token: str,
+    init_data: str,
+) -> None:
+    """Validate and atomically activate a replacement token from the Mini App."""
+    candidate = str(token or "").strip()
+    expected_bot_id = bot_id_from_token(
+        effective_bot_token(config.telegram.bot_token, config.telegram.sessions_dir)
+    )
+    candidate_bot_id = bot_id_from_token(candidate)
+    if expected_bot_id is None or candidate_bot_id is None:
+        raise BotTokenRecoveryError("Format token bot tidak sah.")
+    if candidate_bot_id != expected_bot_id:
+        raise BotTokenRecoveryError("Token itu bukan milik bot kawalan ini.")
+
+    _verify_bot_token_with_telegram(candidate, expected_bot_id)
+    try:
+        user = validate_init_data(
+            init_data,
+            candidate,
+            config.mini_app.auth_max_age_seconds,
+        )
+    except MiniAppAuthError:
+        raise BotTokenRecoveryError("Sahkan semula melalui Mini App bot ini, kemudian cuba lagi.") from None
+    if not is_authorized(config, int(user["id"])):
+        raise BotTokenRecoveryError("Akaun Telegram ini bukan admin yang dibenarkan.")
+
+    try:
+        save_runtime_bot_token(config.telegram.sessions_dir, candidate)
+    except OSError:
+        raise BotTokenRecoveryError("Token tidak dapat disimpan. Cuba semula sebentar lagi.") from None
 
 
 def _title(value: Any, chat: str) -> str:
@@ -334,7 +407,7 @@ def _handler_for(config: AppConfig, config_path: str | Path) -> type[BaseHTTPReq
             try:
                 user = validate_init_data(
                     self.headers.get("X-Telegram-Init-Data", ""),
-                    config.telegram.bot_token,
+                    effective_bot_token(config.telegram.bot_token, config.telegram.sessions_dir),
                     config.mini_app.auth_max_age_seconds,
                 )
             except MiniAppAuthError:
@@ -384,10 +457,35 @@ def _handler_for(config: AppConfig, config_path: str | Path) -> type[BaseHTTPReq
             if not config.mini_app.enabled:
                 self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Mini App belum diaktifkan."})
                 return
+            path = urlsplit(self.path).path
+            if path == "/api/bot-token/recover":
+                body = self._read_json()
+                if body is None:
+                    return
+                token = body.get("bot_token")
+                if not isinstance(token, str) or len(token) > 512:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": "Token bot tidak sah."})
+                    return
+                try:
+                    replace_bot_token(
+                        config,
+                        token=token,
+                        init_data=self.headers.get("X-Telegram-Init-Data", ""),
+                    )
+                except BotTokenRecoveryError as exc:
+                    self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+                    return
+                except OSError:
+                    self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "Cuba semula sebentar lagi."})
+                    return
+                self._send_json(
+                    HTTPStatus.OK,
+                    {"ok": True, "message": "Token disahkan. Admin bot sedang disambungkan semula."},
+                )
+                return
             if not self._require_admin():
                 return
 
-            path = urlsplit(self.path).path
             try:
                 if path == "/api/dashboard":
                     self._send_json(HTTPStatus.OK, dashboard_payload(config, config_path))

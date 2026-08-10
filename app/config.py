@@ -10,6 +10,8 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 import yaml
 
+from app.bot_token_recovery import effective_bot_token
+
 
 ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -310,9 +312,14 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
     include = transfer.get("include") or {}
     native_copy = transfer.get("native_copy") or {}
 
+    sessions_dir = _path(base_dir, str(telegram.get("sessions_dir", "sessions")))
     api_id = int(_as_int(telegram.get("api_id") or os.getenv("API_ID"), 0, name="telegram.api_id") or 0)
     api_hash = str(telegram.get("api_hash") or os.getenv("API_HASH") or "").strip()
-    bot_token = str(bot.get("token") or os.getenv("BOT_TOKEN") or "").strip()
+    configured_bot_token = str(bot.get("token") or os.getenv("BOT_TOKEN") or "").strip()
+    # A replacement submitted through the Mini App is stored in the shared
+    # sessions volume, so every container picks it up on its next start even
+    # though Docker does not reload a running container's environment.
+    bot_token = effective_bot_token(configured_bot_token, sessions_dir)
     bot_enabled = _as_bool(bot.get("enabled"), bool(bot_token), name="telegram.bot.enabled")
 
     if api_id <= 0:
@@ -399,7 +406,7 @@ def load_config(path: str | Path = "config.yaml") -> AppConfig:
             api_id=api_id,
             api_hash=api_hash,
             user_session=str(telegram.get("user_session") or "user"),
-            sessions_dir=_path(base_dir, str(telegram.get("sessions_dir", "sessions"))),
+            sessions_dir=sessions_dir,
             load_dialogs_on_start=_as_bool(
                 telegram.get("load_dialogs_on_start"), True, name="telegram.load_dialogs_on_start"
             ),

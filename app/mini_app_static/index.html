@@ -267,6 +267,33 @@
       line-height: 1.55;
     }
 
+    .notice p:last-child { margin-bottom: 0; }
+
+    .recovery-form { display: grid; gap: 10px; margin-top: 16px; text-align: left; }
+    .recovery-form label { color: var(--text); font-size: 13px; font-weight: 650; }
+    .recovery-form input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      background: var(--surface-2);
+      color: var(--text);
+      font: inherit;
+    }
+    .recovery-form button, .recovery-link {
+      border: 0;
+      border-radius: 12px;
+      padding: 12px 14px;
+      background: var(--accent);
+      color: var(--accent-text);
+      cursor: pointer;
+      font: inherit;
+      font-weight: 700;
+    }
+    .recovery-link { margin-top: 14px; }
+    .recovery-form button:disabled { opacity: .6; cursor: default; }
+    .recovery-help { color: var(--muted); font-size: 12px; }
+
     .hidden { display: none !important; }
 
     @media (min-width: 480px) {
@@ -311,7 +338,14 @@
     </div>
 
     <div id="notice" class="notice">
-      Buka dashboard ini melalui butang dalam chat bot Telegram.
+      <p id="notice-text">Buka dashboard ini melalui butang dalam chat bot Telegram.</p>
+      <button id="open-recovery" class="recovery-link hidden" type="button">Masukkan token bot baharu</button>
+      <form id="recovery-form" class="recovery-form hidden" autocomplete="off">
+        <label for="bot-token">Token baharu daripada @BotFather</label>
+        <input id="bot-token" type="password" inputmode="text" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="512" required>
+        <button id="recover-token" type="submit">Sahkan &amp; sambung semula</button>
+        <div class="recovery-help">Token tidak dipaparkan atau dihantar semula selepas disahkan.</div>
+      </form>
     </div>
   </main>
 
@@ -342,7 +376,11 @@
         }
         return fetch(path, options).then(async (response) => {
           const data = await response.json().catch(() => ({}));
-          if (!response.ok) throw new Error(data.error || "Tidak dapat memuatkan dashboard.");
+          if (!response.ok) {
+            const error = new Error(data.error || "Tidak dapat memuatkan dashboard.");
+            error.status = response.status;
+            throw error;
+          }
           return data;
         });
       }
@@ -431,10 +469,18 @@
         });
       }
 
-      function showError(message) {
+      function showError(message, canRecover) {
         $("dashboard").classList.add("hidden");
         $("notice").classList.remove("hidden");
-        $("notice").textContent = message || "Tidak dapat memuatkan dashboard. Cuba semula dari bot chat.";
+        $("notice-text").textContent = message || "Tidak dapat memuatkan dashboard. Cuba semula dari bot chat.";
+        $("open-recovery").classList.toggle("hidden", !canRecover);
+        if (!canRecover) $("recovery-form").classList.add("hidden");
+      }
+
+      function showRecovery() {
+        $("recovery-form").classList.remove("hidden");
+        $("open-recovery").classList.add("hidden");
+        $("bot-token").focus();
       }
 
       function setLoading(loading) {
@@ -449,7 +495,11 @@
         try {
           render(await request("/api/dashboard"));
         } catch (error) {
-          showError(error.message);
+          const canRecover = error.status === 401 && telegram && telegram.initData;
+          showError(
+            canRecover ? "Token bot telah tamat atau dibatalkan. Masukkan token baharu untuk sambungkan semula." : error.message,
+            canRecover,
+          );
         } finally {
           setLoading(false);
         }
@@ -463,13 +513,39 @@
           if (telegram && telegram.HapticFeedback) telegram.HapticFeedback.notificationOccurred("success");
         } catch (error) {
           if (telegram && telegram.HapticFeedback) telegram.HapticFeedback.notificationOccurred("error");
-          showError(error.message);
+          showError(error.message, false);
         } finally {
           setLoading(false);
         }
       }
 
       $("refresh").addEventListener("click", refresh);
+      $("open-recovery").addEventListener("click", showRecovery);
+      $("recovery-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        if (state.loading) return;
+        const input = $("bot-token");
+        const button = $("recover-token");
+        const token = input.value.trim();
+        if (!token) return;
+        state.loading = true;
+        button.disabled = true;
+        try {
+          const result = await request("/api/bot-token/recover", { bot_token: token });
+          input.value = "";
+          $("recovery-form").classList.add("hidden");
+          $("notice-text").textContent = result.message + " Tutup dan buka semula dashboard daripada chat bot dalam beberapa saat.";
+          if (telegram && telegram.HapticFeedback) telegram.HapticFeedback.notificationOccurred("success");
+        } catch (error) {
+          input.value = "";
+          $("notice-text").textContent = error.message || "Token tidak dapat disahkan.";
+          $("recovery-form").classList.remove("hidden");
+          if (telegram && telegram.HapticFeedback) telegram.HapticFeedback.notificationOccurred("error");
+        } finally {
+          state.loading = false;
+          button.disabled = false;
+        }
+      });
       document.querySelectorAll(".tab").forEach((button) => {
         button.addEventListener("click", () => {
           state.tab = button.dataset.tab;
@@ -478,7 +554,7 @@
       });
 
       if (!telegram || !telegram.initData) {
-        showError("Buka dashboard ini melalui butang dalam chat bot Telegram.");
+        showError("Buka dashboard ini melalui butang dalam chat bot Telegram.", false);
         return;
       }
       telegram.ready();
