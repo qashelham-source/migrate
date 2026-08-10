@@ -36,6 +36,7 @@ from app.config import AppConfig, load_config
 from app.control import (
     clear_pause,
     clear_stop,
+    has_pending_run_request,
     is_active_phase,
     is_stoppable_phase,
     read_status,
@@ -1955,7 +1956,8 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await query.answer("Command scheduled.", show_alert=True)
             return
         if data == "stop:current":
-            if is_stoppable_phase(read_status(config).get("phase")):
+            status = read_status(config)
+            if is_stoppable_phase(status.get("phase")) or has_pending_run_request(config):
                 request_pause(config)
                 request_stop(config)
                 write_status(

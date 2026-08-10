@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from app.control import (
     clear_pause,
     clear_stop,
+    has_pending_run_request,
     is_active_phase,
     is_pause_requested,
     is_stop_requested,
@@ -49,9 +50,11 @@ def test_stop_and_pause_markers_and_phase_helpers(tmp_path):
     runtime.mkdir(parents=True, exist_ok=True)
     (runtime / "run_now").touch()
     (runtime / "run_mode").write_text("run", encoding="utf-8")
+    assert has_pending_run_request(config)
 
     request_stop(config)
     assert is_stop_requested(config)
+    assert not has_pending_run_request(config)
     assert not (runtime / "run_now").exists()
     assert not (runtime / "run_mode").exists()
 
