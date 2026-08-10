@@ -708,7 +708,7 @@ def _document_message(message_id: int = 7) -> SimpleNamespace:
         id=message_id,
         video=None,
         photo=None,
-        document=SimpleNamespace(file_id="source-document"),
+        document=SimpleNamespace(file_id="source-document", mime_type="application/octet-stream"),
         animation=None,
         audio=None,
         voice=None,
@@ -717,6 +717,12 @@ def _document_message(message_id: int = 7) -> SimpleNamespace:
         caption=None,
         media_group_id=None,
     )
+
+
+def _video_document_message(message_id: int = 7) -> SimpleNamespace:
+    message = _document_message(message_id)
+    message.document = SimpleNamespace(file_id="source-video-document", mime_type="video/mp4")
+    return message
 
 
 def _document_job(file_unique_key: str = "cache-type-mismatch") -> MessageJob:
@@ -739,6 +745,82 @@ def _document_job(file_unique_key: str = "cache-type-mismatch") -> MessageJob:
         file_size=1,
         caption=None,
     )
+
+
+def test_video_document_bypasses_native_copy_and_uses_video_upload(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    uploader = Uploader.__new__(Uploader)
+    uploader.config = config
+    uploader.queue = SimpleNamespace(get_media_cache=lambda _key: None)
+    uploader.logger = None
+    calls: list[str] = []
+
+    async def load_source_messages(*_args: object) -> list[SimpleNamespace]:
+        return [_video_document_message()]
+
+    async def copy_or_forward(*_args: object) -> UploadResult:
+        calls.append("native-copy")
+        raise AssertionError("a video document must be sent with send_video, not native copied")
+
+    async def download_and_upload(*_args: object) -> UploadResult:
+        calls.append("video-upload")
+        return UploadResult(status="copied", dest_message_ids=[9003])
+
+    async def phase(_name: str) -> None:
+        return None
+
+    uploader._load_source_messages = load_source_messages
+    uploader._copy_or_forward = copy_or_forward
+    uploader._download_and_upload = download_and_upload
+
+    result = asyncio.run(
+        uploader.process(
+            replace(_document_job("video-document"), media_type="video"),
+            asyncio.Event(),
+            phase,
+        )
+    )
+
+    assert result.dest_message_ids == [9003]
+    assert calls == ["video-upload"]
+
+
+def test_forwarding_only_keeps_video_document_on_native_copy(tmp_path: Path) -> None:
+    config = load_config(_write_config(tmp_path / "config.yaml"))
+    config = replace(config, transfer=replace(config.transfer, forwarding_only=True))
+    uploader = Uploader.__new__(Uploader)
+    uploader.config = config
+    uploader.queue = SimpleNamespace(get_media_cache=lambda _key: None)
+    uploader.logger = None
+    calls: list[str] = []
+
+    async def load_source_messages(*_args: object) -> list[SimpleNamespace]:
+        return [_video_document_message()]
+
+    async def copy_or_forward(*_args: object) -> UploadResult:
+        calls.append("native-copy")
+        return UploadResult(status="copied", dest_message_ids=[9004])
+
+    async def download_and_upload(*_args: object) -> UploadResult:
+        raise AssertionError("forwarding_only must not download/re-upload")
+
+    async def phase(_name: str) -> None:
+        return None
+
+    uploader._load_source_messages = load_source_messages
+    uploader._copy_or_forward = copy_or_forward
+    uploader._download_and_upload = download_and_upload
+
+    result = asyncio.run(
+        uploader.process(
+            replace(_document_job("video-document-only"), media_type="video"),
+            asyncio.Event(),
+            phase,
+        )
+    )
+
+    assert result.dest_message_ids == [9004]
+    assert calls == ["native-copy"]
 
 
 def test_incompatible_cached_media_type_falls_back_before_sending(tmp_path: Path) -> None:

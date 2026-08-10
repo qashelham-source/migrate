@@ -76,6 +76,23 @@ class Uploader:
         if self.logger:
             self.logger.warning("Discarded cached bot file_id for job %s: %s", job.id, reason)
 
+    @staticmethod
+    def _has_video_document(messages: list[Message]) -> bool:
+        """Whether Telegram stored any selected video as a generic document.
+
+        ``message_media_type`` deliberately classifies ``video/*`` documents as
+        videos so they honour the video filter.  A native Telegram copy, however,
+        preserves the original *document* presentation.  These messages must be
+        downloaded and sent with ``send_video`` to appear as a playable video at
+        the destination.
+        """
+        for message in messages:
+            document = getattr(message, "document", None)
+            mime_type = str(getattr(document, "mime_type", "") or "").lower()
+            if document is not None and mime_type.startswith("video/"):
+                return True
+        return False
+
     async def process(
         self,
         job: MessageJob,
@@ -106,7 +123,19 @@ class Uploader:
             return UploadResult(status="skipped", reason="Source messages missing or filtered out")
 
         text_only = all(message_media_type(message) == "text" for message in messages)
-        if self.config.transfer.prefer_copy:
+        video_document = self._has_video_document(messages)
+        # ``forwarding_only`` is an explicit promise not to download/re-upload.
+        # Honour it even though its document-video messages will retain Telegram's
+        # original file presentation.
+        use_native_copy = self.config.transfer.prefer_copy and (
+            not video_document or self.config.transfer.forwarding_only
+        )
+        if video_document and not use_native_copy and self.logger:
+            self.logger.info(
+                "Job %s contains a video document; bypassing native copy so it is sent as video media",
+                job.id,
+            )
+        if use_native_copy:
             try:
                 await on_phase("uploading")
                 return await self._copy_or_forward(job, messages)
