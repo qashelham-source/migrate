@@ -13,6 +13,7 @@ import yaml
 import app.destination_manager as destination_manager
 import app.admin_bot as admin_bot
 from app.config import ChatSpec, load_config
+from app.control import write_status
 from app.dashboard_v2 import issue_center, source_migration_progress
 from app.db import Database
 from app.queue import MessageJob, MessageQueue
@@ -658,6 +659,48 @@ def test_source_queue_uses_saved_channel_titles_after_bot_restart(tmp_path: Path
         admin_bot._CHANNEL_CACHE.pop(user_id, None)
         admin_bot._SELECTIONS.pop(user_id, None)
         admin_bot._SOURCE_TITLE_CACHE.pop(path.resolve(), None)
+
+
+def test_dashboard_hides_completed_source_but_keeps_its_saved_work(tmp_path: Path) -> None:
+    path = _write_config(
+        tmp_path / "config.yaml",
+        migration={"sources": ["-1002843617976"], "destinations": ["-100999"]},
+    )
+    config = load_config(path)
+    config.ensure_directories()
+    db = Database(config.queue.db_path)
+    db.initialize()
+    try:
+        queue = MessageQueue(db, config)
+        queue.register_source(
+            source_chat_id="-1002843617976",
+            title="Completed Channel",
+            username=None,
+            chat_type="channel",
+            latest_seen_message_id=1,
+        )
+        assert queue.enqueue(
+            source_chat_id="-1002843617976",
+            source_message_id=1,
+            dest_chat_id="-100999",
+            file_unique_key="completed:1",
+            source_message_ids=[1],
+            source_topic_id=None,
+            dest_topic_id=None,
+            media_group_id=None,
+            media_type="video",
+            file_size=1024,
+            caption=None,
+            status="copied",
+        )
+    finally:
+        db.close()
+
+    write_status(config, "stopped", message="Migration stopped safely.")
+    text = admin_bot._dashboard_text(config, path)
+
+    assert "Completed Channel" not in text
+    assert "source complete" not in text.lower()
 
 
 def _document_message(message_id: int = 7) -> SimpleNamespace:
