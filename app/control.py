@@ -106,6 +106,12 @@ def is_stop_requested(config: AppConfig) -> bool:
     return _stop_path(config).exists()
 
 
+def has_pending_run_request(config: AppConfig) -> bool:
+    """Return whether a queued Start command is waiting for the live service."""
+    runtime = _runtime_dir(config)
+    return any((runtime / name).exists() for name in ("run_now", "run_mode"))
+
+
 def is_active_phase(phase: str | None) -> bool:
     return str(phase or "").lower() in ACTIVE_PHASES
 
