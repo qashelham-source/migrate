@@ -35,6 +35,9 @@ x-migration-common: &migration-common
     - ./config.yaml:/app/config.yaml
     - ./sessions:/app/sessions
     - ./data:/app/data
+    # Pyrogram appends unknown RPC diagnostics in its current working directory.
+    # Keep the root filesystem read-only while allowing only that one file.
+    - ./data/pyrogram_unknown_errors.txt:/app/unknown_errors.txt
     - ./downloads:/app/downloads
   stop_grace_period: 45s
 

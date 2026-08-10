@@ -99,6 +99,9 @@ prepare_runtime_files() {
   fi
   rm -f config.yaml.bak config.yaml.tmp sessions/accounts.json.tmp
   mkdir -p sessions data downloads/active downloads/failed downloads/completed
+  # Pyrogram appends unmapped RPC diagnostics in /app/unknown_errors.txt.
+  # This bind-mounted file preserves a read-only container root filesystem.
+  touch data/pyrogram_unknown_errors.txt
 
   if [ "$(id -u)" -eq 0 ]; then
     chown "$APP_UID:$APP_GID" config.yaml
@@ -108,6 +111,7 @@ prepare_runtime_files() {
   fi
 
   chmod 600 config.yaml
+  chmod 600 data/pyrogram_unknown_errors.txt
   [ -f .env ] && chmod 600 .env
 
   config_owner="$(stat -c '%u:%g' config.yaml)"

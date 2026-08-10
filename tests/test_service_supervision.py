@@ -58,6 +58,7 @@ def test_compose_keeps_admin_web_and_migration_in_independent_services() -> None
     compose_path = Path(__file__).resolve().parents[1] / "docker-compose.yml"
     compose = yaml.safe_load(compose_path.read_text(encoding="utf-8"))
     services = compose["services"]
+    common = compose["x-migration-common"]
 
     assert {"migration-manager", "migration-admin", "migration-web"} <= set(services)
     assert "python main.py serve" in "\n".join(services["migration-manager"]["command"])
@@ -66,3 +67,9 @@ def test_compose_keeps_admin_web_and_migration_in_independent_services() -> None
     assert services["migration-admin"]["depends_on"]["migration-manager"]["condition"] == "service_healthy"
     assert "ports" not in services["migration-manager"]
     assert services["migration-web"]["ports"]
+    assert common["read_only"] is True
+    assert "./data/pyrogram_unknown_errors.txt:/app/unknown_errors.txt" in common["volumes"]
+
+    deploy_script = compose_path.with_name("deploy.sh").read_text(encoding="utf-8")
+    assert "touch data/pyrogram_unknown_errors.txt" in deploy_script
+    assert "chmod 600 data/pyrogram_unknown_errors.txt" in deploy_script
