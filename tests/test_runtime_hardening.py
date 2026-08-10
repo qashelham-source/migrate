@@ -94,6 +94,85 @@ def test_floodwait_snapshot_reloads_updates_from_another_container(tmp_path: Pat
     assert snapshot["floodwait_operations"]["copy"]["cooldown_remaining_seconds"] > 0
 
 
+def test_copy_recovery_pacing_uses_long_floodwait_history_then_relaxes(tmp_path: Path) -> None:
+    state_path = tmp_path / "data" / "floodwait.json"
+    record_floodwait(
+        {
+            "floodwait_events": 3,
+            "floodwait_total_seconds": 5864,
+            "floodwait_operations": {
+                "copy": {
+                    "events": 3,
+                    "total_wait_seconds": 5864,
+                    "cooldown_until_epoch": time.time() - 1,
+                }
+            },
+        },
+        state_path,
+    )
+    config = SimpleNamespace(
+        base_dir=tmp_path,
+        limits=SimpleNamespace(
+            global_min_delay_seconds=0,
+            delay_for=lambda operation: 3 if operation == "copy" else 0,
+        ),
+    )
+    limiter = TelegramLimiter(config)
+
+    assert limiter._operation_delay("copy") == 5
+
+    async def recover_cleanly() -> None:
+        for _ in range(limiter._COPY_RECOVERY_DECAY_SUCCESSFUL_CALLS):
+            await limiter._record_success("copy")
+
+    asyncio.run(recover_cleanly())
+
+    assert limiter._operation_delay("copy") == 4
+    restarted = TelegramLimiter(config)
+    assert restarted._operation_delay("copy") == 4
+
+
+def test_new_long_copy_floodwait_activates_recovery_pacing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class TestFloodWait(Exception):
+        def __init__(self, value: int) -> None:
+            self.value = value
+
+    config = SimpleNamespace(
+        base_dir=tmp_path,
+        limits=SimpleNamespace(
+            global_min_delay_seconds=0,
+            delay_for=lambda operation: 3 if operation == "copy" else 0,
+            floodwait_extra_min_seconds=0,
+            floodwait_extra_max_seconds=0,
+        ),
+    )
+    limiter = TelegramLimiter(config)
+    attempts = 0
+
+    async def copy_once() -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TestFloodWait(2479)
+        return "copied"
+
+    async def fast_forward_wait(_delay: float) -> None:
+        limiter._floodwait_until_by_operation["copy"] = 0
+        limiter._last_by_operation["copy"] = 0
+
+    monkeypatch.setattr("app.telegram_client.FloodWait", TestFloodWait)
+    monkeypatch.setattr("app.telegram_client.asyncio.sleep", fast_forward_wait)
+
+    assert asyncio.run(limiter.call("copy", copy_once)) == "copied"
+    assert attempts == 2
+    assert limiter._operation_delay("copy") == 5
+    snapshot = get_floodwait(tmp_path / "data" / "floodwait.json")
+    assert snapshot["floodwait_operations"]["copy"]["recovery_delay_seconds"] == 5
+
+
 def test_limiter_restores_active_floodwait_after_manager_restart(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
