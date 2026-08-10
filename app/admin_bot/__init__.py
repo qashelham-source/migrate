@@ -511,7 +511,6 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
             )
 
         active_sources = [s for s in source_progress if not _source_is_complete(s)]
-        done_sources   = [s for s in source_progress if     _source_is_complete(s)]
 
         # Active / in-progress sources — full detail, one entry each
         for i, item in enumerate(active_sources, 1):
@@ -525,14 +524,10 @@ def _dashboard_text(config: AppConfig, config_path: Path | None = None) -> str:
         if waiting > 0:
             lines.append(f"   📋 +{waiting} more source(s) waiting in queue")
 
-        # Completed sources — single summary line, not repeated individually
-        if done_sources:
-            done_item_count = sum(int(s.get("copied_items") or 0) for s in done_sources)
-            n = len(done_sources)
-            source_word = "source" if n == 1 else "sources"
-            if active_sources or waiting:
-                lines.append("")
-            lines.append(f"✅ {n} {source_word} complete · {done_item_count:,} items")
+        # Completed sources are intentionally omitted from the live dashboard.
+        # Their jobs and checkpoints remain in the database, and configured
+        # sources continue to be watched for new posts. Showing a permanent
+        # completion summary here makes finished work look like an active queue.
 
     # ── Loud errors ───────────────────────────────────────────────────────
     if dest_count == 0 and phase not in {"stopped", "stopping", "watching"}:
