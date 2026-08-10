@@ -44,6 +44,13 @@ class TelegramLimiter:
     therefore no longer prevent reads, downloads, or verification from scheduling.
     """
 
+    # A long native-copy FloodWait is far more expensive than a few seconds of
+    # spacing between copies.  Recovery starts gently, never exceeds five
+    # seconds, and relaxes again after clean progress.
+    _COPY_RECOVERY_MIN_DELAY_SECONDS = 3.0
+    _COPY_RECOVERY_MAX_DELAY_SECONDS = 5.0
+    _COPY_RECOVERY_DECAY_SUCCESSFUL_CALLS = 25
+
     def __init__(self, config: AppConfig, logger: Any | None = None) -> None:
         self.config = config
         self.logger = logger
@@ -54,7 +61,46 @@ class TelegramLimiter:
         self._floodwait_until_by_operation: dict[str, float] = {}
         self._floodwait_events_by_operation: dict[str, int] = {}
         self._floodwait_seconds_by_operation: dict[str, int] = {}
+        self._recovery_delay_by_operation: dict[str, float] = {}
+        self._recovery_successes_by_operation: dict[str, int] = {}
         self._restore_persisted_floodwait()
+
+    def _configured_delay(self, operation: str) -> float:
+        return float(self.config.limits.delay_for(operation))
+
+    def _operation_delay(self, operation: str) -> float:
+        return max(
+            self._configured_delay(operation),
+            self._recovery_delay_by_operation.get(operation, 0.0),
+        )
+
+    def _restored_copy_recovery_delay(self, *, events: int, total_wait: int) -> float:
+        """Choose a conservative-but-temporary pace for old FloodWait state."""
+        base = self._configured_delay("copy")
+        if events <= 0:
+            return base
+
+        recovered = max(base, self._COPY_RECOVERY_MIN_DELAY_SECONDS)
+        if total_wait >= 600:
+            recovered = max(recovered, 4.0)
+        if total_wait >= 1800:
+            recovered = max(recovered, self._COPY_RECOVERY_MAX_DELAY_SECONDS)
+        return max(base, min(self._COPY_RECOVERY_MAX_DELAY_SECONDS, recovered))
+
+    def _next_copy_recovery_delay(self, *, wait_seconds: int) -> float:
+        """Increase only copy pacing after Telegram explicitly rate-limits it."""
+        base = self._configured_delay("copy")
+        current = self._recovery_delay_by_operation.get("copy", base)
+        recovered = max(
+            base,
+            self._COPY_RECOVERY_MIN_DELAY_SECONDS,
+            current + 1.0,
+        )
+        if wait_seconds >= 600:
+            recovered = max(recovered, 4.0)
+        if wait_seconds >= 1800:
+            recovered = max(recovered, self._COPY_RECOVERY_MAX_DELAY_SECONDS)
+        return max(base, min(self._COPY_RECOVERY_MAX_DELAY_SECONDS, recovered))
 
     def _restore_persisted_floodwait(self) -> None:
         """Honour an active Telegram cooldown after a manager restart.
@@ -83,11 +129,27 @@ class TelegramLimiter:
                 events = max(0, int(raw_details.get("events") or 0))
                 total_wait = max(0, int(raw_details.get("total_wait_seconds") or 0))
                 remaining = max(0, int(raw_details.get("cooldown_remaining_seconds") or 0))
+                recovery_delay = raw_details.get("recovery_delay_seconds")
+                recovery_successes = max(0, int(raw_details.get("recovery_successes") or 0))
             except (TypeError, ValueError):
                 continue
 
             self._floodwait_events_by_operation[operation] = events
             self._floodwait_seconds_by_operation[operation] = total_wait
+            if operation == "copy":
+                if isinstance(recovery_delay, (int, float)):
+                    restored_delay = max(
+                        self._configured_delay(operation),
+                        min(float(recovery_delay), self._COPY_RECOVERY_MAX_DELAY_SECONDS),
+                    )
+                else:
+                    restored_delay = self._restored_copy_recovery_delay(
+                        events=events,
+                        total_wait=total_wait,
+                    )
+                if restored_delay > self._configured_delay(operation):
+                    self._recovery_delay_by_operation[operation] = restored_delay
+                    self._recovery_successes_by_operation[operation] = recovery_successes
             if remaining > 0:
                 self._floodwait_until_by_operation[operation] = now + remaining
                 restored.append(f"{operation} ({remaining}s)")
@@ -106,7 +168,7 @@ class TelegramLimiter:
                     self._floodwait_until_by_operation.get(operation, 0.0),
                     self._last_global + self.config.limits.global_min_delay_seconds,
                     self._last_by_operation.get(operation, 0.0)
-                    + self.config.limits.delay_for(operation),
+                    + self._operation_delay(operation),
                 )
                 delay = ready_at - now
                 if delay <= 0:
@@ -136,6 +198,13 @@ class TelegramLimiter:
                 "cooldown_remaining_seconds": int(cooldown_remaining),
                 "cooldown_until_epoch": wall_now + cooldown_remaining,
             }
+            if operation in self._recovery_delay_by_operation:
+                details[operation]["recovery_delay_seconds"] = (
+                    self._recovery_delay_by_operation[operation]
+                )
+                details[operation]["recovery_successes"] = (
+                    self._recovery_successes_by_operation.get(operation, 0)
+                )
         return {
             "floodwait_events": sum(item["events"] for item in details.values()),
             "floodwait_total_seconds": sum(item["total_wait_seconds"] for item in details.values()),
@@ -152,11 +221,12 @@ class TelegramLimiter:
         while True:
             await self.wait(operation)
             try:
-                return await fn(*args, **kwargs)
+                result = await fn(*args, **kwargs)
             except FloodWait as exc:
                 extra_min = self.config.limits.floodwait_extra_min_seconds
                 extra_max = self.config.limits.floodwait_extra_max_seconds
                 wait = max(1, int(exc.value)) + random.randint(extra_min, extra_max)
+                recovery_delay: float | None = None
                 async with self._lock:
                     self._floodwait_until_by_operation[operation] = max(
                         self._floodwait_until_by_operation.get(operation, 0.0),
@@ -168,17 +238,68 @@ class TelegramLimiter:
                     self._floodwait_seconds_by_operation[operation] = (
                         self._floodwait_seconds_by_operation.get(operation, 0) + wait
                     )
+                    if operation == "copy":
+                        recovery_delay = self._next_copy_recovery_delay(
+                            wait_seconds=wait,
+                        )
+                        self._recovery_delay_by_operation[operation] = recovery_delay
+                        self._recovery_successes_by_operation[operation] = 0
                 record_floodwait(
                     self.floodwait_snapshot(),
                     self.config.base_dir / "data" / "floodwait.json",
                 )
                 if self.logger:
-                    self.logger.warning(
-                        "FloodWait from Telegram during %s: pausing only %s operations for %ss",
-                        operation,
-                        operation,
-                        wait,
-                    )
+                    if recovery_delay is None:
+                        self.logger.warning(
+                            "FloodWait from Telegram during %s: pausing only %s operations for %ss",
+                            operation,
+                            operation,
+                            wait,
+                        )
+                    else:
+                        self.logger.warning(
+                            "FloodWait from Telegram during copy: pausing copy operations for %ss; "
+                            "resuming at %ss spacing",
+                            wait,
+                            recovery_delay,
+                        )
+            else:
+                await self._record_success(operation)
+                return result
+
+    async def _record_success(self, operation: str) -> None:
+        """Gradually restore normal copy speed after a clean recovery run."""
+        if operation != "copy":
+            return
+
+        persist = False
+        async with self._lock:
+            base = self._configured_delay(operation)
+            current = self._recovery_delay_by_operation.get(operation, base)
+            if current <= base:
+                return
+
+            successes = self._recovery_successes_by_operation.get(operation, 0) + 1
+            if successes < self._COPY_RECOVERY_DECAY_SUCCESSFUL_CALLS:
+                self._recovery_successes_by_operation[operation] = successes
+                return
+
+            relaxed = max(base, current - 1.0)
+            self._recovery_delay_by_operation[operation] = relaxed
+            self._recovery_successes_by_operation[operation] = 0
+            persist = True
+
+        if persist:
+            record_floodwait(
+                self.floodwait_snapshot(),
+                self.config.base_dir / "data" / "floodwait.json",
+            )
+            if self.logger:
+                self.logger.info(
+                    "Relaxed native-copy recovery pacing to %ss after %s successful copy calls",
+                    relaxed,
+                    self._COPY_RECOVERY_DECAY_SUCCESSFUL_CALLS,
+                )
 
     async def call(
         self,
