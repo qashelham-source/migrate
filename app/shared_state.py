@@ -53,16 +53,27 @@ def record_floodwait(snapshot: dict[str, Any], path: str | Path | None = None) -
 
 
 def get_floodwait(path: str | Path | None = None) -> dict[str, Any]:
-    """Read the latest snapshot and refresh cooldowns against wall-clock time."""
+    """Read the latest snapshot and refresh cooldowns against wall-clock time.
+
+    The manager and admin bot run in different containers. The manager can
+    replace this file with a newer FloodWait while the admin bot is still
+    alive, so the admin process must not keep serving its first in-memory
+    snapshot forever.
+    """
     global _floodwait, _floodwait_source
     target = _state_path(path)
-    if target != _floodwait_source:
-        try:
-            loaded = json.loads(target.read_text(encoding="utf-8"))
-        except (OSError, TypeError, ValueError):
-            return {}
-        if not isinstance(loaded, dict):
-            return {}
-        _floodwait = loaded
-        _floodwait_source = target
+    try:
+        loaded = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError):
+        # Keep a last-known good snapshot during a transient shared-volume
+        # read failure. Its wall-clock countdown will still expire safely.
+        if target == _floodwait_source:
+            return _refresh_snapshot(_floodwait)
+        return {}
+    if not isinstance(loaded, dict):
+        if target == _floodwait_source:
+            return _refresh_snapshot(_floodwait)
+        return {}
+    _floodwait = loaded
+    _floodwait_source = target
     return _refresh_snapshot(_floodwait)

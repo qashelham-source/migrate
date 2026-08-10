@@ -1,4 +1,5 @@
 import asyncio
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -45,6 +46,52 @@ def test_floodwait_snapshot_is_shared_and_countdown_refreshes(tmp_path: Path) ->
 
     assert state_path.exists()
     assert snapshot["floodwait_operations"]["upload"]["cooldown_remaining_seconds"] > 0
+
+
+def test_floodwait_snapshot_reloads_updates_from_another_container(tmp_path: Path) -> None:
+    """The dashboard must see a newer cooldown written by the manager."""
+    state_path = tmp_path / "data" / "floodwait.json"
+    record_floodwait(
+        {
+            "floodwait_events": 1,
+            "floodwait_total_seconds": 30,
+            "floodwait_operations": {
+                "copy": {
+                    "events": 1,
+                    "total_wait_seconds": 30,
+                    "cooldown_until_epoch": time.time() + 30,
+                }
+            },
+        },
+        state_path,
+    )
+    assert get_floodwait(state_path)["floodwait_operations"]["copy"]["events"] == 1
+
+    # Simulate the manager atomically replacing the shared state file after a
+    # later FloodWait. This bypasses record_floodwait's in-process cache.
+    replacement = state_path.with_name("floodwait.updated.json")
+    replacement.write_text(
+        json.dumps(
+            {
+                "floodwait_events": 2,
+                "floodwait_total_seconds": 3385,
+                "floodwait_operations": {
+                    "copy": {
+                        "events": 2,
+                        "total_wait_seconds": 3385,
+                        "cooldown_until_epoch": time.time() + 300,
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    replacement.replace(state_path)
+
+    snapshot = get_floodwait(state_path)
+
+    assert snapshot["floodwait_operations"]["copy"]["events"] == 2
+    assert snapshot["floodwait_operations"]["copy"]["cooldown_remaining_seconds"] > 0
 
 
 def test_limiter_restores_active_floodwait_after_manager_restart(
