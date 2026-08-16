@@ -368,10 +368,17 @@ class Scanner:
             for destination in destinations
         ]
         if self.scan_mode == "incremental":
-            checkpoint, destination_route_bootstrap = destination_route_baseline(
-                scan_mode=self.scan_mode,
-                route_checkpoints=route_checkpoints,
-            )
+            if history_clear_pending_at_start:
+                # An explicit "clear old history" decision applies to every
+                # future destination too. Do not bootstrap old posts merely
+                # because a new route has no checkpoint yet.
+                checkpoint = source_checkpoint
+                destination_route_bootstrap = False
+            else:
+                checkpoint, destination_route_bootstrap = destination_route_baseline(
+                    scan_mode=self.scan_mode,
+                    route_checkpoints=route_checkpoints,
+                )
         else:
             checkpoint = source_checkpoint
             destination_route_bootstrap = False
