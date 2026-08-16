@@ -726,6 +726,39 @@ class MessageQueue:
             scan_mode,
         )
 
+    def get_destination_scan_checkpoint(
+        self,
+        source_chat_id: int | str,
+        source_topic_id: int | None,
+        dest_chat_id: int | str,
+        dest_topic_id: int | None,
+    ) -> int | None:
+        row = self.db.get_destination_scan_checkpoint(
+            source_chat_id,
+            source_topic_id,
+            dest_chat_id,
+            dest_topic_id,
+        )
+        return int(row["last_scanned_message_id"]) if row else None
+
+    def set_destination_scan_checkpoint(
+        self,
+        source_chat_id: int | str,
+        source_topic_id: int | None,
+        dest_chat_id: int | str,
+        dest_topic_id: int | None,
+        last_scanned_message_id: int,
+        scan_mode: str,
+    ) -> None:
+        self.db.set_destination_scan_checkpoint(
+            source_chat_id,
+            source_topic_id,
+            dest_chat_id,
+            dest_topic_id,
+            last_scanned_message_id,
+            scan_mode,
+        )
+
     def source_queue_highwater(self, source_chat_id: int | str) -> int | None:
         return self.db.source_queue_highwater(source_chat_id)
 
