@@ -276,6 +276,10 @@ class Release3Store:
             checkpoints = int(checkpoint_row["count"] if checkpoint_row else 0)
             jobs = self._delete_source_jobs_locked(ids)
             conn.execute(f"DELETE FROM scan_checkpoints WHERE {source_filter}", ids)
+            conn.execute(
+                f"DELETE FROM destination_scan_checkpoints WHERE {source_filter}",
+                ids,
+            )
             conn.execute(f"DELETE FROM source_registry WHERE {source_filter}", ids)
             conn.commit()
         except BaseException:
@@ -314,6 +318,18 @@ class Release3Store:
             checkpoints = int(checkpoint_row["count"] if checkpoint_row else 0)
             jobs = self._delete_source_jobs_locked(ids)
             conn.execute(f"DELETE FROM scan_checkpoints WHERE {source_filter}", ids)
+            # Preserve an explicit history-clear decision for every known
+            # destination route; a later sync must not recreate old posts.
+            conn.execute(
+                f"""
+                UPDATE destination_scan_checkpoints
+                SET last_scanned_message_id = ?,
+                    last_scan_mode = 'skip_history',
+                    updated_at = ?
+                WHERE {source_filter}
+                """,
+                (checkpoint, now, *ids),
+            )
             conn.execute(
                 """
                 INSERT INTO scan_checkpoints (

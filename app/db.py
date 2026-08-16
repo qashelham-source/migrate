@@ -121,6 +121,32 @@ class Database:
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (source_chat_id, source_topic_key)
             );
+
+            -- Source checkpoints track live discovery. Route checkpoints track
+            -- whether that source history has been queued for each destination.
+            -- A new destination must never inherit completion from an old one.
+            CREATE TABLE IF NOT EXISTS destination_scan_checkpoints (
+                source_chat_id TEXT NOT NULL,
+                source_topic_key INTEGER NOT NULL DEFAULT 0,
+                dest_chat_id TEXT NOT NULL,
+                dest_topic_key INTEGER NOT NULL DEFAULT 0,
+                last_scanned_message_id INTEGER NOT NULL,
+                last_scan_mode TEXT NOT NULL DEFAULT 'incremental',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (
+                    source_chat_id,
+                    source_topic_key,
+                    dest_chat_id,
+                    dest_topic_key
+                )
+            );
+            CREATE INDEX IF NOT EXISTS idx_destination_scan_checkpoints_source
+                ON destination_scan_checkpoints(
+                    source_chat_id,
+                    source_topic_key,
+                    updated_at
+                );
             """
         )
         columns = {
@@ -145,6 +171,37 @@ class Database:
             """
             CREATE INDEX IF NOT EXISTS idx_messages_lease
                 ON messages(status, lease_expires_at)
+            """
+        )
+        # Upgrade legacy source-only checkpoints without making existing
+        # destinations rescan their entire history after deployment. A destination
+        # with no prior delivery rows remains deliberately unseeded so its first
+        # incremental scan bootstraps the source history.
+        self.conn.execute(
+            """
+            INSERT OR IGNORE INTO destination_scan_checkpoints (
+                source_chat_id, source_topic_key, dest_chat_id, dest_topic_key,
+                last_scanned_message_id, last_scan_mode, created_at, updated_at
+            )
+            SELECT
+                sc.source_chat_id,
+                sc.source_topic_key,
+                m.dest_chat_id,
+                COALESCE(m.dest_topic_id, 0),
+                sc.last_scanned_message_id,
+                sc.last_scan_mode,
+                sc.created_at,
+                sc.updated_at
+            FROM scan_checkpoints sc
+            INNER JOIN messages m
+                ON m.source_chat_id = sc.source_chat_id
+               AND COALESCE(m.source_topic_id, 0) = sc.source_topic_key
+               AND m.file_unique_key NOT LIKE 'repair:%'
+            GROUP BY
+                sc.source_chat_id,
+                sc.source_topic_key,
+                m.dest_chat_id,
+                COALESCE(m.dest_topic_id, 0)
             """
         )
         self.conn.commit()
@@ -821,18 +878,92 @@ class Database:
             """
         )
 
+    def get_destination_scan_checkpoint(
+        self,
+        source_chat_id: int | str,
+        source_topic_id: int | None,
+        dest_chat_id: int | str,
+        dest_topic_id: int | None,
+    ) -> sqlite3.Row | None:
+        return self.query_one(
+            """
+            SELECT * FROM destination_scan_checkpoints
+            WHERE source_chat_id = ?
+              AND source_topic_key = ?
+              AND dest_chat_id = ?
+              AND dest_topic_key = ?
+            """,
+            (
+                str(source_chat_id),
+                _topic_key(source_topic_id),
+                str(dest_chat_id),
+                _topic_key(dest_topic_id),
+            ),
+        )
+
+    def set_destination_scan_checkpoint(
+        self,
+        source_chat_id: int | str,
+        source_topic_id: int | None,
+        dest_chat_id: int | str,
+        dest_topic_id: int | None,
+        last_scanned_message_id: int,
+        scan_mode: str,
+    ) -> None:
+        now = utc_now()
+        self.execute(
+            """
+            INSERT INTO destination_scan_checkpoints (
+                source_chat_id, source_topic_key, dest_chat_id, dest_topic_key,
+                last_scanned_message_id, last_scan_mode, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(
+                source_chat_id,
+                source_topic_key,
+                dest_chat_id,
+                dest_topic_key
+            ) DO UPDATE SET
+                last_scanned_message_id = excluded.last_scanned_message_id,
+                last_scan_mode = excluded.last_scan_mode,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(source_chat_id),
+                _topic_key(source_topic_id),
+                str(dest_chat_id),
+                _topic_key(dest_topic_id),
+                int(last_scanned_message_id),
+                str(scan_mode),
+                now,
+                now,
+            ),
+        )
+
     def reset_scan_checkpoints(
         self,
         source_chat_id: int | str | None = None,
         source_topic_id: int | None = None,
     ) -> int:
         if source_chat_id is None:
-            cursor = self.execute("DELETE FROM scan_checkpoints")
+            cursor = self.conn.execute("DELETE FROM scan_checkpoints")
+            self.conn.execute("DELETE FROM destination_scan_checkpoints")
+            self.conn.commit()
             return int(cursor.rowcount)
-        cursor = self.execute(
+
+        source_id = str(source_chat_id)
+        topic_key = _topic_key(source_topic_id)
+        cursor = self.conn.execute(
             "DELETE FROM scan_checkpoints WHERE source_chat_id = ? AND source_topic_key = ?",
-            (str(source_chat_id), _topic_key(source_topic_id)),
+            (source_id, topic_key),
         )
+        self.conn.execute(
+            """
+            DELETE FROM destination_scan_checkpoints
+            WHERE source_chat_id = ? AND source_topic_key = ?
+            """,
+            (source_id, topic_key),
+        )
+        self.conn.commit()
         return int(cursor.rowcount)
 
     def source_queue_highwater(self, source_chat_id: int | str) -> int | None:

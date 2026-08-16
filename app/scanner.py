@@ -83,6 +83,27 @@ def build_scan_plan(
     )
 
 
+def destination_route_baseline(
+    *,
+    scan_mode: str,
+    route_checkpoints: list[int | None],
+) -> tuple[int | None, bool]:
+    """Return the shared incremental baseline for the configured destinations.
+
+    Completion belongs to a source *route* (source + destination + topic), not
+    to a source globally.  If a destination has no route checkpoint, it is new
+    and must receive the source history even when older destinations are current.
+    """
+    normalized = str(scan_mode).strip().lower()
+    if normalized not in SCAN_MODES:
+        raise ValueError(f"Unsupported scan mode: {scan_mode}")
+    if normalized != "incremental":
+        return None, False
+    if not route_checkpoints or any(value is None for value in route_checkpoints):
+        return None, True
+    return min(int(value) for value in route_checkpoints if value is not None), False
+
+
 class Scanner:
     def __init__(
         self,
@@ -333,15 +354,37 @@ class Scanner:
                 "read", self._latest_message_id, resolved_source.chat_id
             )
 
-        checkpoint = self.queue.get_scan_checkpoint(
+        source_checkpoint = self.queue.get_scan_checkpoint(
             resolved_source.chat_id,
             resolved_source.topic_id,
         )
-        queue_highwater = (
-            self.queue.source_queue_highwater(resolved_source.chat_id)
-            if self.scan_mode == "incremental" and checkpoint is None
-            else None
-        )
+        route_checkpoints = [
+            self.queue.get_destination_scan_checkpoint(
+                resolved_source.chat_id,
+                resolved_source.topic_id,
+                destination.chat_id,
+                destination.topic_id,
+            )
+            for destination in destinations
+        ]
+        if self.scan_mode == "incremental":
+            if history_clear_pending_at_start:
+                # An explicit "clear old history" decision applies to every
+                # future destination too. Do not bootstrap old posts merely
+                # because a new route has no checkpoint yet.
+                checkpoint = source_checkpoint
+                destination_route_bootstrap = False
+            else:
+                checkpoint, destination_route_bootstrap = destination_route_baseline(
+                    scan_mode=self.scan_mode,
+                    route_checkpoints=route_checkpoints,
+                )
+        else:
+            checkpoint = source_checkpoint
+            destination_route_bootstrap = False
+        # Legacy source-wide queue high-water must never advance a newly added
+        # destination. Route checkpoints above are the only incremental baseline.
+        queue_highwater = None
         plan = build_scan_plan(
             configured_start=configured_start,
             configured_end=source.end_id,
@@ -366,13 +409,29 @@ class Scanner:
 
         if not plan.has_work:
             checkpoint_target = max(plan.baseline or 0, plan.end_id)
-            if checkpoint_target > 0 and checkpoint != checkpoint_target:
-                self.queue.set_scan_checkpoint(
-                    resolved_source.chat_id,
-                    resolved_source.topic_id,
-                    checkpoint_target,
-                    self.scan_mode,
-                )
+            if checkpoint_target > 0:
+                if source_checkpoint != checkpoint_target:
+                    self.queue.set_scan_checkpoint(
+                        resolved_source.chat_id,
+                        resolved_source.topic_id,
+                        checkpoint_target,
+                        self.scan_mode,
+                    )
+                for destination in destinations:
+                    if self.queue.get_destination_scan_checkpoint(
+                        resolved_source.chat_id,
+                        resolved_source.topic_id,
+                        destination.chat_id,
+                        destination.topic_id,
+                    ) != checkpoint_target:
+                        self.queue.set_destination_scan_checkpoint(
+                            resolved_source.chat_id,
+                            resolved_source.topic_id,
+                            destination.chat_id,
+                            destination.topic_id,
+                            checkpoint_target,
+                            self.scan_mode,
+                        )
             if self.logger:
                 self.logger.info(
                     "Incremental sync found no new messages in %s; checkpoint=%s latest=%s",
@@ -623,23 +682,38 @@ class Scanner:
             plan.end_id,
             self.scan_mode,
         )
+        for destination in destinations:
+            self.queue.set_destination_scan_checkpoint(
+                resolved_source.chat_id,
+                resolved_source.topic_id,
+                destination.chat_id,
+                destination.topic_id,
+                plan.end_id,
+                self.scan_mode,
+            )
         if self.logger:
             self.logger.info(
-                "Scan complete: mode=%s added=%s skipped=%s duplicates=%s already_queued=%s checkpoint=%s",
+                "Scan complete: mode=%s added=%s skipped=%s duplicates=%s existing=%s "
+                "checkpoint=%s route_bootstrap=%s",
                 self.scan_mode,
                 added,
                 skipped,
                 duplicates,
                 existing,
                 plan.end_id,
+                destination_route_bootstrap,
             )
         write_status(
             self.config,
             "scan_complete",
             message=(
-                "New-post sync complete. Starting the migration queue."
-                if self.scan_mode == "incremental"
-                else "Full scan complete. Starting the migration queue."
+                "New destination detected. Source history was queued for it."
+                if destination_route_bootstrap
+                else (
+                    "New-post sync complete. Starting the migration queue."
+                    if self.scan_mode == "incremental"
+                    else "Full scan complete. Starting the migration queue."
+                )
             ),
             source=resolved_source.title,
             source_index=source_index,
@@ -654,6 +728,7 @@ class Scanner:
             scan_end=plan.end_id,
             checkpoint=plan.end_id,
             checkpoint_bootstrap=plan.bootstrapped_from_queue,
+            destination_route_bootstrap=destination_route_bootstrap,
         )
 
     def _group_messages(self, messages: list[Message]) -> list[list[Message]]:
