@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+DUPLICATE_CLEANUP_SKIP_MARKER = "deleted duplicate delivery by admin cleanup"
+
+
 EXPECTED_SKIP_REASON_MARKERS: tuple[str, ...] = (
     "filtered out by config",
     "skipped duplicate media fingerprint",
@@ -7,6 +10,7 @@ EXPECTED_SKIP_REASON_MARKERS: tuple[str, ...] = (
     "forwarding_only is enabled",
     "text message was empty",
     "cancelled by policy",
+    DUPLICATE_CLEANUP_SKIP_MARKER,
 )
 
 

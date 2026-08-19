@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from app.skip_policy import expected_skip_reason_sql
+from app.skip_policy import DUPLICATE_CLEANUP_SKIP_MARKER, expected_skip_reason_sql
 
 
 STATUSES = {"pending", "downloading", "uploading", "copied", "failed", "skipped"}
@@ -296,15 +296,28 @@ class Database:
               AND COALESCE(dest_topic_id, 0) = ?
               AND file_unique_key = ?
               AND file_unique_key NOT LIKE 'repair:%'
-              AND status IN ('pending', 'downloading', 'uploading', 'copied')
+              AND (
+                    status IN ('pending', 'downloading', 'uploading', 'copied')
+                    OR (
+                        status = 'skipped'
+                        AND LOWER(COALESCE(last_error, '')) LIKE ?
+                    )
+              )
               AND (source_chat_id != ? OR source_message_id != ?)
-            ORDER BY CASE status WHEN 'copied' THEN 0 ELSE 1 END, id ASC
+            ORDER BY CASE status
+                WHEN 'copied' THEN 0
+                WHEN 'pending' THEN 1
+                WHEN 'downloading' THEN 2
+                WHEN 'uploading' THEN 3
+                ELSE 4
+            END, id ASC
             LIMIT 1
             """,
             (
                 str(dest_chat_id),
                 _topic_key(dest_topic_id),
                 fingerprint,
+                f"%{DUPLICATE_CLEANUP_SKIP_MARKER}%",
                 str(source_chat_id),
                 int(source_message_id),
             ),
