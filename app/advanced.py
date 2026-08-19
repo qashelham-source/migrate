@@ -11,7 +11,7 @@ from app.db import Database, utc_now
 from app.release3_store import Release3Store
 
 
-RUN_MODES = {"run", "sync", "process", "health"}
+RUN_MODES = {"run", "sync", "process", "health", "duplicate_cleanup_scan"}
 REPAIR_CATEGORIES = (
     "media_empty",
     "peer_id",
