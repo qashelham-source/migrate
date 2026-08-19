@@ -53,7 +53,7 @@ def add_verified_delivery(
     return job_id
 
 
-def test_cleanup_only_targets_exact_verified_copies_in_the_same_destination(tmp_path: Path) -> None:
+def test_cleanup_targets_exact_copies_with_saved_destination_ids(tmp_path: Path) -> None:
     db = make_db(tmp_path)
     try:
         kept_job = add_verified_delivery(
@@ -86,7 +86,9 @@ def test_cleanup_only_targets_exact_verified_copies_in_the_same_destination(tmp_
             destination_message_ids=[40],
             topic_id=77,
         )
-        # Text fallback and unverified deliveries are never eligible for deletion.
+        # Text fallbacks are never eligible.  A completed delivery without a
+        # later strong-verification timestamp is still safe: its exact
+        # destination message ID was recorded when Telegram accepted the send.
         add_verified_delivery(
             db,
             source="-1005",
@@ -95,7 +97,7 @@ def test_cleanup_only_targets_exact_verified_copies_in_the_same_destination(tmp_
             destination_message_ids=[50],
             fingerprint="messages:-1005:5",
         )
-        add_verified_delivery(
+        unverified_duplicate_job = add_verified_delivery(
             db,
             source="-1006",
             source_message_id=6,
@@ -106,13 +108,12 @@ def test_cleanup_only_targets_exact_verified_copies_in_the_same_destination(tmp_
 
         plan = plan_duplicate_delivery_cleanup(db)
         assert plan.group_count == 1
-        assert plan.delivery_count == 1
-        assert plan.message_count == 1
-        candidate = plan.candidates[0]
-        assert candidate.job_id == duplicate_job
-        assert candidate.kept_job_id == kept_job
-        assert candidate.dest_message_ids == (20,)
-        assert candidate.kept_dest_message_ids == (10,)
+        assert plan.delivery_count == 2
+        assert plan.message_count == 2
+        assert [candidate.job_id for candidate in plan.candidates] == [duplicate_job, unverified_duplicate_job]
+        assert [candidate.dest_message_ids for candidate in plan.candidates] == [(20,), (60,)]
+        assert all(candidate.kept_job_id == kept_job for candidate in plan.candidates)
+        assert all(candidate.kept_dest_message_ids == (10,) for candidate in plan.candidates)
     finally:
         db.close()
 
@@ -133,6 +134,7 @@ def test_cleanup_retains_a_skip_record_so_the_media_is_not_sent_again(tmp_path: 
             source_message_id=2,
             destination="-2001",
             destination_message_ids=[20],
+            verified=False,
         )
 
         candidate = plan_duplicate_delivery_cleanup(db).candidates[0]

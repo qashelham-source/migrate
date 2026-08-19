@@ -757,7 +757,7 @@ def _duplicate_cleanup_text(plan: DuplicateCleanupPlan) -> str:
     lines = [
         "🧹 Clean Sent Duplicate Copies",
         "",
-        "Only exact Telegram media fingerprints are included.",
+        "Only exact Telegram media fingerprints from recorded deliveries are included.",
         "The oldest sent copy stays. Source posts are never touched.",
         "",
         f"Duplicate groups: {plan.group_count}",
@@ -767,8 +767,8 @@ def _duplicate_cleanup_text(plan: DuplicateCleanupPlan) -> str:
     if not plan.candidates:
         lines += [
             "",
-            "✅ No safe, verified duplicate deliveries are ready to clean.",
-            "Only completed media with saved destination IDs can be removed.",
+            "✅ No exact duplicate deliveries with saved destination IDs are ready to clean.",
+            "Only media sent and recorded by this migration manager can be removed.",
         ]
         return "\n".join(lines)
 
