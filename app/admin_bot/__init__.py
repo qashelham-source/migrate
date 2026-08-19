@@ -59,10 +59,15 @@ from app.destination_manager import (
     set_sources,
     unblacklist_source,
 )
+from app.duplicate_cleanup import (
+    DuplicateCleanupPlan,
+    mark_duplicate_delivery_deleted,
+    plan_duplicate_delivery_cleanup,
+)
 from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
 from app.queue import MessageQueue
 from app.shared_state import get_floodwait
-from app.telegram_client import start_client_with_floodwait
+from app.telegram_client import TelegramLimiter, start_client_with_floodwait
 from app.logging import setup_logging
 
 _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
@@ -71,6 +76,7 @@ _SOURCE_TITLE_CACHE: dict[Path, dict[str, str]] = {}
 _SELECTIONS: dict[int, dict[str, list[str]]] = {}
 _CONTENT_TYPES: dict[int, set[str]] = {}
 _FINDER_INPUTS: set[int] = set()
+_DUPLICATE_CLEANUP_ACTIVE: set[Path] = set()
 _PAGE_SIZE = 8
 
 _ALL_CONTENT_TYPES: tuple[str, ...] = ("video", "photo", "text")
@@ -739,9 +745,82 @@ def _duplicates_menu() -> InlineKeyboardMarkup:
     return _buttons(
         [
             [("📥 Index Queue", "duplicates:index"), ("🔄 Refresh", "duplicates:view")],
+            [("🧹 Clean Sent Copies", "duplicates:cleanup:preview")],
             [("⬅️ Smart Center", "smart:menu")],
         ]
     )
+
+
+def _duplicate_cleanup_text(plan: DuplicateCleanupPlan) -> str:
+    """Render the non-destructive cleanup preview before the delete confirmation."""
+
+    lines = [
+        "🧹 Clean Sent Duplicate Copies",
+        "",
+        "Only exact Telegram media fingerprints are included.",
+        "The oldest sent copy stays. Source posts are never touched.",
+        "",
+        f"Duplicate groups: {plan.group_count}",
+        f"Extra deliveries: {plan.delivery_count}",
+        f"Telegram messages to delete: {plan.message_count}",
+    ]
+    if not plan.candidates:
+        lines += [
+            "",
+            "✅ No safe, verified duplicate deliveries are ready to clean.",
+            "Only completed media with saved destination IDs can be removed.",
+        ]
+        return "\n".join(lines)
+
+    lines += ["", "Preview (first 8):"]
+    for index, candidate in enumerate(plan.candidates[:8], start=1):
+        topic = f" · topic {candidate.dest_topic_id}" if candidate.dest_topic_id is not None else ""
+        lines += [
+            f"{index}. Destination {candidate.dest_chat_id}{topic}",
+            f"   Delete: {', '.join(str(value) for value in candidate.dest_message_ids)}",
+            f"   Keep: {', '.join(str(value) for value in candidate.kept_dest_message_ids)}",
+        ]
+    if plan.delivery_count > 8:
+        lines.append(f"… and {plan.delivery_count - 8} more duplicate delivery record(s).")
+    lines += ["", "This cannot be undone from Telegram."]
+    return "\n".join(lines)[:3900]
+
+
+def _duplicate_cleanup_menu(plan: DuplicateCleanupPlan) -> InlineKeyboardMarkup:
+    if not plan.candidates:
+        return _buttons([[("⬅️ Duplicate Detector", "duplicates:view")]])
+    return _buttons(
+        [
+            [
+                (
+                    f"🗑 Delete {plan.message_count} Extra Message(s)",
+                    "duplicates:cleanup:confirm",
+                )
+            ],
+            [("⬅️ Cancel", "duplicates:view")],
+        ]
+    )
+
+
+def _duplicate_cleanup_result_text(
+    *,
+    deleted_deliveries: int,
+    deleted_messages: int,
+    failures: list[str],
+) -> str:
+    lines = [
+        "🧹 Duplicate Cleanup Finished",
+        "",
+        f"Deleted delivery records: {deleted_deliveries}",
+        f"Deleted Telegram messages: {deleted_messages}",
+    ]
+    if failures:
+        lines += ["", f"Not changed: {len(failures)}", "", "First errors:"]
+        lines.extend(f"• {item}" for item in failures[:5])
+        lines += ["", "Check the channel and make sure the bot can delete messages there."]
+    else:
+        lines += ["", "✅ The retained original copy and all other destinations were left unchanged."]
+    return "\n".join(lines)[:3900]
 
 
 def _finder_result_text(reference: str, match: dict[str, Any] | None) -> str:
@@ -1334,6 +1413,7 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
     path = Path(config_path).resolve()
     logger = setup_logging(config.logging)
     app = Client(name="manager_admin", api_id=config.telegram.api_id, api_hash=config.telegram.api_hash, bot_token=config.telegram.bot_token, in_memory=True)
+    cleanup_limiter = TelegramLimiter(config, logger)
 
     async def edit(query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
         try:
@@ -1767,6 +1847,77 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
         if data == "duplicates:view":
             await edit(query, _duplicates_text(config), _duplicates_menu())
             await query.answer()
+            return
+        if data == "duplicates:cleanup:preview":
+            db = _database(config)
+            try:
+                plan = plan_duplicate_delivery_cleanup(db)
+            finally:
+                db.close()
+            await edit(query, _duplicate_cleanup_text(plan), _duplicate_cleanup_menu(plan))
+            await query.answer()
+            return
+        if data == "duplicates:cleanup:confirm":
+            if is_active_phase(read_status(config).get("phase")):
+                await query.answer("Stop the migration before deleting duplicate copies.", show_alert=True)
+                return
+            cleanup_key = config.queue.db_path.resolve()
+            if cleanup_key in _DUPLICATE_CLEANUP_ACTIVE:
+                await query.answer("Duplicate cleanup is already running.", show_alert=True)
+                return
+
+            db = _database(config)
+            try:
+                plan = plan_duplicate_delivery_cleanup(db)
+                if not plan.candidates:
+                    await edit(query, _duplicate_cleanup_text(plan), _duplicate_cleanup_menu(plan))
+                    await query.answer("Nothing safe to delete.", show_alert=True)
+                    return
+
+                _DUPLICATE_CLEANUP_ACTIVE.add(cleanup_key)
+                await query.answer(f"Deleting {plan.message_count} exact duplicate message(s)…")
+                await edit(
+                    query,
+                    "🧹 Cleaning duplicate copies…\n\n"
+                    "Telegram is deleting only the approved, exact duplicate deliveries.",
+                    _back("duplicates:view", "⬅️ Duplicate Detector"),
+                )
+                queue = MessageQueue(db, config)
+                deleted_deliveries = 0
+                deleted_messages = 0
+                failures: list[str] = []
+                for candidate in plan.candidates:
+                    try:
+                        await cleanup_limiter.call(
+                            "delete",
+                            app.delete_messages,
+                            chat_id=candidate.dest_chat_id,
+                            message_ids=list(candidate.dest_message_ids),
+                            revoke=True,
+                        )
+                        if not mark_duplicate_delivery_deleted(db, candidate):
+                            failures.append(
+                                f"Job #{candidate.job_id}: deleted in Telegram, but its database row changed first."
+                            )
+                            continue
+                        queue.release3.recompute_source_state(candidate.source_chat_id)
+                        deleted_deliveries += 1
+                        deleted_messages += candidate.message_count
+                    except Exception as exc:
+                        failures.append(f"Job #{candidate.job_id}: {exc.__class__.__name__}: {str(exc)[:120]}")
+
+                await edit(
+                    query,
+                    _duplicate_cleanup_result_text(
+                        deleted_deliveries=deleted_deliveries,
+                        deleted_messages=deleted_messages,
+                        failures=failures,
+                    ),
+                    _duplicates_menu(),
+                )
+            finally:
+                _DUPLICATE_CLEANUP_ACTIVE.discard(cleanup_key)
+                db.close()
             return
         if data in pages:
             fn, markup = pages[data]

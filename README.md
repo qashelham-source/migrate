@@ -14,6 +14,7 @@ Use this project only for content you own or have permission to access, copy, an
 - native Telegram copy/forward with download-and-upload fallback
 - filter-consistent album/media-group handling
 - fast per-destination duplicate detection using Telegram media fingerprints
+- confirmed cleanup of already-sent exact duplicate media copies
 - reusable bot `file_id` cache
 - strong destination verification and item-level repair
 - fail-safe destination readiness checks and Issue Center reporting
@@ -163,6 +164,8 @@ Legacy `SendMultiMedia MEDIA_EMPTY` failures are not silently requeued during st
 The fast detector compares Telegram's media fingerprint (`file_unique_id`) before a new job is queued. When the same single media item or complete album is already pending, in progress, or copied to the **same destination and topic**, the later source post is recorded as `skipped` with a reason that identifies the original job. This prevents a restart or repeated repost from producing another copy.
 
 Different destinations and topics remain independent. Text messages and repair jobs are not compared by this detector. It does not download every file or calculate a SHA-256 checksum, so it remains lightweight; a file re-uploaded to Telegram with a different fingerprint can still be copied.
+
+For duplicates created before the detector was enabled, open **Smart Center → Duplicate Detector → Clean Sent Copies**. The panel first shows a read-only preview, then requires a separate delete confirmation. It only deletes verified, tracked destination messages with the exact same media fingerprint in the same destination and topic; it keeps the oldest sent copy, never touches source posts, and records the removed copy as an expected skip so a later full scan does not send it again. Stop an active migration before cleanup, and ensure the control bot has permission to delete messages in that destination.
 
 ## Telegram control panel
 

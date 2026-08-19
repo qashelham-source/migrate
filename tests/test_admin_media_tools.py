@@ -23,7 +23,7 @@ def test_finder_menu_routes_to_real_actions() -> None:
 
 def test_duplicate_menu_routes_to_real_actions() -> None:
     callbacks = _callbacks(_duplicates_menu())
-    assert {"duplicates:index", "duplicates:view"}.issubset(callbacks)
+    assert {"duplicates:index", "duplicates:view", "duplicates:cleanup:preview"}.issubset(callbacks)
 
 
 def test_finder_stats_and_result_are_operator_readable() -> None:
