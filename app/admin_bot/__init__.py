@@ -59,10 +59,11 @@ from app.destination_manager import (
     set_sources,
     unblacklist_source,
 )
-from app.duplicate_cleanup import (
-    DuplicateCleanupPlan,
-    mark_duplicate_delivery_deleted,
-    plan_duplicate_delivery_cleanup,
+from app.destination_duplicate_scan import (
+    DestinationDuplicatePlan,
+    complete_destination_duplicate_cleanup,
+    load_destination_duplicate_plan,
+    request_destination_duplicate_scan,
 )
 from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
 from app.queue import MessageQueue
@@ -745,73 +746,100 @@ def _duplicates_menu() -> InlineKeyboardMarkup:
     return _buttons(
         [
             [("📥 Index Queue", "duplicates:index"), ("🔄 Refresh", "duplicates:view")],
-            [("🧹 Clean Sent Copies", "duplicates:cleanup:preview")],
+            [("🔎 Scan Destination", "duplicates:destination:scan")],
+            [("🧹 Clean Scan Results", "duplicates:destination:preview")],
             [("⬅️ Smart Center", "smart:menu")],
         ]
     )
 
 
-def _duplicate_cleanup_text(plan: DuplicateCleanupPlan) -> str:
-    """Render the non-destructive cleanup preview before the delete confirmation."""
+def _destination_duplicate_cleanup_text(plan: DestinationDuplicatePlan | None) -> str:
+    """Render a live destination-history scan without making any deletion."""
 
     lines = [
-        "🧹 Clean Sent Duplicate Copies",
+        "🧹 Destination Duplicate Cleanup",
         "",
-        "Only exact Telegram media fingerprints from recorded deliveries are included.",
-        "The oldest sent copy stays. Source posts are never touched.",
-        "",
-        f"Duplicate groups: {plan.group_count}",
-        f"Extra deliveries: {plan.delivery_count}",
-        f"Telegram messages to delete: {plan.message_count}",
+        "This reads the actual configured destination history.",
+        "Only exact Telegram media fingerprints match. Source posts are never touched.",
     ]
-    if not plan.candidates:
+    if plan is None:
+        lines += ["", "Tap Scan Destination first. No deletion happens during the scan."]
+        return "\n".join(lines)
+    if plan.state == "pending":
+        lines += ["", "⏳ Scan queued. The manager session will start it shortly.", "Tap Refresh to view progress."]
+        return "\n".join(lines)
+    if plan.state == "running":
         lines += [
             "",
-            "✅ No exact duplicate deliveries with saved destination IDs are ready to clean.",
-            "Only media sent and recorded by this migration manager can be removed.",
+            "⏳ Scanning destination history…",
+            f"Messages checked so far: {plan.scanned_message_count}",
+            f"Media fingerprints read so far: {plan.media_message_count}",
+            "Tap Refresh after a moment.",
         ]
+        return "\n".join(lines)
+    if plan.state == "completed":
+        lines += [
+            "",
+            f"✅ Previous cleanup deleted: {plan.deleted_message_count} Telegram message(s).",
+            "Run a fresh scan to verify the destination.",
+        ]
+        if plan.error:
+            lines += ["", f"Some delete requests failed: {plan.error[:300]}"]
+        return "\n".join(lines)
+    if plan.state in {"failed", "cancelled"}:
+        lines += ["", f"❌ Scan {plan.state}: {plan.error or 'Unknown error'}", "Tap Scan Destination to try again."]
+        return "\n".join(lines)
+
+    lines += [
+        "",
+        f"Destination messages scanned: {plan.scanned_message_count}",
+        f"Media fingerprints checked: {plan.media_message_count}",
+        f"Exact duplicate groups: {plan.group_count}",
+        f"Telegram messages to delete: {plan.message_count}",
+    ]
+    if not plan.groups:
+        lines += ["", "✅ No exact duplicate media was found in the destination history."]
         return "\n".join(lines)
 
     lines += ["", "Preview (first 8):"]
-    for index, candidate in enumerate(plan.candidates[:8], start=1):
-        topic = f" · topic {candidate.dest_topic_id}" if candidate.dest_topic_id is not None else ""
+    for index, group in enumerate(plan.groups[:8], start=1):
+        topic = f" · topic {group.dest_topic_id}" if group.dest_topic_id is not None else ""
         lines += [
-            f"{index}. Destination {candidate.dest_chat_id}{topic}",
-            f"   Delete: {', '.join(str(value) for value in candidate.dest_message_ids)}",
-            f"   Keep: {', '.join(str(value) for value in candidate.kept_dest_message_ids)}",
+            f"{index}. {group.dest_title}{topic} · {group.media_type}",
+            f"   Keep: {group.kept_message_id}",
+            f"   Delete: {', '.join(str(value) for value in group.duplicate_message_ids)}",
         ]
-    if plan.delivery_count > 8:
-        lines.append(f"… and {plan.delivery_count - 8} more duplicate delivery record(s).")
+    if plan.group_count > 8:
+        lines.append(f"… and {plan.group_count - 8} more exact duplicate group(s).")
     lines += ["", "This cannot be undone from Telegram."]
     return "\n".join(lines)[:3900]
 
 
-def _duplicate_cleanup_menu(plan: DuplicateCleanupPlan) -> InlineKeyboardMarkup:
-    if not plan.candidates:
-        return _buttons([[("⬅️ Duplicate Detector", "duplicates:view")]])
-    return _buttons(
-        [
+def _destination_duplicate_cleanup_menu(plan: DestinationDuplicatePlan | None) -> InlineKeyboardMarkup:
+    rows: list[list[tuple[str, str]]] = []
+    if plan is None or plan.state not in {"pending", "running"}:
+        rows.append([("🔎 Scan Destination", "duplicates:destination:scan")])
+    if plan and plan.state == "ready" and plan.message_count:
+        rows.append(
             [
                 (
-                    f"🗑 Delete {plan.message_count} Extra Message(s)",
-                    "duplicates:cleanup:confirm",
+                    f"🗑 Delete {plan.message_count} Exact Duplicate Message(s)",
+                    "duplicates:destination:confirm",
                 )
-            ],
-            [("⬅️ Cancel", "duplicates:view")],
-        ]
-    )
+            ]
+        )
+    rows += [[("🔄 Refresh", "duplicates:destination:preview")], [("⬅️ Duplicate Detector", "duplicates:view")]]
+    return _buttons(rows)
 
 
-def _duplicate_cleanup_result_text(
+def _destination_duplicate_cleanup_result_text(
     *,
-    deleted_deliveries: int,
     deleted_messages: int,
     failures: list[str],
 ) -> str:
     lines = [
-        "🧹 Duplicate Cleanup Finished",
+        "🧹 Destination Duplicate Cleanup Finished",
         "",
-        f"Deleted delivery records: {deleted_deliveries}",
         f"Deleted Telegram messages: {deleted_messages}",
     ]
     if failures:
@@ -819,8 +847,12 @@ def _duplicate_cleanup_result_text(
         lines.extend(f"• {item}" for item in failures[:5])
         lines += ["", "Check the channel and make sure the bot can delete messages there."]
     else:
-        lines += ["", "✅ The retained original copy and all other destinations were left unchanged."]
+        lines += ["", "✅ The oldest matching copy was kept. Source posts were not changed."]
     return "\n".join(lines)[:3900]
+
+
+def _chunks(values: tuple[int, ...], size: int = 100) -> list[tuple[int, ...]]:
+    return [values[index:index + size] for index in range(0, len(values), size)]
 
 
 def _finder_result_text(reference: str, match: dict[str, Any] | None) -> str:
@@ -1848,16 +1880,29 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await edit(query, _duplicates_text(config), _duplicates_menu())
             await query.answer()
             return
-        if data == "duplicates:cleanup:preview":
-            db = _database(config)
-            try:
-                plan = plan_duplicate_delivery_cleanup(db)
-            finally:
-                db.close()
-            await edit(query, _duplicate_cleanup_text(plan), _duplicate_cleanup_menu(plan))
+        if data in {"duplicates:cleanup:preview", "duplicates:destination:scan"}:
+            if is_active_phase(read_status(config).get("phase")):
+                await query.answer("Stop the migration before scanning destination history.", show_alert=True)
+                return
+            plan = request_destination_duplicate_scan(config)
+            request_run_mode(config, "duplicate_cleanup_scan")
+            await edit(
+                query,
+                _destination_duplicate_cleanup_text(plan),
+                _destination_duplicate_cleanup_menu(plan),
+            )
+            await query.answer("Destination scan queued. Tap Refresh shortly.", show_alert=True)
+            return
+        if data == "duplicates:destination:preview":
+            plan = load_destination_duplicate_plan(config)
+            await edit(
+                query,
+                _destination_duplicate_cleanup_text(plan),
+                _destination_duplicate_cleanup_menu(plan),
+            )
             await query.answer()
             return
-        if data == "duplicates:cleanup:confirm":
+        if data in {"duplicates:cleanup:confirm", "duplicates:destination:confirm"}:
             if is_active_phase(read_status(config).get("phase")):
                 await query.answer("Stop the migration before deleting duplicate copies.", show_alert=True)
                 return
@@ -1866,50 +1911,53 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 await query.answer("Duplicate cleanup is already running.", show_alert=True)
                 return
 
-            db = _database(config)
+            plan = load_destination_duplicate_plan(config)
+            if plan is None or plan.state != "ready" or not plan.message_count:
+                await edit(
+                    query,
+                    _destination_duplicate_cleanup_text(plan),
+                    _destination_duplicate_cleanup_menu(plan),
+                )
+                await query.answer("Run and refresh a destination scan first.", show_alert=True)
+                return
             try:
-                plan = plan_duplicate_delivery_cleanup(db)
-                if not plan.candidates:
-                    await edit(query, _duplicate_cleanup_text(plan), _duplicate_cleanup_menu(plan))
-                    await query.answer("Nothing safe to delete.", show_alert=True)
-                    return
-
                 _DUPLICATE_CLEANUP_ACTIVE.add(cleanup_key)
                 await query.answer(f"Deleting {plan.message_count} exact duplicate message(s)…")
                 await edit(
                     query,
                     "🧹 Cleaning duplicate copies…\n\n"
-                    "Telegram is deleting only the approved, exact duplicate deliveries.",
+                    "Telegram is deleting only the approved exact duplicates from the scan.",
                     _back("duplicates:view", "⬅️ Duplicate Detector"),
                 )
-                queue = MessageQueue(db, config)
-                deleted_deliveries = 0
                 deleted_messages = 0
                 failures: list[str] = []
-                for candidate in plan.candidates:
-                    try:
-                        await cleanup_limiter.call(
-                            "delete",
-                            app.delete_messages,
-                            chat_id=candidate.dest_chat_id,
-                            message_ids=list(candidate.dest_message_ids),
-                            revoke=True,
-                        )
-                        if not mark_duplicate_delivery_deleted(db, candidate):
-                            failures.append(
-                                f"Job #{candidate.job_id}: deleted in Telegram, but its database row changed first."
+                for group in plan.groups:
+                    for message_ids in _chunks(group.duplicate_message_ids):
+                        try:
+                            await cleanup_limiter.call(
+                                "delete",
+                                app.delete_messages,
+                                chat_id=group.dest_chat_id,
+                                message_ids=list(message_ids),
+                                revoke=True,
                             )
-                            continue
-                        queue.release3.recompute_source_state(candidate.source_chat_id)
-                        deleted_deliveries += 1
-                        deleted_messages += candidate.message_count
-                    except Exception as exc:
-                        failures.append(f"Job #{candidate.job_id}: {exc.__class__.__name__}: {str(exc)[:120]}")
+                            deleted_messages += len(message_ids)
+                        except Exception as exc:
+                            failures.append(
+                                f"{group.dest_title} ({', '.join(str(item) for item in message_ids)}): "
+                                f"{exc.__class__.__name__}: {str(exc)[:120]}"
+                            )
+
+                complete_destination_duplicate_cleanup(
+                    config,
+                    plan,
+                    deleted_message_count=deleted_messages,
+                    failures=failures,
+                )
 
                 await edit(
                     query,
-                    _duplicate_cleanup_result_text(
-                        deleted_deliveries=deleted_deliveries,
+                    _destination_duplicate_cleanup_result_text(
                         deleted_messages=deleted_messages,
                         failures=failures,
                     ),
@@ -1917,7 +1965,6 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
                 )
             finally:
                 _DUPLICATE_CLEANUP_ACTIVE.discard(cleanup_key)
-                db.close()
             return
         if data in pages:
             fn, markup = pages[data]

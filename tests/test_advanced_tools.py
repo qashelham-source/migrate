@@ -58,6 +58,13 @@ def test_request_run_mode_writes_atomic_mode_and_wakeup_marker(tmp_path: Path) -
     assert (runtime_dir / "run_now").exists()
 
 
+def test_request_run_mode_accepts_destination_duplicate_scan(tmp_path: Path) -> None:
+    config = config_for(tmp_path)
+    request_run_mode(config, "duplicate_cleanup_scan")  # type: ignore[arg-type]
+
+    assert (tmp_path / "data" / "run_mode").read_text(encoding="utf-8") == "duplicate_cleanup_scan"
+
+
 def test_health_report_round_trip(tmp_path: Path) -> None:
     config = config_for(tmp_path)
     report = {"overall": "pass", "checks": [{"name": "storage", "status": "pass"}]}

@@ -575,10 +575,19 @@ def message_file_size(message: Message) -> int | None:
 
 
 def message_unique_key(message: Message) -> str:
+    file_unique_id = message_file_unique_id(message)
+    if file_unique_id:
+        return file_unique_id
     media = _message_media_object(message)
     if media:
-        return str(getattr(media, "file_unique_id", None) or getattr(media, "file_id", None) or "")
+        return str(getattr(media, "file_id", None) or "")
     return ""
+
+
+def message_file_unique_id(message: Message) -> str:
+    """Return Telegram's cross-message media fingerprint, never a fallback file ID."""
+    media = _message_media_object(message)
+    return str(getattr(media, "file_unique_id", None) or "") if media else ""
 
 
 def message_caption(message: Message) -> str | None:

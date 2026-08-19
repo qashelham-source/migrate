@@ -17,6 +17,7 @@ from app.config import AppConfig, load_config
 from app.control import clear_stop, is_pause_requested, watch_stop_request, write_status
 from app.db import Database
 from app.destination_manager import add_destination, list_destinations, remove_destination
+from app.destination_duplicate_scan import scan_destination_duplicate_history
 from app.health import run_health_check
 from app.live import LiveTrigger
 from app.logging import setup_logging
@@ -719,6 +720,33 @@ async def _execute_cycle(
     trigger_reason: str | None = None,
 ) -> CycleOutcome:
     queue.config = config
+    if command == "duplicate_cleanup_scan":
+        write_status(
+            config,
+            "scanning",
+            message="Scanning configured destination history for exact duplicate media.",
+            cycle_mode=command,
+        )
+        plan = await scan_destination_duplicate_history(config, reader, limiter, stop_event)
+        if plan.state == "ready":
+            write_status(
+                config,
+                "source_complete",
+                message=(
+                    "Destination duplicate scan finished: "
+                    f"{plan.group_count} group(s), {plan.message_count} extra message(s)."
+                ),
+                cycle_mode=command,
+            )
+            return CycleOutcome("complete", message="Destination duplicate scan finished.")
+        write_status(
+            config,
+            "blocked" if plan.state == "failed" else "stopped",
+            message=plan.error or "Destination duplicate scan did not complete.",
+            cycle_mode=command,
+        )
+        return CycleOutcome("blocked", message=plan.error or "Destination duplicate scan did not complete.")
+
     writer = bot if bot is not None and config.telegram.use_bot_for_uploads else reader
     writer, destinations_ready = await choose_writer_for_destinations(
         config,

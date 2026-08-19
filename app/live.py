@@ -12,7 +12,7 @@ from pyrogram.handlers import MessageHandler
 from app.config import AppConfig
 
 
-VALID_RUN_MODES = {"health", "process", "sync", "run"}
+VALID_RUN_MODES = {"health", "process", "sync", "run", "duplicate_cleanup_scan"}
 
 
 def _runtime_dir(config: AppConfig) -> Path:
