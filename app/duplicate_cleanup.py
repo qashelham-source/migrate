@@ -85,11 +85,14 @@ def _decode_message_ids(value: Any) -> tuple[int, ...]:
 
 
 def plan_duplicate_delivery_cleanup(db: Database) -> DuplicateCleanupPlan:
-    """Find exact, verified duplicate deliveries without changing Telegram or SQLite.
+    """Find exact duplicate deliveries without changing Telegram or SQLite.
 
-    Only completed, verified media deliveries with stored destination message IDs
-    are eligible.  The first message already present in the destination is
-    retained; later full copies of the same fingerprint become candidates.
+    A ``copied`` row with stored destination message IDs is a completed
+    delivery record: Telegram has already returned the messages that were
+    sent.  Strong post-send verification is useful for migration health, but
+    older successful deliveries may not have it.  The first message already
+    present in the destination is retained; later full copies of the same
+    fingerprint become candidates.
     """
 
     rows = db.query(
@@ -98,7 +101,6 @@ def plan_duplicate_delivery_cleanup(db: Database) -> DuplicateCleanupPlan:
                file_unique_key, dest_message_ids
         FROM messages
         WHERE status = 'copied'
-          AND verified_at IS NOT NULL
           AND file_unique_key != ''
           AND file_unique_key NOT LIKE 'messages:%'
           AND file_unique_key NOT LIKE 'repair:%'
@@ -190,7 +192,6 @@ def mark_duplicate_delivery_deleted(db: Database, candidate: DuplicateCleanupCan
             updated_at = ?
         WHERE id = ?
           AND status = 'copied'
-          AND verified_at IS NOT NULL
           AND source_chat_id = ?
           AND dest_chat_id = ?
           AND COALESCE(dest_topic_id, 0) = ?
