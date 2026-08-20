@@ -17,7 +17,10 @@ from app.config import AppConfig, load_config
 from app.control import clear_stop, is_pause_requested, watch_stop_request, write_status
 from app.db import Database
 from app.destination_manager import add_destination, list_destinations, remove_destination
-from app.destination_duplicate_scan import scan_destination_duplicate_history
+from app.destination_duplicate_scan import (
+    delete_destination_duplicate_history,
+    scan_destination_duplicate_history,
+)
 from app.health import run_health_check
 from app.live import LiveTrigger
 from app.logging import setup_logging
@@ -746,6 +749,36 @@ async def _execute_cycle(
             cycle_mode=command,
         )
         return CycleOutcome("blocked", message=plan.error or "Destination duplicate scan did not complete.")
+
+    if command == "duplicate_cleanup_delete":
+        write_status(
+            config,
+            "processing",
+            message="Deleting reviewed destination duplicate media through the manager session.",
+            cycle_mode=command,
+        )
+        plan = await delete_destination_duplicate_history(config, reader, limiter, stop_event)
+        if plan.state == "completed":
+            write_status(
+                config,
+                "source_complete",
+                message=(
+                    "Destination duplicate cleanup finished: "
+                    f"{plan.deleted_message_count} message(s) deleted."
+                ),
+                cycle_mode=command,
+            )
+            return CycleOutcome("complete", message="Destination duplicate cleanup finished.")
+        write_status(
+            config,
+            "blocked" if plan.state == "delete_failed" else "stopped",
+            message=plan.error or "Destination duplicate cleanup did not complete.",
+            cycle_mode=command,
+        )
+        return CycleOutcome(
+            "blocked",
+            message=plan.error or "Destination duplicate cleanup did not complete.",
+        )
 
     writer = bot if bot is not None and config.telegram.use_bot_for_uploads else reader
     writer, destinations_ready = await choose_writer_for_destinations(

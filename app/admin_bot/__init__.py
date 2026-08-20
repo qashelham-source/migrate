@@ -61,14 +61,14 @@ from app.destination_manager import (
 )
 from app.destination_duplicate_scan import (
     DestinationDuplicatePlan,
-    complete_destination_duplicate_cleanup,
     load_destination_duplicate_plan,
+    request_destination_duplicate_cleanup,
     request_destination_duplicate_scan,
 )
 from app.media_finder import duplicate_groups, find_by_reference, index_existing_queue, media_finder_stats
 from app.queue import MessageQueue
 from app.shared_state import get_floodwait
-from app.telegram_client import TelegramLimiter, start_client_with_floodwait
+from app.telegram_client import start_client_with_floodwait
 from app.logging import setup_logging
 
 _LIVE_TASKS: dict[int, asyncio.Task[None]] = {}
@@ -77,7 +77,6 @@ _SOURCE_TITLE_CACHE: dict[Path, dict[str, str]] = {}
 _SELECTIONS: dict[int, dict[str, list[str]]] = {}
 _CONTENT_TYPES: dict[int, set[str]] = {}
 _FINDER_INPUTS: set[int] = set()
-_DUPLICATE_CLEANUP_ACTIVE: set[Path] = set()
 _PAGE_SIZE = 8
 
 _ALL_CONTENT_TYPES: tuple[str, ...] = ("video", "photo", "text")
@@ -777,6 +776,22 @@ def _destination_duplicate_cleanup_text(plan: DestinationDuplicatePlan | None) -
             "Tap Refresh after a moment.",
         ]
         return "\n".join(lines)
+    if plan.state == "delete_pending":
+        lines += [
+            "",
+            "⏳ Cleanup queued.",
+            "The manager session that scanned this destination will delete the approved IDs.",
+            "Tap Refresh shortly to view progress.",
+        ]
+        return "\n".join(lines)
+    if plan.state == "deleting":
+        lines += [
+            "",
+            "⏳ Deleting approved exact duplicates through the manager session…",
+            f"Deleted so far: {plan.deleted_message_count}",
+            "Tap Refresh shortly to view progress.",
+        ]
+        return "\n".join(lines)
     if plan.state == "completed":
         lines += [
             "",
@@ -784,10 +799,15 @@ def _destination_duplicate_cleanup_text(plan: DestinationDuplicatePlan | None) -
             "Run a fresh scan to verify the destination.",
         ]
         if plan.error:
-            lines += ["", f"Some delete requests failed: {plan.error[:300]}"]
+            lines += ["", f"Some manager delete requests failed: {plan.error[:300]}"]
         return "\n".join(lines)
-    if plan.state in {"failed", "cancelled"}:
-        lines += ["", f"❌ Scan {plan.state}: {plan.error or 'Unknown error'}", "Tap Scan Destination to try again."]
+    if plan.state in {"failed", "cancelled", "delete_failed", "delete_cancelled"}:
+        action = "Cleanup" if plan.state.startswith("delete_") else "Scan"
+        lines += [
+            "",
+            f"❌ {action} {plan.state.removeprefix('delete_')}: {plan.error or 'Unknown error'}",
+            "Tap Scan Destination to create a fresh review.",
+        ]
         return "\n".join(lines)
 
     lines += [
@@ -817,7 +837,7 @@ def _destination_duplicate_cleanup_text(plan: DestinationDuplicatePlan | None) -
 
 def _destination_duplicate_cleanup_menu(plan: DestinationDuplicatePlan | None) -> InlineKeyboardMarkup:
     rows: list[list[tuple[str, str]]] = []
-    if plan is None or plan.state not in {"pending", "running"}:
+    if plan is None or plan.state not in {"pending", "running", "delete_pending", "deleting"}:
         rows.append([("🔎 Scan Destination", "duplicates:destination:scan")])
     if plan and plan.state == "ready" and plan.message_count:
         rows.append(
@@ -830,29 +850,6 @@ def _destination_duplicate_cleanup_menu(plan: DestinationDuplicatePlan | None) -
         )
     rows += [[("🔄 Refresh", "duplicates:destination:preview")], [("⬅️ Duplicate Detector", "duplicates:view")]]
     return _buttons(rows)
-
-
-def _destination_duplicate_cleanup_result_text(
-    *,
-    deleted_messages: int,
-    failures: list[str],
-) -> str:
-    lines = [
-        "🧹 Destination Duplicate Cleanup Finished",
-        "",
-        f"Deleted Telegram messages: {deleted_messages}",
-    ]
-    if failures:
-        lines += ["", f"Not changed: {len(failures)}", "", "First errors:"]
-        lines.extend(f"• {item}" for item in failures[:5])
-        lines += ["", "Check the channel and make sure the bot can delete messages there."]
-    else:
-        lines += ["", "✅ The oldest matching copy was kept. Source posts were not changed."]
-    return "\n".join(lines)[:3900]
-
-
-def _chunks(values: tuple[int, ...], size: int = 100) -> list[tuple[int, ...]]:
-    return [values[index:index + size] for index in range(0, len(values), size)]
 
 
 def _finder_result_text(reference: str, match: dict[str, Any] | None) -> str:
@@ -1445,8 +1442,6 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
     path = Path(config_path).resolve()
     logger = setup_logging(config.logging)
     app = Client(name="manager_admin", api_id=config.telegram.api_id, api_hash=config.telegram.api_hash, bot_token=config.telegram.bot_token, in_memory=True)
-    cleanup_limiter = TelegramLimiter(config, logger)
-
     async def edit(query: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
         try:
             await query.message.edit_text(text, reply_markup=markup)
@@ -1906,65 +1901,26 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             if is_active_phase(read_status(config).get("phase")):
                 await query.answer("Stop the migration before deleting duplicate copies.", show_alert=True)
                 return
-            cleanup_key = config.queue.db_path.resolve()
-            if cleanup_key in _DUPLICATE_CLEANUP_ACTIVE:
-                await query.answer("Duplicate cleanup is already running.", show_alert=True)
-                return
-
-            plan = load_destination_duplicate_plan(config)
-            if plan is None or plan.state != "ready" or not plan.message_count:
+            plan = request_destination_duplicate_cleanup(config)
+            if plan is None:
+                current_plan = load_destination_duplicate_plan(config)
                 await edit(
                     query,
-                    _destination_duplicate_cleanup_text(plan),
-                    _destination_duplicate_cleanup_menu(plan),
+                    _destination_duplicate_cleanup_text(current_plan),
+                    _destination_duplicate_cleanup_menu(current_plan),
                 )
                 await query.answer("Run and refresh a destination scan first.", show_alert=True)
                 return
-            try:
-                _DUPLICATE_CLEANUP_ACTIVE.add(cleanup_key)
-                await query.answer(f"Deleting {plan.message_count} exact duplicate message(s)…")
-                await edit(
-                    query,
-                    "🧹 Cleaning duplicate copies…\n\n"
-                    "Telegram is deleting only the approved exact duplicates from the scan.",
-                    _back("duplicates:view", "⬅️ Duplicate Detector"),
-                )
-                deleted_messages = 0
-                failures: list[str] = []
-                for group in plan.groups:
-                    for message_ids in _chunks(group.duplicate_message_ids):
-                        try:
-                            await cleanup_limiter.call(
-                                "delete",
-                                app.delete_messages,
-                                chat_id=group.dest_chat_id,
-                                message_ids=list(message_ids),
-                                revoke=True,
-                            )
-                            deleted_messages += len(message_ids)
-                        except Exception as exc:
-                            failures.append(
-                                f"{group.dest_title} ({', '.join(str(item) for item in message_ids)}): "
-                                f"{exc.__class__.__name__}: {str(exc)[:120]}"
-                            )
-
-                complete_destination_duplicate_cleanup(
-                    config,
-                    plan,
-                    deleted_message_count=deleted_messages,
-                    failures=failures,
-                )
-
-                await edit(
-                    query,
-                    _destination_duplicate_cleanup_result_text(
-                        deleted_messages=deleted_messages,
-                        failures=failures,
-                    ),
-                    _duplicates_menu(),
-                )
-            finally:
-                _DUPLICATE_CLEANUP_ACTIVE.discard(cleanup_key)
+            request_run_mode(config, "duplicate_cleanup_delete")
+            await edit(
+                query,
+                _destination_duplicate_cleanup_text(plan),
+                _destination_duplicate_cleanup_menu(plan),
+            )
+            await query.answer(
+                "Cleanup queued. The manager session will delete the reviewed IDs.",
+                show_alert=True,
+            )
             return
         if data in pages:
             fn, markup = pages[data]
