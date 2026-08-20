@@ -4,7 +4,7 @@ import asyncio
 import json
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,11 +18,25 @@ from app.telegram_client import (
     message_is_empty,
     message_media_type,
     resolve_chat,
+    telegram_peer,
 )
 
 
 _RESULT_FILE = "destination_duplicate_cleanup.json"
 _SUPPORTED_MEDIA_TYPES = {"photo", "video", "document", "audio", "voice"}
+_PLAN_STATES = {
+    "pending",
+    "running",
+    "ready",
+    "delete_pending",
+    "deleting",
+    "failed",
+    "cancelled",
+    "delete_failed",
+    "delete_cancelled",
+    "completed",
+}
+_DELETE_BATCH_SIZE = 100
 
 
 @dataclass(frozen=True)
@@ -126,7 +140,7 @@ class DestinationDuplicatePlan:
     def from_dict(cls, value: dict[str, Any]) -> "DestinationDuplicatePlan | None":
         state = str(value.get("state") or "").strip().lower()
         scan_id = str(value.get("scan_id") or "").strip()
-        if state not in {"pending", "running", "ready", "failed", "cancelled", "completed"} or not scan_id:
+        if state not in _PLAN_STATES or not scan_id:
             return None
         groups: list[DestinationDuplicateGroup] = []
         raw_groups = value.get("groups") or []
@@ -170,6 +184,10 @@ class DestinationScanCancelled(Exception):
     """Internal signal used to leave no deletable plan after a stop request."""
 
 
+class DestinationCleanupCancelled(Exception):
+    """Internal signal used to stop an in-progress destructive cleanup safely."""
+
+
 def _optional_text(value: Any) -> str | None:
     text = str(value or "").strip()
     return text or None
@@ -201,6 +219,30 @@ def request_destination_duplicate_scan(config: AppConfig) -> DestinationDuplicat
             state="pending",
             scan_id=uuid.uuid4().hex,
             requested_at=utc_now(),
+        ),
+    )
+
+
+def request_destination_duplicate_cleanup(config: AppConfig) -> DestinationDuplicatePlan | None:
+    """Queue a previously reviewed cleanup for the manager user session.
+
+    The control bot intentionally does not call Telegram's delete API.  It
+    cannot reliably resolve private channel peers.  Instead it records the
+    approval here and wakes the long-lived manager session that performed the
+    scan and already has the destination peer available.
+    """
+
+    plan = load_destination_duplicate_plan(config)
+    if plan is None or plan.state != "ready" or not plan.message_count:
+        return None
+    return _save_plan(
+        config,
+        replace(
+            plan,
+            state="delete_pending",
+            completed_at=None,
+            deleted_message_count=0,
+            error=None,
         ),
     )
 
@@ -237,6 +279,146 @@ def complete_destination_duplicate_cleanup(
             error=failure_text,
         ),
     )
+
+
+def _chunks(values: tuple[int, ...], size: int = _DELETE_BATCH_SIZE) -> Iterable[tuple[int, ...]]:
+    for index in range(0, len(values), size):
+        yield values[index:index + size]
+
+
+def _delete_failure(group: DestinationDuplicateGroup, message_ids: tuple[int, ...], exc: Exception) -> str:
+    shown_ids = ", ".join(str(item) for item in message_ids[:10])
+    remainder = len(message_ids) - 10
+    ids = f"{shown_ids}, … (+{remainder})" if remainder > 0 else shown_ids
+    return f"{group.dest_title} ({ids}): {exc.__class__.__name__}: {str(exc)[:120]}"
+
+
+async def delete_destination_duplicate_history(
+    config: AppConfig,
+    reader: Client,
+    limiter: TelegramLimiter,
+    stop_event: asyncio.Event,
+) -> DestinationDuplicatePlan:
+    """Delete the approved IDs through the same manager session that scanned them.
+
+    Telegram message IDs never get reused inside a chat.  The persisted plan
+    therefore remains an exact, bounded deletion request; it never scans or
+    deletes source posts during cleanup.  A newly requested scan always
+    replaces the plan before another cleanup can be approved.
+    """
+
+    prior = load_destination_duplicate_plan(config)
+    if prior is None:
+        return _save_plan(
+            config,
+            DestinationDuplicatePlan(
+                state="delete_failed",
+                scan_id=uuid.uuid4().hex,
+                requested_at=utc_now(),
+                completed_at=utc_now(),
+                error="No reviewed destination duplicate scan is available.",
+            ),
+        )
+    if prior.state != "delete_pending":
+        return prior
+
+    plan = _save_plan(
+        config,
+        replace(
+            prior,
+            state="deleting",
+            completed_at=None,
+            deleted_message_count=0,
+            error=None,
+        ),
+    )
+    deleted_messages = 0
+    failures: list[str] = []
+    resolved_peers: dict[str, int | str] = {}
+
+    try:
+        for group in plan.groups:
+            if stop_event.is_set():
+                raise DestinationCleanupCancelled
+
+            peer = resolved_peers.get(group.dest_chat_id)
+            if peer is None:
+                try:
+                    chat = await limiter.call(
+                        "resolve",
+                        reader.get_chat,
+                        telegram_peer(group.dest_chat_id),
+                    )
+                    peer = telegram_peer(getattr(chat, "id", group.dest_chat_id))
+                    resolved_peers[group.dest_chat_id] = peer
+                except Exception as exc:
+                    failures.append(
+                        _delete_failure(group, group.duplicate_message_ids, exc)
+                    )
+                    continue
+
+            for message_ids in _chunks(group.duplicate_message_ids):
+                if stop_event.is_set():
+                    raise DestinationCleanupCancelled
+                try:
+                    await limiter.call(
+                        "delete",
+                        reader.delete_messages,
+                        chat_id=peer,
+                        message_ids=list(message_ids),
+                        revoke=True,
+                    )
+                except Exception as exc:
+                    failures.append(_delete_failure(group, message_ids, exc))
+                else:
+                    deleted_messages += len(message_ids)
+
+                plan = _save_plan(
+                    config,
+                    replace(
+                        plan,
+                        state="deleting",
+                        deleted_message_count=deleted_messages,
+                    ),
+                )
+                await asyncio.sleep(0)
+
+        return complete_destination_duplicate_cleanup(
+            config,
+            plan,
+            deleted_message_count=deleted_messages,
+            failures=failures,
+        )
+    except DestinationCleanupCancelled:
+        return _save_plan(
+            config,
+            DestinationDuplicatePlan(
+                state="delete_cancelled",
+                scan_id=plan.scan_id,
+                requested_at=plan.requested_at,
+                started_at=plan.started_at,
+                completed_at=utc_now(),
+                scanned_message_count=plan.scanned_message_count,
+                media_message_count=plan.media_message_count,
+                deleted_message_count=deleted_messages,
+                error="Cleanup was stopped. Run a fresh scan before deleting again.",
+            ),
+        )
+    except Exception as exc:
+        return _save_plan(
+            config,
+            DestinationDuplicatePlan(
+                state="delete_failed",
+                scan_id=plan.scan_id,
+                requested_at=plan.requested_at,
+                started_at=plan.started_at,
+                completed_at=utc_now(),
+                scanned_message_count=plan.scanned_message_count,
+                media_message_count=plan.media_message_count,
+                deleted_message_count=deleted_messages,
+                error=f"{exc.__class__.__name__}: {str(exc)[:500]}",
+            ),
+        )
 
 
 def _topic_id(message: Any) -> int | None:
