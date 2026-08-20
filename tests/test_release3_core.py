@@ -214,3 +214,13 @@ def test_live_service_consumes_destination_duplicate_cleanup_delete_request(tmp_
     (runtime / "run_now").touch()
 
     assert consume_run_request(config) == "duplicate_cleanup_delete"  # type: ignore[arg-type]
+
+
+def test_live_service_consumes_destination_duplicate_content_scan_request(tmp_path: Path) -> None:
+    config = config_for(tmp_path)
+    runtime = config.queue.db_path.parent
+    runtime.mkdir(parents=True)
+    (runtime / "run_mode").write_text("duplicate_cleanup_content_scan", encoding="utf-8")
+    (runtime / "run_now").touch()
+
+    assert consume_run_request(config) == "duplicate_cleanup_content_scan"  # type: ignore[arg-type]

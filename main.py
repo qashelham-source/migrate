@@ -19,6 +19,7 @@ from app.db import Database
 from app.destination_manager import add_destination, list_destinations, remove_destination
 from app.destination_duplicate_scan import (
     delete_destination_duplicate_history,
+    scan_destination_content_duplicates,
     scan_destination_duplicate_history,
 )
 from app.health import run_health_check
@@ -749,6 +750,33 @@ async def _execute_cycle(
             cycle_mode=command,
         )
         return CycleOutcome("blocked", message=plan.error or "Destination duplicate scan did not complete.")
+
+    if command == "duplicate_cleanup_content_scan":
+        write_status(
+            config,
+            "scanning",
+            message="Checking destination media content for byte-identical copies.",
+            cycle_mode=command,
+        )
+        plan = await scan_destination_content_duplicates(config, reader, limiter, stop_event)
+        if plan.state == "ready":
+            write_status(
+                config,
+                "source_complete",
+                message=(
+                    "Destination content scan finished: "
+                    f"{plan.group_count} group(s), {plan.message_count} extra message(s)."
+                ),
+                cycle_mode=command,
+            )
+            return CycleOutcome("complete", message="Destination content scan finished.")
+        write_status(
+            config,
+            "blocked" if plan.state == "failed" else "stopped",
+            message=plan.error or "Destination content scan did not complete.",
+            cycle_mode=command,
+        )
+        return CycleOutcome("blocked", message=plan.error or "Destination content scan did not complete.")
 
     if command == "duplicate_cleanup_delete":
         write_status(

@@ -18,6 +18,7 @@ VALID_RUN_MODES = {
     "sync",
     "run",
     "duplicate_cleanup_scan",
+    "duplicate_cleanup_content_scan",
     "duplicate_cleanup_delete",
 }
 

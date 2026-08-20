@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import tempfile
 import uuid
 from collections import defaultdict
 from dataclasses import dataclass, replace
@@ -15,6 +17,7 @@ from app.db import utc_now
 from app.telegram_client import (
     TelegramLimiter,
     message_file_unique_id,
+    message_file_size,
     message_is_empty,
     message_media_type,
     resolve_chat,
@@ -50,6 +53,7 @@ class DestinationDuplicateGroup:
     media_type: str
     kept_message_id: int
     duplicate_message_ids: tuple[int, ...]
+    match_kind: str = "telegram_fingerprint"
 
     @property
     def message_count(self) -> int:
@@ -64,6 +68,7 @@ class DestinationDuplicateGroup:
             "media_type": self.media_type,
             "kept_message_id": self.kept_message_id,
             "duplicate_message_ids": list(self.duplicate_message_ids),
+            "match_kind": self.match_kind,
         }
 
     @classmethod
@@ -88,6 +93,9 @@ class DestinationDuplicateGroup:
         dest_chat_id = str(value.get("dest_chat_id") or "").strip()
         if not file_unique_id or not dest_chat_id:
             return None
+        match_kind = str(value.get("match_kind") or "telegram_fingerprint").strip().lower()
+        if match_kind not in {"telegram_fingerprint", "content_sha256"}:
+            return None
         return cls(
             dest_chat_id=dest_chat_id,
             dest_title=str(value.get("dest_title") or dest_chat_id),
@@ -96,6 +104,7 @@ class DestinationDuplicateGroup:
             media_type=str(value.get("media_type") or "media"),
             kept_message_id=kept_message_id,
             duplicate_message_ids=tuple(sorted(set(duplicate_ids))),
+            match_kind=match_kind,
         )
 
 
@@ -111,6 +120,9 @@ class DestinationDuplicatePlan:
     scanned_message_count: int = 0
     media_message_count: int = 0
     deleted_message_count: int = 0
+    scan_mode: str = "fingerprint"
+    content_candidate_count: int = 0
+    content_hashed_count: int = 0
     groups: tuple[DestinationDuplicateGroup, ...] = ()
     error: str | None = None
 
@@ -132,6 +144,9 @@ class DestinationDuplicatePlan:
             "scanned_message_count": self.scanned_message_count,
             "media_message_count": self.media_message_count,
             "deleted_message_count": self.deleted_message_count,
+            "scan_mode": self.scan_mode,
+            "content_candidate_count": self.content_candidate_count,
+            "content_hashed_count": self.content_hashed_count,
             "groups": [group.as_dict() for group in self.groups],
             "error": self.error,
         }
@@ -160,6 +175,9 @@ class DestinationDuplicatePlan:
             except (TypeError, ValueError):
                 return 0
 
+        scan_mode = str(value.get("scan_mode") or "fingerprint").strip().lower()
+        if scan_mode not in {"fingerprint", "content"}:
+            return None
         return cls(
             state=state,
             scan_id=scan_id,
@@ -169,6 +187,9 @@ class DestinationDuplicatePlan:
             scanned_message_count=count("scanned_message_count"),
             media_message_count=count("media_message_count"),
             deleted_message_count=count("deleted_message_count"),
+            scan_mode=scan_mode,
+            content_candidate_count=count("content_candidate_count"),
+            content_hashed_count=count("content_hashed_count"),
             groups=tuple(groups),
             error=_optional_text(value.get("error")),
         )
@@ -176,6 +197,12 @@ class DestinationDuplicatePlan:
 
 @dataclass(frozen=True)
 class _HistoryRecord:
+    message_id: int
+    media_type: str
+
+
+@dataclass(frozen=True)
+class _ContentCandidate:
     message_id: int
     media_type: str
 
@@ -210,8 +237,16 @@ def _save_plan(config: AppConfig, plan: DestinationDuplicatePlan) -> Destination
     return plan
 
 
-def request_destination_duplicate_scan(config: AppConfig) -> DestinationDuplicatePlan:
+def request_destination_duplicate_scan(
+    config: AppConfig,
+    *,
+    scan_mode: str = "fingerprint",
+) -> DestinationDuplicatePlan:
     """Queue a read-only destination-history audit for the manager session."""
+
+    normalized_mode = str(scan_mode).strip().lower()
+    if normalized_mode not in {"fingerprint", "content"}:
+        raise ValueError(f"Unsupported destination duplicate scan mode: {scan_mode}")
 
     return _save_plan(
         config,
@@ -219,6 +254,7 @@ def request_destination_duplicate_scan(config: AppConfig) -> DestinationDuplicat
             state="pending",
             scan_id=uuid.uuid4().hex,
             requested_at=utc_now(),
+            scan_mode=normalized_mode,
         ),
     )
 
@@ -276,6 +312,9 @@ def complete_destination_duplicate_cleanup(
             scanned_message_count=plan.scanned_message_count,
             media_message_count=plan.media_message_count,
             deleted_message_count=max(0, int(deleted_message_count)),
+            scan_mode=plan.scan_mode,
+            content_candidate_count=plan.content_candidate_count,
+            content_hashed_count=plan.content_hashed_count,
             error=failure_text,
         ),
     )
@@ -442,6 +481,8 @@ def _matches_configured_topic(message: Any, configured_topic_id: int | None) -> 
 def _build_groups(
     records: dict[tuple[str, int, str], list[_HistoryRecord]],
     destinations: dict[tuple[str, int], tuple[str, int | None]],
+    *,
+    match_kind: str = "telegram_fingerprint",
 ) -> tuple[DestinationDuplicateGroup, ...]:
     groups: list[DestinationDuplicateGroup] = []
     for (chat_id, topic_key, file_unique_id), entries in records.items():
@@ -460,6 +501,7 @@ def _build_groups(
                 media_type=kept.media_type,
                 kept_message_id=kept.message_id,
                 duplicate_message_ids=duplicate_ids,
+                match_kind=match_kind,
             )
         )
     return tuple(
@@ -595,6 +637,229 @@ async def scan_destination_duplicate_history(
                 scan_id=plan.scan_id,
                 requested_at=plan.requested_at,
                 started_at=plan.started_at,
+                completed_at=utc_now(),
+                scanned_message_count=scanned,
+                media_message_count=media_count,
+                error=f"{exc.__class__.__name__}: {str(exc)[:500]}",
+            ),
+        )
+
+
+def _content_candidate_key(
+    chat_id: str,
+    topic_key: int,
+    media_type: str,
+    file_size: int,
+) -> tuple[str, int, str, int]:
+    return chat_id, topic_key, media_type, max(0, int(file_size))
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+async def _download_content_hash(
+    message: Any,
+    limiter: TelegramLimiter,
+    directory: Path,
+) -> str:
+    target = directory / f"message-{int(getattr(message, 'id', 0) or 0)}-{uuid.uuid4().hex}"
+    downloaded = await limiter.call("download", message.download, file_name=str(target))
+    path = Path(downloaded or target)
+    try:
+        if not path.is_file():
+            raise OSError("Telegram did not return a downloadable media file")
+        return await asyncio.to_thread(_hash_file, path)
+    finally:
+        path.unlink(missing_ok=True)
+        if path != target:
+            target.unlink(missing_ok=True)
+
+
+async def scan_destination_content_duplicates(
+    config: AppConfig,
+    reader: Client,
+    limiter: TelegramLimiter,
+    stop_event: asyncio.Event,
+) -> DestinationDuplicatePlan:
+    """Find byte-identical destination media when Telegram fingerprints differ.
+
+    The fast detector stays the default.  This deeper detector only downloads
+    media whose canonical type and exact byte size already match, then compares
+    SHA-256 checksums.  It never treats a merely similar image/video as safe to
+    delete.
+    """
+
+    prior = load_destination_duplicate_plan(config)
+    use_prior = bool(prior and prior.state == "pending" and prior.scan_mode == "content")
+    plan = DestinationDuplicatePlan(
+        state="running",
+        scan_id=prior.scan_id if use_prior else uuid.uuid4().hex,
+        requested_at=prior.requested_at if use_prior else utc_now(),
+        started_at=utc_now(),
+        scan_mode="content",
+    )
+    _save_plan(config, plan)
+
+    specs = [
+        spec
+        for spec in config.destinations
+        if str(getattr(spec, "chat", "") or "").strip()
+        and "destination_channel_or_-100_id" not in str(getattr(spec, "chat", "")).casefold()
+    ]
+    if not specs:
+        return _save_plan(
+            config,
+            replace(
+                plan,
+                state="failed",
+                completed_at=utc_now(),
+                error="No configured destination is available to scan.",
+            ),
+        )
+
+    candidates: dict[tuple[str, int, str, int], list[_ContentCandidate]] = defaultdict(list)
+    destinations: dict[tuple[str, int], tuple[str, int | None]] = {}
+    scanned = 0
+    media_count = 0
+    try:
+        for spec in specs:
+            if stop_event.is_set():
+                raise DestinationScanCancelled
+            resolved = await resolve_chat(reader, limiter, spec)
+            chat_id = str(resolved.chat_id)
+            raw_topic_id = getattr(spec, "topic_id", None)
+            configured_topic_id = int(raw_topic_id) if raw_topic_id is not None else None
+            topic_key = int(configured_topic_id or 0)
+            destinations[(chat_id, topic_key)] = (str(resolved.title or chat_id), configured_topic_id)
+
+            async for message in reader.get_chat_history(resolved.chat_id):
+                if stop_event.is_set():
+                    raise DestinationScanCancelled
+                scanned += 1
+                if message_is_empty(message) or not _matches_configured_topic(message, configured_topic_id):
+                    continue
+                media_type = message_media_type(message)
+                file_size = int(message_file_size(message) or 0)
+                message_id = int(getattr(message, "id", 0) or 0)
+                if media_type not in _SUPPORTED_MEDIA_TYPES or file_size <= 0 or message_id <= 0:
+                    continue
+                media_count += 1
+                candidates[_content_candidate_key(chat_id, topic_key, media_type, file_size)].append(
+                    _ContentCandidate(message_id=message_id, media_type=media_type)
+                )
+                if scanned % 100 == 0:
+                    _save_plan(
+                        config,
+                        replace(
+                            plan,
+                            scanned_message_count=scanned,
+                            media_message_count=media_count,
+                        ),
+                    )
+                    await asyncio.sleep(0)
+
+        candidate_groups = {
+            key: entries for key, entries in candidates.items() if len(entries) >= 2
+        }
+        candidate_count = sum(len(entries) for entries in candidate_groups.values())
+        plan = _save_plan(
+            config,
+            replace(
+                plan,
+                scanned_message_count=scanned,
+                media_message_count=media_count,
+                content_candidate_count=candidate_count,
+            ),
+        )
+
+        checksums: dict[tuple[str, int, str], list[_HistoryRecord]] = defaultdict(list)
+        failures: list[str] = []
+        hashed = 0
+        with tempfile.TemporaryDirectory(prefix="destination-content-scan-", dir=_plan_path(config).parent) as raw_dir:
+            directory = Path(raw_dir)
+            for (chat_id, topic_key, media_type, _size), entries in candidate_groups.items():
+                if stop_event.is_set():
+                    raise DestinationScanCancelled
+                message_ids = [entry.message_id for entry in entries]
+                for index in range(0, len(message_ids), 100):
+                    if stop_event.is_set():
+                        raise DestinationScanCancelled
+                    batch = message_ids[index:index + 100]
+                    result = await limiter.call(
+                        "read",
+                        reader.get_messages,
+                        telegram_peer(chat_id),
+                        batch,
+                    )
+                    messages = result if isinstance(result, list) else [result]
+                    by_id = {
+                        int(getattr(message, "id", 0) or 0): message
+                        for message in messages
+                        if not message_is_empty(message)
+                    }
+                    for entry in entries[index:index + 100]:
+                        if stop_event.is_set():
+                            raise DestinationScanCancelled
+                        message = by_id.get(entry.message_id)
+                        if message is None:
+                            failures.append(f"{chat_id} ({entry.message_id}): message is no longer available")
+                            continue
+                        try:
+                            checksum = await _download_content_hash(message, limiter, directory)
+                        except Exception as exc:
+                            failures.append(
+                                f"{chat_id} ({entry.message_id}): {exc.__class__.__name__}: {str(exc)[:120]}"
+                            )
+                            continue
+                        hashed += 1
+                        checksums[(chat_id, topic_key, checksum)].append(
+                            _HistoryRecord(message_id=entry.message_id, media_type=entry.media_type)
+                        )
+                        if hashed % 10 == 0:
+                            plan = _save_plan(
+                                config,
+                                replace(plan, content_hashed_count=hashed),
+                            )
+                            await asyncio.sleep(0)
+
+        ready = DestinationDuplicatePlan(
+            state="ready",
+            scan_id=plan.scan_id,
+            requested_at=plan.requested_at,
+            started_at=plan.started_at,
+            completed_at=utc_now(),
+            scanned_message_count=scanned,
+            media_message_count=media_count,
+            scan_mode="content",
+            content_candidate_count=candidate_count,
+            content_hashed_count=hashed,
+            groups=_build_groups(checksums, destinations, match_kind="content_sha256"),
+            error=("; ".join(failures[:5])[:1000] or None),
+        )
+        return _save_plan(config, ready)
+    except DestinationScanCancelled:
+        return _save_plan(
+            config,
+            replace(
+                plan,
+                state="cancelled",
+                completed_at=utc_now(),
+                scanned_message_count=scanned,
+                media_message_count=media_count,
+                error="Content scan was stopped before a deletion preview was created.",
+            ),
+        )
+    except Exception as exc:
+        return _save_plan(
+            config,
+            replace(
+                plan,
+                state="failed",
                 completed_at=utc_now(),
                 scanned_message_count=scanned,
                 media_message_count=media_count,

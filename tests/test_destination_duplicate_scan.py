@@ -10,6 +10,7 @@ from app.destination_duplicate_scan import (
     load_destination_duplicate_plan,
     request_destination_duplicate_cleanup,
     request_destination_duplicate_scan,
+    scan_destination_content_duplicates,
     scan_destination_duplicate_history,
 )
 
@@ -37,6 +38,14 @@ class FakeClient:
         for message in self.messages[int(chat_id)]:
             yield message
 
+    async def get_messages(self, chat_id: int, message_ids: list[int]) -> list[object]:
+        wanted = {int(message_id) for message_id in message_ids}
+        return [
+            message
+            for message in self.messages[int(chat_id)]
+            if int(getattr(message, "id", 0) or 0) in wanted
+        ]
+
     async def delete_messages(
         self,
         chat_id: int,
@@ -46,7 +55,19 @@ class FakeClient:
         self.delete_calls.append((int(chat_id), tuple(message_ids), revoke))
 
 
-def media(message_id: int, file_unique_id: str, *, media_type: str = "video") -> object:
+def media(
+    message_id: int,
+    file_unique_id: str,
+    *,
+    media_type: str = "video",
+    content: bytes | None = None,
+) -> object:
+    content = content if content is not None else f"content-{file_unique_id}".encode()
+
+    async def download(*, file_name: str) -> str:
+        Path(file_name).write_bytes(content)
+        return file_name
+
     values = {
         "id": message_id,
         "video": None,
@@ -62,7 +83,12 @@ def media(message_id: int, file_unique_id: str, *, media_type: str = "video") ->
         "reply_to_top_message_id": None,
     }
     field = "video" if media_type == "video" else "photo"
-    values[field] = SimpleNamespace(file_unique_id=file_unique_id, file_id=f"fallback-{file_unique_id}")
+    values[field] = SimpleNamespace(
+        file_unique_id=file_unique_id,
+        file_id=f"fallback-{file_unique_id}",
+        file_size=len(content),
+    )
+    values["download"] = download
     return SimpleNamespace(**values)
 
 
@@ -229,6 +255,64 @@ def test_cleanup_stop_invalidates_the_approved_preview(tmp_path: Path) -> None:
     assert client.delete_calls == []
 
 
+def test_content_scan_finds_byte_identical_files_with_different_telegram_fingerprints(tmp_path: Path) -> None:
+    config = config_for(tmp_path)
+    request_destination_duplicate_scan(config, scan_mode="content")  # type: ignore[arg-type]
+    client = FakeClient(
+        {
+            -2001: [
+                media(30, "telegram-fingerprint-new", content=b"same bytes"),
+                media(10, "telegram-fingerprint-old", content=b"same bytes"),
+                media(9, "different", content=b"other bytes"),
+            ]
+        }
+    )
+
+    plan = asyncio.run(
+        scan_destination_content_duplicates(
+            config,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            FakeLimiter(),  # type: ignore[arg-type]
+            asyncio.Event(),
+        )
+    )
+
+    assert plan.state == "ready"
+    assert plan.scan_mode == "content"
+    assert plan.content_candidate_count == 2
+    assert plan.content_hashed_count == 2
+    assert plan.group_count == 1
+    assert plan.groups[0].kept_message_id == 10
+    assert plan.groups[0].duplicate_message_ids == (30,)
+    assert plan.groups[0].match_kind == "content_sha256"
+
+
+def test_content_scan_never_marks_different_bytes_as_duplicates(tmp_path: Path) -> None:
+    config = config_for(tmp_path)
+    request_destination_duplicate_scan(config, scan_mode="content")  # type: ignore[arg-type]
+    client = FakeClient(
+        {
+            -2001: [
+                media(2, "first", content=b"one"),
+                media(1, "second", content=b"two"),
+            ]
+        }
+    )
+
+    plan = asyncio.run(
+        scan_destination_content_duplicates(
+            config,  # type: ignore[arg-type]
+            client,  # type: ignore[arg-type]
+            FakeLimiter(),  # type: ignore[arg-type]
+            asyncio.Event(),
+        )
+    )
+
+    assert plan.state == "ready"
+    assert plan.group_count == 0
+    assert plan.message_count == 0
+
+
 def test_manager_cycle_runs_approved_cleanup_with_the_reader_session(tmp_path: Path) -> None:
     config = config_for(tmp_path)
     request_destination_duplicate_scan(config)  # type: ignore[arg-type]
@@ -261,3 +345,37 @@ def test_manager_cycle_runs_approved_cleanup_with_the_reader_session(tmp_path: P
 
     assert outcome.state == "complete"
     assert client.delete_calls == [(-2001, (2,), True)]
+
+
+def test_manager_cycle_runs_deep_content_scan_with_the_reader_session(tmp_path: Path) -> None:
+    config = config_for(tmp_path)
+    request_destination_duplicate_scan(config, scan_mode="content")  # type: ignore[arg-type]
+    client = FakeClient(
+        {
+            -2001: [
+                media(2, "new-file-id", content=b"same"),
+                media(1, "old-file-id", content=b"same"),
+            ]
+        }
+    )
+
+    outcome = asyncio.run(
+        migration_main._execute_cycle(
+            config,  # type: ignore[arg-type]
+            "duplicate_cleanup_content_scan",
+            reader=client,  # type: ignore[arg-type]
+            bot=None,
+            limiter=FakeLimiter(),  # type: ignore[arg-type]
+            queue=SimpleNamespace(config=None),
+            stop_event=asyncio.Event(),
+            reader_me=SimpleNamespace(id=1),
+            writer_me=SimpleNamespace(id=1),
+            logger=None,
+        )
+    )
+
+    plan = load_destination_duplicate_plan(config)  # type: ignore[arg-type]
+    assert outcome.state == "complete"
+    assert plan is not None
+    assert plan.scan_mode == "content"
+    assert plan.groups[0].duplicate_message_ids == (2,)

@@ -746,6 +746,7 @@ def _duplicates_menu() -> InlineKeyboardMarkup:
         [
             [("📥 Index Queue", "duplicates:index"), ("🔄 Refresh", "duplicates:view")],
             [("🔎 Scan Destination", "duplicates:destination:scan")],
+            [("🧬 Deep Scan Same Files", "duplicates:destination:content-scan")],
             [("🧹 Clean Scan Results", "duplicates:destination:preview")],
             [("⬅️ Smart Center", "smart:menu")],
         ]
@@ -755,26 +756,43 @@ def _duplicates_menu() -> InlineKeyboardMarkup:
 def _destination_duplicate_cleanup_text(plan: DestinationDuplicatePlan | None) -> str:
     """Render a live destination-history scan without making any deletion."""
 
-    lines = [
-        "🧹 Destination Duplicate Cleanup",
-        "",
-        "This reads the actual configured destination history.",
-        "Only exact Telegram media fingerprints match. Source posts are never touched.",
-    ]
+    content_scan = bool(plan and plan.scan_mode == "content")
+    lines = ["🧹 Destination Duplicate Cleanup", ""]
+    if content_scan:
+        lines += [
+            "This checks byte-identical media files when Telegram fingerprints differ.",
+            "Visually similar re-encoded files are not auto-deleted. Source posts are never touched.",
+        ]
+    else:
+        lines += [
+            "This reads the actual configured destination history.",
+            "Only exact Telegram media fingerprints match. Source posts are never touched.",
+        ]
     if plan is None:
         lines += ["", "Tap Scan Destination first. No deletion happens during the scan."]
         return "\n".join(lines)
     if plan.state == "pending":
-        lines += ["", "⏳ Scan queued. The manager session will start it shortly.", "Tap Refresh to view progress."]
+        scan_name = "Deep content scan" if content_scan else "Scan"
+        lines += ["", f"⏳ {scan_name} queued. The manager session will start it shortly.", "Tap Refresh to view progress."]
         return "\n".join(lines)
     if plan.state == "running":
-        lines += [
-            "",
-            "⏳ Scanning destination history…",
-            f"Messages checked so far: {plan.scanned_message_count}",
-            f"Media fingerprints read so far: {plan.media_message_count}",
-            "Tap Refresh after a moment.",
-        ]
+        if content_scan:
+            lines += [
+                "",
+                "⏳ Deep-scanning destination media…",
+                f"Messages checked so far: {plan.scanned_message_count}",
+                f"Same-size candidates: {plan.content_candidate_count}",
+                f"Files hashed so far: {plan.content_hashed_count}",
+                "Tap Refresh after a moment.",
+            ]
+        else:
+            lines += [
+                "",
+                "⏳ Scanning destination history…",
+                f"Messages checked so far: {plan.scanned_message_count}",
+                f"Media fingerprints read so far: {plan.media_message_count}",
+                "Tap Refresh after a moment.",
+            ]
         return "\n".join(lines)
     if plan.state == "delete_pending":
         lines += [
@@ -814,23 +832,29 @@ def _destination_duplicate_cleanup_text(plan: DestinationDuplicatePlan | None) -
         "",
         f"Destination messages scanned: {plan.scanned_message_count}",
         f"Media fingerprints checked: {plan.media_message_count}",
-        f"Exact duplicate groups: {plan.group_count}",
+        f"{'Byte-identical' if content_scan else 'Exact'} duplicate groups: {plan.group_count}",
         f"Telegram messages to delete: {plan.message_count}",
     ]
     if not plan.groups:
-        lines += ["", "✅ No exact duplicate media was found in the destination history."]
+        no_match = "byte-identical" if content_scan else "exact"
+        lines += ["", f"✅ No {no_match} duplicate media was found in the destination history."]
+        if plan.error:
+            lines += ["", f"Some candidates could not be checked: {plan.error[:300]}"]
         return "\n".join(lines)
 
     lines += ["", "Preview (first 8):"]
     for index, group in enumerate(plan.groups[:8], start=1):
         topic = f" · topic {group.dest_topic_id}" if group.dest_topic_id is not None else ""
         lines += [
-            f"{index}. {group.dest_title}{topic} · {group.media_type}",
+            f"{index}. {group.dest_title}{topic} · {group.media_type} · {'checksum' if group.match_kind == 'content_sha256' else 'Telegram fingerprint'}",
             f"   Keep: {group.kept_message_id}",
             f"   Delete: {', '.join(str(value) for value in group.duplicate_message_ids)}",
         ]
     if plan.group_count > 8:
-        lines.append(f"… and {plan.group_count - 8} more exact duplicate group(s).")
+        adjective = "byte-identical" if content_scan else "exact"
+        lines.append(f"… and {plan.group_count - 8} more {adjective} duplicate group(s).")
+    if plan.error:
+        lines += ["", f"Some candidates could not be checked: {plan.error[:300]}"]
     lines += ["", "This cannot be undone from Telegram."]
     return "\n".join(lines)[:3900]
 
@@ -839,6 +863,7 @@ def _destination_duplicate_cleanup_menu(plan: DestinationDuplicatePlan | None) -
     rows: list[list[tuple[str, str]]] = []
     if plan is None or plan.state not in {"pending", "running", "delete_pending", "deleting"}:
         rows.append([("🔎 Scan Destination", "duplicates:destination:scan")])
+        rows.append([("🧬 Deep Scan Same Files", "duplicates:destination:content-scan")])
     if plan and plan.state == "ready" and plan.message_count:
         rows.append(
             [
@@ -1875,18 +1900,32 @@ async def run_admin_bot(config: AppConfig, config_path: str | Path = "config.yam
             await edit(query, _duplicates_text(config), _duplicates_menu())
             await query.answer()
             return
-        if data in {"duplicates:cleanup:preview", "duplicates:destination:scan"}:
+        if data in {
+            "duplicates:cleanup:preview",
+            "duplicates:destination:scan",
+            "duplicates:destination:content-scan",
+        }:
             if is_active_phase(read_status(config).get("phase")):
                 await query.answer("Stop the migration before scanning destination history.", show_alert=True)
                 return
-            plan = request_destination_duplicate_scan(config)
-            request_run_mode(config, "duplicate_cleanup_scan")
+            content_scan = data == "duplicates:destination:content-scan"
+            plan = request_destination_duplicate_scan(
+                config,
+                scan_mode="content" if content_scan else "fingerprint",
+            )
+            request_run_mode(
+                config,
+                "duplicate_cleanup_content_scan" if content_scan else "duplicate_cleanup_scan",
+            )
             await edit(
                 query,
                 _destination_duplicate_cleanup_text(plan),
                 _destination_duplicate_cleanup_menu(plan),
             )
-            await query.answer("Destination scan queued. Tap Refresh shortly.", show_alert=True)
+            await query.answer(
+                "Deep content scan queued. It checks matching file bytes." if content_scan else "Destination scan queued. Tap Refresh shortly.",
+                show_alert=True,
+            )
             return
         if data == "duplicates:destination:preview":
             plan = load_destination_duplicate_plan(config)
