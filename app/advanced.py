@@ -17,6 +17,7 @@ RUN_MODES = {
     "process",
     "health",
     "duplicate_cleanup_scan",
+    "duplicate_cleanup_content_scan",
     "duplicate_cleanup_delete",
 }
 REPAIR_CATEGORIES = (

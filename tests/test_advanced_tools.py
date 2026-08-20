@@ -72,6 +72,13 @@ def test_request_run_mode_accepts_destination_duplicate_cleanup_delete(tmp_path:
     assert (tmp_path / "data" / "run_mode").read_text(encoding="utf-8") == "duplicate_cleanup_delete"
 
 
+def test_request_run_mode_accepts_destination_duplicate_content_scan(tmp_path: Path) -> None:
+    config = config_for(tmp_path)
+    request_run_mode(config, "duplicate_cleanup_content_scan")  # type: ignore[arg-type]
+
+    assert (tmp_path / "data" / "run_mode").read_text(encoding="utf-8") == "duplicate_cleanup_content_scan"
+
+
 def test_health_report_round_trip(tmp_path: Path) -> None:
     config = config_for(tmp_path)
     report = {"overall": "pass", "checks": [{"name": "storage", "status": "pass"}]}
